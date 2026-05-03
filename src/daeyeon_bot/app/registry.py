@@ -72,13 +72,13 @@ def build_handler_registry(config: Config) -> HandlerRegistry:
     for name, entry in config.handlers.items():
         if not entry.enabled:
             continue
-        record = _instantiate_handler(name, entry)
+        record = instantiate_handler(name, entry)
         registry.register(record)
 
     return registry
 
 
-def _instantiate_handler(name: str, entry: HandlerEntry) -> HandlerRecord:
+def instantiate_handler(name: str, entry: HandlerEntry) -> HandlerRecord:
     if name == "echo":
         manifest = _override_manifest(echo_handler.MANIFEST, entry)
         return HandlerRecord(

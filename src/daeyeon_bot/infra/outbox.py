@@ -259,3 +259,109 @@ async def is_deduped(
     if row is None:
         return False
     return datetime.fromisoformat(row["expires_at"]) > now
+
+
+async def mark_interrupted(
+    conn: aiosqlite.Connection,
+    *,
+    outbox_ids: list[int],
+    now: datetime,
+    reason: str = "interrupted",
+) -> int:
+    """Mark a set of outbox rows as 'interrupted'. Caller already commits.
+
+    Used by the dispatcher's drain timeout path to record stragglers; the next
+    boot's `recover_interrupted_rows` decides whether they retry or DLQ.
+    """
+    if not outbox_ids:
+        return 0
+    iso_now = _to_iso(now)
+    placeholders = ",".join("?" * len(outbox_ids))
+    cursor = await conn.execute(
+        f"""
+        UPDATE outbox
+           SET status = 'interrupted', last_error = ?, claimed_by = NULL, claimed_at = NULL,
+               updated_at = ?
+         WHERE id IN ({placeholders}) AND status = 'running'
+        """,  # noqa: S608 — placeholders are integer ids built above, not user input
+        (reason, iso_now, *outbox_ids),
+    )
+    await conn.commit()
+    return cursor.rowcount
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryReport:
+    crashed: int  # rows that were 'running' on boot — daemon was killed mid-flight
+    rerun: int  # 'interrupted' rows promoted back to 'pending' (idempotent handlers)
+    dead_lettered: int  # 'interrupted' rows sent to DLQ (non-idempotent or unknown handler)
+
+
+async def recover_interrupted_rows(
+    conn: aiosqlite.Connection,
+    *,
+    idempotent_handlers: set[str],
+    known_handlers: set[str],
+    now: datetime,
+) -> RecoveryReport:
+    """Boot-time recovery for in-flight rows from a prior unclean shutdown.
+
+    Two passes:
+    1. Any `status='running'` row is from a crashed/killed daemon. Demote to
+       `'interrupted'` so step 2 can decide its fate uniformly.
+    2. For every `status='interrupted'` row, look up the handler:
+       - idempotent → `'pending'` (will be re-claimed and rerun)
+       - non-idempotent or handler unknown → `'dead_letter'`
+
+    Caller is responsible for ensuring this runs *before* the dispatcher starts
+    polling, otherwise rows can be claimed before recovery decides their fate.
+    """
+    iso_now = _to_iso(now)
+    crashed_cur = await conn.execute(
+        """
+        UPDATE outbox
+           SET status = 'interrupted',
+               last_error = COALESCE(last_error, 'daemon crash or kill -9'),
+               claimed_by = NULL, claimed_at = NULL, updated_at = ?
+         WHERE status = 'running'
+        """,
+        (iso_now,),
+    )
+    crashed_count = crashed_cur.rowcount
+
+    async with conn.execute("SELECT id, handler FROM outbox WHERE status = 'interrupted'") as cur:
+        rows = await cur.fetchall()
+
+    rerun_ids: list[int] = []
+    dlq_pairs: list[tuple[int, str]] = []
+    for row in rows:
+        handler = row["handler"]
+        if handler in idempotent_handlers:
+            rerun_ids.append(int(row["id"]))
+        elif handler in known_handlers:
+            dlq_pairs.append((int(row["id"]), "interrupted (non-idempotent handler)"))
+        else:
+            dlq_pairs.append((int(row["id"]), "interrupted (handler not registered)"))
+
+    if rerun_ids:
+        placeholders = ",".join("?" * len(rerun_ids))
+        await conn.execute(
+            f"""
+            UPDATE outbox
+               SET status = 'pending', last_error = NULL, next_attempt_at = NULL,
+                   updated_at = ?
+             WHERE id IN ({placeholders})
+            """,  # noqa: S608 — placeholders are integer ids
+            (iso_now, *rerun_ids),
+        )
+    for outbox_id, reason in dlq_pairs:
+        await conn.execute(
+            """
+            UPDATE outbox
+               SET status = 'dead_letter', last_error = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (reason, iso_now, outbox_id),
+        )
+    await conn.commit()
+    return RecoveryReport(crashed=crashed_count, rerun=len(rerun_ids), dead_lettered=len(dlq_pairs))

@@ -8,7 +8,6 @@ reaches 'acked' within a budget, and a runs row was written.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +59,7 @@ async def test_phase1_vertical_slice(
 ) -> None:
     fake = FakeClaudeSession(default="ok-from-fake")
     overrides = ContainerOverrides(claude_session_factory=lambda: fake)
+    stop = asyncio.Event()
 
     boot_task = asyncio.create_task(
         boot(
@@ -67,6 +67,7 @@ async def test_phase1_vertical_slice(
                 config_path=str(config_file),
                 overrides=overrides,
                 install_signal_handlers=False,
+                external_stop_event=stop,
             )
         )
     )
@@ -105,12 +106,9 @@ async def test_phase1_vertical_slice(
             break
         await asyncio.sleep(0.05)
 
-    # Stop the daemon. `install_signal_handlers=False` means we can't SIGTERM;
-    # cancel the boot task and swallow the resulting CancelledError /
-    # ExceptionGroup that TaskGroup wraps it in.
-    boot_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError, BaseExceptionGroup):
-        await boot_task
+    # Stop the daemon via the injected stop event. boot returns cleanly.
+    stop.set()
+    await asyncio.wait_for(boot_task, timeout=5.0)
 
     assert settled_status == "acked"
     assert fake.calls and fake.calls[0]["prompt"] == "hello"

@@ -55,6 +55,17 @@ prune:
 migrate:
     uv run daeyeon-bot ops migrate
 
+# ─── Deployment ────────────────────────────────────────────────────────────────
+
+setup-token:
+    ./scripts/setup-token.sh
+
+install-mac:
+    ./scripts/install-mac.sh
+
+install-linux credential:
+    ./scripts/install-linux.sh {{credential}}
+
 # ─── Pre-commit aggregate ──────────────────────────────────────────────────────
 
 check: lint typecheck test

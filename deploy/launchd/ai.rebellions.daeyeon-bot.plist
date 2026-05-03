@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.rebellions.daeyeon-bot</string>
+
+  <!-- Wraps `daeyeon-bot run` so launchd sees the daemon's pid (not uv's). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__INSTALL_PREFIX__/deploy/launchd/entrypoint.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__INSTALL_PREFIX__</string>
+
+  <!-- Auto-restart on crash. ThrottleInterval=10 keeps an exit-78 loop sane
+       (operator must rotate the token before launchd stops looping). -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__STATE_DIR__/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE_DIR__/launchd.err.log</string>
+
+  <!-- The token comes from Keychain at boot; do NOT inject it here. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

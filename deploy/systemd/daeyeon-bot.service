@@ -1,0 +1,50 @@
+[Unit]
+Description=daeyeon-bot — personal Claude bot daemon
+Documentation=https://github.com/rebellions-sw/daeyeon-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+TimeoutStopSec=180
+
+# `__INSTALL_PREFIX__` is rewritten by scripts/install-linux.sh.
+WorkingDirectory=__INSTALL_PREFIX__
+ExecStart=/usr/bin/env bash -lc 'umask 0077 && exec uv run daeyeon-bot run'
+
+# Restart policy. exit 78 (EX_CONFIG, AuthError) is non-recoverable —
+# operator must rotate the token before the unit will start again.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=78
+
+# Hardening — keep `systemd-analyze security` honest.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# State dir — only place the unit can write.
+ReadWritePaths=__STATE_DIR__
+
+# Token via systemd LoadCredential (preferred over env). The unit loads a
+# 0600 file from the credential store; the daemon reads it through
+# secrets.provider='file' with file_path=$CREDENTIALS_DIRECTORY/oauth_token.
+LoadCredential=oauth_token:__CREDENTIAL_PATH__
+
+[Install]
+WantedBy=default.target

@@ -26,6 +26,9 @@ class TriggerContext(Protocol):
 class HandlerContext(Protocol):
     clock: Clock
     trace_id: str
+    # Factory yields a fresh Claude session per handler call. Kept as a callable
+    # rather than the session itself so handlers can choose not to call Claude.
+    claude_session_factory: Callable[[], object]
 
 
 @runtime_checkable

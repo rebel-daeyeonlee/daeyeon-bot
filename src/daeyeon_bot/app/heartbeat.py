@@ -84,28 +84,41 @@ def _touch(flag_path: Path) -> None:
 
 
 def _sd_notify_ready() -> None:
-    _send_sd_notify("READY=1")
+    if _send_sd_notify("READY=1"):
+        _log.info("heartbeat.sd_notify_ready", socket=os.environ.get("NOTIFY_SOCKET"))
 
 
 def _sd_notify_watchdog() -> None:
     _send_sd_notify("WATCHDOG=1")
 
 
-def _send_sd_notify(message: str) -> None:
-    """Best-effort sd_notify. No-op outside systemd's notify socket.
+def _send_sd_notify(message: str) -> bool:
+    """Best-effort sd_notify. Returns True if the datagram was sent.
 
-    We avoid pulling in `systemd` libs; the protocol is a one-line UDP send.
+    No-op (returns False) outside systemd's notify socket. We avoid pulling
+    in `systemd` libs; the protocol is a one-line UDP send.
     """
     socket_path = os.environ.get("NOTIFY_SOCKET")
     if not socket_path:
-        return
+        return False
     try:
         # Abstract namespace sockets begin with NUL on Linux.
         addr = "\0" + socket_path[1:] if socket_path.startswith("@") else socket_path
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
             sock.sendto(message.encode("utf-8"), addr)
+        return True
     except OSError as exc:
-        _log.debug("heartbeat.sd_notify_failed", error=str(exc), message=message)
+        # Promoted from debug to warning: when Type=notify is in play, a
+        # silent sendto failure leaves the unit stuck in `activating (start)`
+        # until TimeoutStartSec. Surfacing the OSError tells the operator
+        # whether it's EACCES (perms / namespace) vs ENOENT (path missing).
+        _log.warning(
+            "heartbeat.sd_notify_failed",
+            error=str(exc),
+            message=message,
+            socket=socket_path,
+        )
+        return False
 
 
 __all__ = [

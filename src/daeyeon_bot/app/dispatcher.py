@@ -40,6 +40,11 @@ _log = structlog.get_logger(__name__)
 DEFAULT_BACKOFF_S = 30.0
 RATE_LIMIT_BACKOFF_S = 60.0
 PAUSE_BACKOFF_S = 5.0
+# Cap on transient retries per outbox row. After this many attempts the
+# dispatcher gives up and dead-letters instead of looping forever — empirically
+# we hit attempt=142 on a stuck PR before adding this. Operators recover with
+# `ops replay --confirm` once the underlying issue is addressed.
+MAX_TRANSIENT_ATTEMPTS = 10
 
 
 @dataclass(slots=True)
@@ -239,15 +244,33 @@ class Dispatcher:
     @staticmethod
     def _classify_transient(
         exc: Exception, default_backoff: float, job: outbox.ClaimedJob
-    ) -> Retry:
+    ) -> Retry | DeadLetter:
         # Future: read RateLimitError.retry_after if the SDK exposes it.
         # Log here so operators can diagnose retries from journald — Retry results
         # don't carry the exception, and outbox.settle clears last_error to NULL.
+        next_attempt = job.attempt + 1
+        if next_attempt >= MAX_TRANSIENT_ATTEMPTS:
+            _log.warning(
+                "dispatcher.handler_transient_exhausted",
+                outbox_id=job.outbox_id,
+                handler=job.handler,
+                event_id=job.event.id,
+                attempt=next_attempt,
+                exc_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return DeadLetter(
+                reason=(
+                    f"max transient attempts ({MAX_TRANSIENT_ATTEMPTS}) reached: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            )
         _log.warning(
             "dispatcher.handler_transient",
             outbox_id=job.outbox_id,
             handler=job.handler,
             event_id=job.event.id,
+            attempt=next_attempt,
             exc_type=type(exc).__name__,
             error=str(exc),
             backoff_s=default_backoff,
@@ -266,4 +289,10 @@ def _result_to_status(result: HandlerResult) -> str:
 
 
 # Re-exported types so callers don't reach into infra.outbox.
-__all__ = ["DEFAULT_BACKOFF_S", "RATE_LIMIT_BACKOFF_S", "Dispatcher", "Event"]
+__all__ = [
+    "DEFAULT_BACKOFF_S",
+    "MAX_TRANSIENT_ATTEMPTS",
+    "RATE_LIMIT_BACKOFF_S",
+    "Dispatcher",
+    "Event",
+]

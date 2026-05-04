@@ -10,7 +10,7 @@ import aiosqlite
 import pytest
 
 from daeyeon_bot.app.config import Config, HandlerEntry
-from daeyeon_bot.app.dispatcher import Dispatcher
+from daeyeon_bot.app.dispatcher import MAX_TRANSIENT_ATTEMPTS, Dispatcher
 from daeyeon_bot.app.registry import build_handler_registry
 from daeyeon_bot.core.errors import TransientError
 from daeyeon_bot.core.events import Event, make_event
@@ -143,6 +143,67 @@ async def test_transient_error_becomes_retry(db_path: Path, now: datetime) -> No
         assert row is not None
         assert row["status"] == "retry"
         assert row["next_attempt_at"] is not None
+    finally:
+        await conn.close()
+
+
+async def test_transient_error_dead_letters_at_max_attempts(db_path: Path, now: datetime) -> None:
+    """Once attempt count reaches MAX_TRANSIENT_ATTEMPTS, dispatcher dead-letters.
+
+    Without this cap, a flaky upstream that raises TransientError every call
+    pins a row in retry forever (we observed attempt=142 in production).
+    """
+    conn = await storage.open_db(db_path)
+    await storage.apply_migrations(conn)
+    try:
+        ev_id = await _seed(conn, dedup_key="k_max", message="hi", now=now)
+        # Pre-bump the row so the next claim is the boundary attempt.
+        await conn.execute(
+            "UPDATE outbox SET attempt = ? WHERE event_id = ?",
+            (MAX_TRANSIENT_ATTEMPTS - 1, ev_id),
+        )
+        await conn.commit()
+
+        fake = FakeClaudeSession(default="ok")
+        dispatcher = await _build_dispatcher(conn, fake)
+        record = dispatcher.handlers.by_name["echo"]
+
+        class AlwaysTransientHandler:
+            manifest = record.manifest
+
+            async def handle(self, event: Event, ctx: HandlerContext) -> HandlerResult:
+                raise TransientError("upstream blip")
+
+        from dataclasses import replace as _replace
+
+        dispatcher.handlers.by_name["echo"] = _replace(record, instance=AlwaysTransientHandler())
+
+        async def stop_when(status_target: str) -> None:
+            for _ in range(50):
+                async with conn.execute(
+                    "SELECT status FROM outbox WHERE event_id = ?", (ev_id,)
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None and row["status"] == status_target:
+                    dispatcher.stop()
+                    return
+                await asyncio.sleep(0.05)
+            dispatcher.stop()
+            raise AssertionError(f"outbox row never reached {status_target!r}")
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(dispatcher.run())
+            tg.create_task(stop_when("dead_letter"))
+
+        async with conn.execute(
+            "SELECT status, attempt, last_error FROM outbox WHERE event_id = ?", (ev_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row["status"] == "dead_letter"
+        assert row["attempt"] == MAX_TRANSIENT_ATTEMPTS
+        assert row["last_error"] is not None
+        assert "max transient attempts" in row["last_error"]
     finally:
         await conn.close()
 

@@ -196,7 +196,14 @@ class RealClaudeSession:
 
 
 async def _collect_assistant_text(client: ClaudeSDKClient) -> str:
-    """Drain the response stream and concatenate assistant text blocks."""
+    """Drain the response stream and concatenate assistant text blocks.
+
+    Empty results — no `AssistantMessage`/`TextBlock` ever yielded, or only
+    whitespace — are surfaced as `TransientError`. Handlers that try to parse
+    JSON would otherwise hit "Expecting value: line 1 column 1" and escalate
+    to PermanentError; the underlying cause is almost always a transient
+    upstream hiccup that the dispatcher's retry/backoff will recover from.
+    """
     parts: list[str] = []
     async for message in client.receive_response():
         if isinstance(message, RateLimitEvent):
@@ -215,7 +222,10 @@ async def _collect_assistant_text(client: ClaudeSDKClient) -> str:
             for block in message.content:
                 if isinstance(block, TextBlock):
                     parts.append(block.text)
-    return "".join(parts)
+    text = "".join(parts)
+    if not text.strip():
+        raise TransientError("claude returned no assistant text")
+    return text
 
 
 def _raise_process_error(exc: ProcessError) -> NoReturn:

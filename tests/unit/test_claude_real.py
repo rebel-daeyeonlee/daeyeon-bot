@@ -107,6 +107,19 @@ async def test_per_call_system_override_is_passed_to_sdk(
         return stub
 
     monkeypatch.setattr(claude_mod, "ClaudeSDKClient", _factory)
+    stub.scripted_messages = [
+        AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="m",
+            parent_tool_use_id=None,
+            error=None,
+            usage=None,
+            message_id="mid",
+            stop_reason=None,
+            session_id="s",
+            uuid="u",
+        ),
+    ]
     async with _session() as session:
         await session.query("hi", system="persona-A")
     options = cast("claude_mod.ClaudeAgentOptions", captured["options"])
@@ -212,6 +225,37 @@ async def test_query_outside_async_with_raises(stub: _StubClient) -> None:
     session = _session()
     with pytest.raises(TransientError, match="outside of"):
         await session.query("hi")
+
+
+async def test_empty_response_raises_transient(stub: _StubClient) -> None:
+    """No AssistantMessage / TextBlock yielded → TransientError, not silent ''.
+
+    Without this guard, empty responses cascade into PermanentError on the
+    handler side (json.loads("") → "Expecting value: line 1 column 1").
+    """
+    stub.scripted_messages = []
+    async with _session() as session:
+        with pytest.raises(TransientError, match="no assistant text"):
+            await session.query("hi")
+
+
+async def test_whitespace_only_response_raises_transient(stub: _StubClient) -> None:
+    stub.scripted_messages = [
+        AssistantMessage(
+            content=[TextBlock(text="   \n  ")],
+            model="m",
+            parent_tool_use_id=None,
+            error=None,
+            usage=None,
+            message_id="mid",
+            stop_reason=None,
+            session_id="s",
+            uuid="u",
+        ),
+    ]
+    async with _session() as session:
+        with pytest.raises(TransientError, match="no assistant text"):
+            await session.query("hi")
 
 
 def test_make_real_factory_builds_sessions() -> None:

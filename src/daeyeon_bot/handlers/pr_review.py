@@ -29,6 +29,7 @@ The single handler that consumes both `gh.review_requested` (auto path) and
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -45,14 +46,18 @@ from daeyeon_bot.core.errors import (
 )
 from daeyeon_bot.core.events import Event
 from daeyeon_bot.core.manifest import HandlerManifest
+from daeyeon_bot.core.pr_review.audit import AuditRow
+from daeyeon_bot.core.pr_review.persona import Persona
 from daeyeon_bot.core.protocols import HandlerContext
 from daeyeon_bot.core.results import Ack, HandlerResult
 from daeyeon_bot.handlers.pr_review_diff import (
     is_anchor_in_hunk,
     parse_hunk_ranges,
 )
+from daeyeon_bot.handlers.pr_review_prompt import build_system_prompt
+from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment, ReviewOutput
-from daeyeon_bot.infra.logging import redact_text
+from daeyeon_bot.infra.logging import RedactReason, redact_with_provenance
 from daeyeon_bot.infra.pr_review_audit import (
     find_latest,
     insert_audit,
@@ -96,6 +101,7 @@ class _GhClient(Protocol):
         commit_id: str,
         body: str,
         comments: list[dict[str, Any]],
+        login: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -121,29 +127,98 @@ class PrReviewHandler:
     db: Any  # aiosqlite.Connection — Any to avoid circular type stub on tests.
     pause_guard: PauseGuard = _no_pause
 
-    async def handle(  # noqa: PLR0915 — sequential gates; decomposing further hurts readability
-        self, event: Event, ctx: HandlerContext
-    ) -> HandlerResult:
+    async def handle(self, event: Event, ctx: HandlerContext) -> HandlerResult:
         # PAUSE check first so even the size-budget short-circuit honors it.
         await self.pause_guard()
-
-        repo, pr_number, payload_head_sha, request_gen, force = _parse_payload(event)
+        parsed = _parse_payload(event)
         now = ctx.clock.now()
 
-        # ── (a) Persona ────────────────────────────────────────────────────
+        early = await self._gate_repo_allowlist(event, parsed, now)
+        if early is not None:
+            return early
+
+        persona = await self._load_persona_or_audit(event, parsed, now)
+
+        prep = await self._fetch_pr_metadata(event, parsed, persona, now)
+
+        early = await self._gate_self_or_withdrawn(prep, now)
+        if early is not None:
+            return early
+
+        sized = await self._fetch_files(prep)
+        early = await self._gate_size_budget(sized, now)
+        if early is not None:
+            return early
+
+        prior = await find_latest(self.db, sized.repo, sized.pr_number, sized.head_sha)
+        already_posted = prior is not None and prior.status == "posted"
+        if already_posted and not sized.force:
+            return await self._record_already_reviewed(sized, prior, now)
+
+        await self.pause_guard()
+        review = await self._call_claude_with_retry(
+            ctx=ctx,
+            system_prompt=build_system_prompt(sized.persona.body),
+            user_message=render_user_message(
+                repo=sized.repo,
+                pr_number=sized.pr_number,
+                title=str(sized.pr.get("title", "")),
+                body=str(sized.pr.get("body") or ""),
+                author_login=sized.author_login,
+                head_sha=sized.head_sha,
+                files=sized.files,
+            ),
+        )
+
+        await self.pause_guard()
+        return await self._post_review_and_audit(
+            sized, review, prior=prior, already_posted=already_posted, now=now
+        )
+
+    # ── stage helpers ──────────────────────────────────────────────────────
+
+    async def _gate_repo_allowlist(
+        self, event: Event, parsed: _Parsed, now: datetime
+    ) -> HandlerResult | None:
+        # Defense-in-depth: even if the trigger's search-side filter is
+        # misconfigured (or the event arrived via the manual CLI path),
+        # gate before any persona load / `gh.pr_get`. `force=True` does NOT
+        # bypass — the allowlist is a security boundary, not a quality knob.
+        if _is_repo_allowed(parsed.repo, self.config.allowed_repos):
+            return None
+        await self._write_audit(
+            event_id=event.id,
+            repo=parsed.repo,
+            pr_number=parsed.pr_number,
+            head_sha=parsed.head_sha,
+            request_gen=str(parsed.request_gen),
+            status="skipped_disallowed_repo",
+            error=(f"repo={parsed.repo!r} not in allowed_repos={self.config.allowed_repos!r}"),
+            created_at=now,
+        )
+        _log.info(
+            "pr_review.skipped_disallowed_repo",
+            repo=parsed.repo,
+            pr_number=parsed.pr_number,
+            head_sha=parsed.head_sha,
+            allowed_repos=self.config.allowed_repos,
+        )
+        return Ack()
+
+    async def _load_persona_or_audit(self, event: Event, parsed: _Parsed, now: datetime) -> Persona:
         skill_name = self.config.persona_skill or ""
         try:
-            persona = self.persona_loader.load(skill_name, min_chars=self.config.min_persona_chars)
+            return self.persona_loader.load(skill_name, min_chars=self.config.min_persona_chars)
         except ValidationError as exc:
             # Persona load failed — record the *configured* skill name so the
             # operator can correlate the failure with which persona file was
             # active. `persona_mtime_ns` is unknown at this point.
             await self._write_audit(
                 event_id=event.id,
-                repo=repo,
-                pr_number=pr_number,
-                head_sha=payload_head_sha,
-                request_gen=request_gen,
+                repo=parsed.repo,
+                pr_number=parsed.pr_number,
+                head_sha=parsed.head_sha,
+                request_gen=str(parsed.request_gen),
                 status="failed",
                 persona_skill=skill_name or None,
                 error=str(exc),
@@ -151,169 +226,177 @@ class PrReviewHandler:
             )
             raise
 
-        # ── (b) Refresh PR metadata ────────────────────────────────────────
-        pr = await self.gh.pr_get(repo, pr_number)
-        current_head = _read_head_sha(pr)
-        author_login = _read_author(pr)
-        requested_logins = _read_requested_logins(pr)
-        pr_state = str(pr.get("state", "open"))
+    async def _fetch_pr_metadata(
+        self, event: Event, parsed: _Parsed, persona: Persona, now: datetime
+    ) -> _PrepState:
+        pr = await self.gh.pr_get(parsed.repo, parsed.pr_number)
+        head_sha = _read_head_sha(pr) or parsed.head_sha
+        return _PrepState(
+            event_id=event.id,
+            repo=parsed.repo,
+            pr_number=parsed.pr_number,
+            request_gen=parsed.request_gen,
+            force=parsed.force,
+            head_sha=head_sha,
+            persona=persona,
+            pr=pr,
+            author_login=_read_author(pr),
+            requested_logins=_read_requested_logins(pr),
+            pr_state=str(pr.get("state", "open")),
+            audit_kwargs={
+                "event_id": event.id,
+                "repo": parsed.repo,
+                "pr_number": parsed.pr_number,
+                "head_sha": head_sha,
+                "request_gen": str(parsed.request_gen),
+                "persona_skill": persona.name,
+                "persona_mtime_ns": persona.mtime_ns,
+            },
+            now=now,
+        )
 
-        # Use the *current* head SHA going forward — payload's was a snapshot.
-        head_sha = current_head or payload_head_sha
-
-        audit_kwargs: dict[str, Any] = {
-            "event_id": event.id,
-            "repo": repo,
-            "pr_number": pr_number,
-            "head_sha": head_sha,
-            "request_gen": request_gen,
-            "persona_skill": persona.name,
-            "persona_mtime_ns": persona.mtime_ns,
-        }
-
-        # ── (c) Self-authored skip ─────────────────────────────────────────
-        if author_login and author_login == self.github_username:
+    async def _gate_self_or_withdrawn(
+        self, prep: _PrepState, now: datetime
+    ) -> HandlerResult | None:
+        if prep.author_login and prep.author_login == self.github_username:
             await self._write_audit(
-                **audit_kwargs,
+                **prep.audit_kwargs,
                 status="skipped_self_authored",
+                error=f"author_login={prep.author_login!r} == github_username",
                 created_at=now,
             )
             _log.info(
                 "pr_review.skipped_self_authored",
-                repo=repo,
-                pr_number=pr_number,
-                head_sha=head_sha,
+                repo=prep.repo,
+                pr_number=prep.pr_number,
+                head_sha=prep.head_sha,
             )
             return Ack()
-
-        # ── (d) Withdrawn skip ─────────────────────────────────────────────
         # Manual force re-runs honor the request even when the PR is no longer
         # in the requested-reviewers list; auto runs always require it.
-        if not force:
-            withdrawn = pr_state != "open" or self.github_username not in requested_logins
-            if withdrawn:
-                await self._write_audit(
-                    **audit_kwargs,
-                    status="skipped_withdrawn",
-                    created_at=now,
-                )
-                _log.info(
-                    "pr_review.skipped_withdrawn",
-                    repo=repo,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    state=pr_state,
-                )
-                return Ack()
+        if prep.force:
+            return None
+        withdrawn = prep.pr_state != "open" or self.github_username not in prep.requested_logins
+        if not withdrawn:
+            return None
+        await self._write_audit(
+            **prep.audit_kwargs,
+            status="skipped_withdrawn",
+            error=f"state={prep.pr_state!r}, requested={prep.requested_logins}",
+            created_at=now,
+        )
+        _log.info(
+            "pr_review.skipped_withdrawn",
+            repo=prep.repo,
+            pr_number=prep.pr_number,
+            head_sha=prep.head_sha,
+            state=prep.pr_state,
+        )
+        return Ack()
 
-        # ── (e) Size budget ────────────────────────────────────────────────
-        files_raw = await self.gh.pr_files(repo, pr_number)
+    async def _fetch_files(self, prep: _PrepState) -> _SizedState:
+        files_raw = await self.gh.pr_files(prep.repo, prep.pr_number)
         files = [_normalize_file(f) for f in files_raw]
-        n_files = len(files)
         n_lines = sum(int(f.get("additions", 0)) + int(f.get("deletions", 0)) for f in files)
+        return _SizedState.from_prep(prep, files=files, n_files=len(files), n_lines=n_lines)
+
+    async def _gate_size_budget(self, sized: _SizedState, now: datetime) -> HandlerResult | None:
         budget = self.config.size_budget
-        if n_files > budget.max_files or n_lines > budget.max_lines:
-            await self.pause_guard()
-            summary = _TOO_LARGE_TEMPLATE.format(
-                head_sha=head_sha,
-                n_files=n_files,
-                max_files=budget.max_files,
-                n_lines=n_lines,
-                max_lines=budget.max_lines,
-            )
-            posted = await self.gh.post_review(
-                repo,
-                pr_number,
-                commit_id=head_sha,
-                body=summary,
-                comments=[],
-            )
-            await self._write_audit(
-                **audit_kwargs,
-                status="skipped_too_large",
-                review_id=_read_review_id(posted),
-                submitted_at=_read_submitted_at(posted),
-                summary_chars=len(summary),
-                inline_comment_count=0,
-                created_at=now,
-            )
-            _log.info(
-                "pr_review.skipped_too_large",
-                repo=repo,
-                pr_number=pr_number,
-                n_files=n_files,
-                n_lines=n_lines,
-            )
-            return Ack()
-
-        # ── (f) Already-reviewed short-circuit ─────────────────────────────
-        prior = await find_latest(self.db, repo, pr_number, head_sha)
-        already_posted = prior is not None and prior.status == "posted"
-        if already_posted and not force:
-            await self._write_audit(
-                **audit_kwargs,
-                status="skipped_already_reviewed",
-                created_at=now,
-            )
-            _log.info(
-                "pr_review.skipped_already_reviewed",
-                repo=repo,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                prior_review_id=prior.review_id if prior else None,
-            )
-            return Ack()
-
-        # ── (g) Call Claude with validate-once-retry-once ──────────────────
-        snapshot_text = _render_user_message(
-            repo=repo,
-            pr_number=pr_number,
-            title=str(pr.get("title", "")),
-            body=str(pr.get("body") or ""),
-            author_login=author_login,
-            head_sha=head_sha,
-            files=files,
-        )
-        system_prompt = _build_system_prompt(persona.body)
+        if sized.n_files <= budget.max_files and sized.n_lines <= budget.max_lines:
+            return None
         await self.pause_guard()
-        review = await self._call_claude_with_retry(
-            ctx=ctx,
-            system_prompt=system_prompt,
-            user_message=snapshot_text,
+        summary = _TOO_LARGE_TEMPLATE.format(
+            head_sha=sized.head_sha,
+            n_files=sized.n_files,
+            max_files=budget.max_files,
+            n_lines=sized.n_lines,
+            max_lines=budget.max_lines,
         )
+        posted = await self.gh.post_review(
+            sized.repo,
+            sized.pr_number,
+            commit_id=sized.head_sha,
+            body=summary,
+            comments=[],
+            login=self.github_username,
+        )
+        await self._write_audit(
+            **sized.audit_kwargs,
+            status="skipped_too_large",
+            review_id=_read_review_id(posted),
+            submitted_at=_read_submitted_at(posted),
+            summary_chars=len(summary),
+            inline_comment_count=0,
+            created_at=now,
+        )
+        _log.info(
+            "pr_review.skipped_too_large",
+            repo=sized.repo,
+            pr_number=sized.pr_number,
+            n_files=sized.n_files,
+            n_lines=sized.n_lines,
+        )
+        return Ack()
 
-        # ── (h) Filter inline anchors ──────────────────────────────────────
-        kept, folded = _filter_anchors(review.comments, files)
+    async def _record_already_reviewed(
+        self, sized: _SizedState, prior: AuditRow | None, now: datetime
+    ) -> HandlerResult:
+        await self._write_audit(
+            **sized.audit_kwargs,
+            status="skipped_already_reviewed",
+            error=(f"prior_review_id={prior.review_id}" if prior is not None else "prior=unknown"),
+            created_at=now,
+        )
+        _log.info(
+            "pr_review.skipped_already_reviewed",
+            repo=sized.repo,
+            pr_number=sized.pr_number,
+            head_sha=sized.head_sha,
+            prior_review_id=prior.review_id if prior else None,
+        )
+        return Ack()
+
+    async def _post_review_and_audit(
+        self,
+        sized: _SizedState,
+        review: ReviewOutput,
+        *,
+        prior: AuditRow | None,
+        already_posted: bool,
+        now: datetime,
+    ) -> HandlerResult:
+        # (h) filter, (h.5) redact, (i) supersede header, (j) post, (k) audit.
+        kept, folded = _filter_anchors(review.comments, sized.files)
         summary = review.summary
         if folded:
             summary = _append_folded_bullets(summary, folded)
 
-        # ── (h.5) Redaction guard ──────────────────────────────────────────
         _enforce_redaction(summary, kept)
 
-        # ── (i) Force-supersede header ─────────────────────────────────────
-        is_force_supersede = force and already_posted and prior is not None
+        # Italicized notice prepended above the Verdict line so it reads as
+        # bot infrastructure metadata rather than review content. The
+        # sign-off invariant ("last non-empty line is `— daeyeon-bot 🐥`")
+        # is preserved because we only touch the head of the body.
+        is_force_supersede = sized.force and already_posted and prior is not None
         if is_force_supersede and prior is not None and prior.submitted_at is not None:
             header = (
-                f"Updated review for SHA {head_sha}"
-                f" (supersedes earlier bot review posted at"
-                f" {prior.submitted_at.strftime('%H:%M:%S UTC')})"
+                f"_Updated review for SHA `{sized.head_sha}`"
+                f" — supersedes earlier bot review posted at"
+                f" {prior.submitted_at.strftime('%H:%M:%S UTC')}._"
             )
             summary = header + "\n\n" + summary
 
-        # ── (j) Post the review ────────────────────────────────────────────
-        await self.pause_guard()
         posted = await self.gh.post_review(
-            repo,
-            pr_number,
-            commit_id=head_sha,
+            sized.repo,
+            sized.pr_number,
+            commit_id=sized.head_sha,
             body=summary,
-            comments=[_inline_to_api(c) for c in kept],
+            comments=[inline_to_api(c) for c in kept],
+            login=self.github_username,
         )
         new_review_id = _read_review_id(posted)
         new_submitted_at = _read_submitted_at(posted)
 
-        # ── (k) Audit: supersede or insert ─────────────────────────────────
         if is_force_supersede and prior is not None and new_submitted_at is not None:
             await record_supersede(
                 self.db,
@@ -324,7 +407,7 @@ class PrReviewHandler:
             await self.db.commit()
         else:
             await self._write_audit(
-                **audit_kwargs,
+                **sized.audit_kwargs,
                 status="posted",
                 review_id=new_review_id,
                 submitted_at=new_submitted_at,
@@ -335,16 +418,14 @@ class PrReviewHandler:
 
         _log.info(
             "pr_review.posted",
-            repo=repo,
-            pr_number=pr_number,
-            head_sha=head_sha,
+            repo=sized.repo,
+            pr_number=sized.pr_number,
+            head_sha=sized.head_sha,
             review_id=new_review_id,
             inline_count=len(kept),
             superseded=is_force_supersede,
         )
         return Ack()
-
-    # ── helpers ────────────────────────────────────────────────────────────
 
     async def _write_audit(self, **kwargs: Any) -> None:
         await insert_audit(self.db, **kwargs)
@@ -392,19 +473,111 @@ class PrReviewHandler:
         raise PermanentError("unreachable: claude retry loop fell through")
 
 
+# ── pipeline state ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class _Parsed:
+    """Inputs parsed straight from the Event payload (pre-pr_get)."""
+
+    repo: str
+    pr_number: int
+    head_sha: str  # payload snapshot — may be stale by `gh.pr_get` time
+    request_gen: int
+    force: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PrepState:
+    """Stages (a)+(b) output: persona + fresh PR metadata."""
+
+    event_id: str
+    repo: str
+    pr_number: int
+    request_gen: int
+    force: bool
+    head_sha: str  # current head from pr_get (or payload if pr_get omitted it)
+    persona: Persona
+    pr: dict[str, Any]
+    author_login: str
+    requested_logins: tuple[str, ...]
+    pr_state: str
+    audit_kwargs: dict[str, Any]
+    now: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _SizedState:
+    """`_PrepState` + the file list and counts from `gh.pr_files`."""
+
+    event_id: str
+    repo: str
+    pr_number: int
+    request_gen: int
+    force: bool
+    head_sha: str
+    persona: Persona
+    pr: dict[str, Any]
+    author_login: str
+    audit_kwargs: dict[str, Any]
+    files: list[dict[str, Any]]
+    n_files: int
+    n_lines: int
+
+    @classmethod
+    def from_prep(
+        cls,
+        prep: _PrepState,
+        *,
+        files: list[dict[str, Any]],
+        n_files: int,
+        n_lines: int,
+    ) -> _SizedState:
+        return cls(
+            event_id=prep.event_id,
+            repo=prep.repo,
+            pr_number=prep.pr_number,
+            request_gen=prep.request_gen,
+            force=prep.force,
+            head_sha=prep.head_sha,
+            persona=prep.persona,
+            pr=prep.pr,
+            author_login=prep.author_login,
+            audit_kwargs=prep.audit_kwargs,
+            files=files,
+            n_files=n_files,
+            n_lines=n_lines,
+        )
+
+
 # ── module-level helpers ──────────────────────────────────────────────────
 
 
-def _parse_payload(event: Event) -> tuple[str, int, str, str, bool]:
+def _parse_payload(event: Event) -> _Parsed:
     payload = event.payload
     repo = str(payload.get("repo", ""))
     pr_number_raw = payload.get("pr_number")
     head_sha = str(payload.get("head_sha", ""))
-    request_gen = str(payload.get("request_gen", "0"))
+    # `request_gen` is INT in the schema and the trigger emits int; tolerate
+    # legacy string payloads (queued before A5) so an in-flight outbox row
+    # from a pre-fix daemon won't fail validation on the next boot.
+    request_gen_raw = payload.get("request_gen", 0)
+    try:
+        request_gen = int(request_gen_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(
+            f"pr_review payload request_gen not an int: {request_gen_raw!r}"
+        ) from exc
     force = bool(payload.get("force", False))
     if not repo or pr_number_raw is None or not head_sha:
         raise ValidationError("pr_review payload must include repo, pr_number, head_sha")
-    return (repo, int(pr_number_raw), head_sha, request_gen, force)
+    return _Parsed(
+        repo=repo,
+        pr_number=int(pr_number_raw),
+        head_sha=head_sha,
+        request_gen=request_gen,
+        force=force,
+    )
 
 
 def _read_head_sha(pr: dict[str, Any]) -> str | None:
@@ -482,6 +655,20 @@ def _strip_code_fence(text: str) -> str:
     return stripped
 
 
+def _is_repo_allowed(repo: str, allowed: list[str]) -> bool:
+    """Return True if `repo` matches any glob in `allowed`, or `allowed` is empty.
+
+    Empty `allowed` means no filter (legacy behavior). Globs use `fnmatch`
+    semantics, so `rebellions-sw/*` matches the whole org and explicit
+    `rebellions-sw/daeyeon-bot` matches just that repo. Case-insensitive
+    because GitHub treats `Owner/Repo` and `owner/repo` as the same path.
+    """
+    if not allowed:
+        return True
+    repo_lc = repo.lower()
+    return any(fnmatch.fnmatchcase(repo_lc, pat.lower()) for pat in allowed)
+
+
 def _filter_anchors(
     comments: list[InlineComment],
     files: list[dict[str, Any]],
@@ -508,101 +695,73 @@ def _filter_anchors(
     return (kept, folded)
 
 
+_SIGNOFF_PREFIX = "— daeyeon-bot 🐥"
+
+
 def _append_folded_bullets(summary: str, folded: list[InlineComment]) -> str:
+    """Insert folded out-of-hunk bullets while keeping the sign-off as the last line.
+
+    `pr_review_prompt.OUTPUT_DIRECTIVE` requires the very last non-empty line to be the
+    sign-off marker. Naively appending after the summary breaks that
+    invariant whenever Claude obeyed the directive (which is the common
+    path). We split on the last line whose first non-whitespace tokens
+    are the sign-off marker and inject the bullets above it. Falls back
+    to plain append when no sign-off is present (e.g. older summaries
+    without sign-off, or chat-mode callers).
+    """
     bullets = "\n".join(f"- [{c.path} near L{c.line}] {c.body}" for c in folded)
     if not bullets:
         return summary
-    if summary.endswith("\n"):
-        return summary + "\n" + bullets
-    return summary + "\n\n" + bullets
+    lines = summary.split("\n")
+    signoff_idx: int | None = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].lstrip().startswith(_SIGNOFF_PREFIX):
+            signoff_idx = idx
+            break
+    if signoff_idx is None:
+        if summary.endswith("\n"):
+            return summary + "\n" + bullets
+        return summary + "\n\n" + bullets
+    head = lines[:signoff_idx]
+    while head and head[-1] == "":
+        head.pop()
+    tail = lines[signoff_idx:]
+    rebuilt = [*head, "", bullets, "", *tail]
+    return "\n".join(rebuilt)
 
 
 def _enforce_redaction(summary: str, comments: list[InlineComment]) -> None:
-    """Raise PermanentError if redaction would mutate any posted text (FR-015)."""
-    if redact_text(summary) != summary:
-        raise PermanentError("redaction would alter posted content (summary)")
+    """Two-tier redaction guard (FR-015 + A4).
+
+    Named-token hits (Slack / AWS / JWT / Anthropic / GitHub) raise
+    `PermanentError` so the row goes to DLQ — that's a real secret leaking
+    from the model and we must not post it. Entropy-only hits are logged as
+    `pr_review.redaction_entropy` and the original text is posted unchanged
+    — the entropy heuristic's false-positive rate on natural review prose
+    (long hashes, identifiers, code excerpts) is too high to gate posts on.
+    Log-sink redaction (`infra/logging.py:redact_processor`) keeps its
+    strict behavior — this loosening applies only to posted PR content.
+    """
+    _check_named_redaction("summary", summary)
     for comment in comments:
-        if redact_text(comment.body) != comment.body:
-            raise PermanentError(
-                f"redaction would alter posted content (comment on {comment.path})"
-            )
+        _check_named_redaction(f"comment on {comment.path}", comment.body)
 
 
-def _inline_to_api(comment: InlineComment) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "path": comment.path,
-        "line": comment.line,
-        "side": comment.side,
-        "body": comment.body,
-    }
-    if comment.start_line is not None:
-        payload["start_line"] = comment.start_line
-        payload["start_side"] = comment.side
-    return payload
-
-
-# Output directive appended to every persona body — verbatim from
-# `specs/001-github-pr-review-bot/contracts/claude-review-output.md` §2.
-# The persona is a chat-mode markdown reviewer; without this directive the
-# model emits prose and the handler's `json.loads` fails with
-# "Expecting value: line 1 column 1 (char 0)".
-_OUTPUT_DIRECTIVE = (
-    "\n\n---\n\n"
-    "You are reviewing the pull request below. Output ONLY a JSON object that"
-    " matches this exact JSON schema. No prose before or after, no Markdown code"
-    " fence — just the JSON object on stdout. If you have nothing to flag, emit"
-    " an empty `comments` array but still produce a meaningful `summary`.\n\n"
-    "JSON schema:\n"
-)
-
-
-def _build_system_prompt(persona_body: str) -> str:
-    schema_dump = json.dumps(ReviewOutput.model_json_schema(), indent=2)
-    return persona_body + _OUTPUT_DIRECTIVE + schema_dump
-
-
-def _render_user_message(
-    *,
-    repo: str,
-    pr_number: int,
-    title: str,
-    body: str,
-    author_login: str,
-    head_sha: str,
-    files: list[dict[str, Any]],
-) -> str:
-    """Render the snapshot the way `contracts/claude-review-output.md` §2 specs."""
-    additions = sum(int(f.get("additions") or 0) for f in files)
-    deletions = sum(int(f.get("deletions") or 0) for f in files)
-    parts: list[str] = [
-        f"Repository: {repo}",
-        f"PR #{pr_number}: {title}",
-        f"Author: @{author_login}",
-        f"Head commit SHA: {head_sha}",
-        "",
-        "PR description:",
-        "---",
-        body,
-        "---",
-        "",
-        f"Changed files ({len(files)}, +{additions} / -{deletions} lines):",
-        "",
+def _check_named_redaction(label: str, text: str) -> None:
+    _, spans = redact_with_provenance(text)
+    named = [(start, end, reason) for start, end, reason in spans if reason != "entropy"]
+    if named:
+        reasons = sorted({reason for _, _, reason in named})
+        raise PermanentError(f"redaction would alter posted content ({label}); reasons={reasons}")
+    entropy_spans: list[tuple[int, int, RedactReason]] = [
+        (start, end, reason) for start, end, reason in spans if reason == "entropy"
     ]
-    for f in files:
-        path = f.get("filename")
-        status = f.get("status")
-        adds = f.get("additions")
-        dels = f.get("deletions")
-        parts.append(f"### {path}  (status: {status}, +{adds}/-{dels})")
-        patch = f.get("patch")
-        if isinstance(patch, str):
-            parts.append("```diff")
-            parts.append(patch)
-            parts.append("```")
-        else:
-            parts.append("(binary or oversized — diff omitted)")
-        parts.append("")
-    return "\n".join(parts)
+    if entropy_spans:
+        _log.warning(
+            "pr_review.redaction_entropy",
+            label=label,
+            spans=[(start, end) for start, end, _ in entropy_spans],
+        )
 
 
 __all__ = ["MANIFEST", "PrReviewHandler"]

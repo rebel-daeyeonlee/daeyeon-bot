@@ -151,7 +151,14 @@ Exit codes that matter:
    claude setup-token                   # opens browser, prints token
    ```
 3. **Store the new token in the right provider.**
-   - **macOS:**
+   - **macOS — one-shot rotate:** `just rotate-token` prompts for the new
+     token, writes it to Keychain, kicks the launchd agent, and (on
+     restart failure) rolls Keychain back to the previous token. Skip
+     step 4's macOS branch if you used this path.
+     ```bash
+     just rotate-token                  # store + restart with rollback
+     ```
+   - **macOS — initial install (no running agent yet):**
      ```bash
      just setup-token                   # prompts, writes to Keychain
      ```
@@ -165,7 +172,7 @@ Exit codes that matter:
 4. **Verify and restart.**
    ```bash
    just doctor                          # token: ok, len>0
-   # macOS
+   # macOS — only if you used `just setup-token` (not `just rotate-token`).
    launchctl kickstart -k gui/$(id -u)/ai.rebellions.daeyeon-bot
    # Linux
    systemctl --user restart daeyeon-bot

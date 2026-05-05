@@ -208,6 +208,80 @@ async def test_transient_error_dead_letters_at_max_attempts(db_path: Path, now: 
         await conn.close()
 
 
+async def test_handler_concurrency_two_runs_in_parallel(db_path: Path, now: datetime) -> None:
+    """With `concurrency=2`, two events for the same handler run simultaneously.
+
+    Guards the `[handlers.pr_review].concurrency` config knob (E6): the
+    dispatcher's per-handler semaphore is keyed off `manifest.concurrency`,
+    so a config override flows through `_override_manifest`. The test uses
+    `echo` for simplicity — the wiring is identical for `pr_review`.
+    """
+    conn = await storage.open_db(db_path)
+    await storage.apply_migrations(conn)
+    try:
+        ev1 = await _seed(conn, dedup_key="par_1", message="hi-1", now=now)
+        ev2 = await _seed(conn, dedup_key="par_2", message="hi-2", now=now)
+
+        cfg = Config(
+            handlers={"echo": HandlerEntry(concurrency=2)},
+            routing={"manual.message": ["echo"]},
+        )
+        handlers = build_handler_registry(cfg)
+        fake = FakeClaudeSession(default="ok")
+        dispatcher = Dispatcher(
+            db=conn,
+            handlers=handlers,
+            claude_session_factory=lambda: fake,
+            poll_interval_s=0.05,
+        )
+
+        record = handlers.by_name["echo"]
+        both_started = asyncio.Event()
+        in_flight = {"n": 0}
+        gate = asyncio.Event()
+
+        class BarrierHandler:
+            manifest = record.manifest
+
+            async def handle(self, event: Event, ctx: HandlerContext) -> HandlerResult:
+                in_flight["n"] += 1
+                if in_flight["n"] >= 2:
+                    both_started.set()
+                await gate.wait()
+                return await record.instance.handle(event, ctx)  # type: ignore[attr-defined]
+
+        from dataclasses import replace as _replace
+
+        dispatcher.handlers.by_name["echo"] = _replace(record, instance=BarrierHandler())
+
+        async def watcher() -> None:
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=2.0)
+            finally:
+                gate.set()
+            for _ in range(50):
+                async with conn.execute(
+                    "SELECT COUNT(*) AS n FROM outbox WHERE event_id IN (?, ?) AND status = 'acked'",
+                    (ev1, ev2),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None and row["n"] == 2:
+                    dispatcher.stop()
+                    return
+                await asyncio.sleep(0.05)
+            dispatcher.stop()
+            raise AssertionError("both rows never reached 'acked'")
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(dispatcher.run())
+            tg.create_task(watcher())
+
+        assert both_started.is_set()
+        assert record.manifest.concurrency == 2
+    finally:
+        await conn.close()
+
+
 async def test_permanent_error_becomes_dead_letter(db_path: Path, now: datetime) -> None:
     conn = await storage.open_db(db_path)
     await storage.apply_migrations(conn)

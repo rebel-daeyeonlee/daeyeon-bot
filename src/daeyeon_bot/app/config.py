@@ -41,6 +41,12 @@ class RateLimitDefaults(BaseModel):
 
 
 class RateLimitSection(BaseModel):
+    # Token-bucket gate the dispatcher consults before each claim. Capacity
+    # is the burst budget; refill_per_sec is the steady-state rate. Defaults
+    # are a soft 60/min cap with full-minute burst headroom — see migration
+    # 003 and OPTIMIZATION_PLAN §A3.
+    claude_call_capacity: float = 60.0
+    claude_call_refill_per_sec: float = 1.0
     defaults: RateLimitDefaults = Field(default_factory=RateLimitDefaults)
 
 
@@ -108,13 +114,26 @@ class PrReviewHandlerEntry(HandlerEntry):
     # bundled persona works without an extra symlink step.
     skills_root: str | None = None
     size_budget: SizeBudget = Field(default_factory=SizeBudget)
+    # Glob allowlist of `owner/repo` patterns the bot is permitted to review.
+    # Empty list = no filter (any repo where the operator is review-requested
+    # triggers a review). Non-empty list applies in two layers:
+    #   1) trigger search query — when expressible, an `OR`-joined filter
+    #      (`repo:a/b OR user:c`) cuts traffic at the GitHub side;
+    #   2) handler — fnmatch defense-in-depth before any `gh.pr_get` call.
+    # Globs accepted: `owner/repo`, `owner/*`. Anything else (e.g. `*foo*`)
+    # falls back to handler-only filtering.
+    allowed_repos: list[str] = Field(default_factory=list)
 
 
 class Config(BaseSettings):
+    # `extra="forbid"` so a typo like `[handlrs.pr_review]` raises at boot
+    # instead of silently dropping the section. The two leaf entries
+    # (`TriggerEntry`, `HandlerEntry`) keep `extra="allow"` because they
+    # pass arbitrary kwargs through to constructors.
     model_config = SettingsConfigDict(
         env_prefix="DAEYEON_BOT__",
         env_nested_delimiter="__",
-        extra="allow",
+        extra="forbid",
     )
 
     runtime: RuntimeSection = Field(default_factory=RuntimeSection)
@@ -162,7 +181,13 @@ class Config(BaseSettings):
         return self.state_dir_path / "daeyeon-bot.pid"
 
 
-def _resolve_config_path(explicit: str | None) -> Path | None:
+def resolve_config_path(explicit: str | None) -> Path | None:
+    """Public: resolve which config.toml `load()` would use, or None for defaults.
+
+    Order: explicit `--config` > `DAEYEON_BOT_CONFIG` env > `./config.toml`.
+    Used by `cli/ops.py:doctor` to surface "using defaults" when nothing
+    resolves, so a first-time operator doesn't get silent fallback behavior.
+    """
     if explicit:
         return Path(explicit).expanduser()
     env = os.environ.get("DAEYEON_BOT_CONFIG")
@@ -174,7 +199,7 @@ def _resolve_config_path(explicit: str | None) -> Path | None:
 
 def load(path: str | None = None) -> Config:
     """Load config from TOML (if present) and environment overrides."""
-    config_path = _resolve_config_path(path)
+    config_path = resolve_config_path(path)
     if config_path and config_path.is_file():
         with config_path.open("rb") as fp:
             data = tomllib.load(fp)

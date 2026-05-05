@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import typer
 
 from daeyeon_bot.app.backup import BackupReport, run_backup
-from daeyeon_bot.app.config import load
+from daeyeon_bot.app.config import load, resolve_config_path
 from daeyeon_bot.app.doctor import DoctorReport, run_checks
 from daeyeon_bot.app.prune import PruneReport
 from daeyeon_bot.app.prune import prune as run_prune
@@ -29,6 +29,11 @@ app = typer.Typer(
 def doctor(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
 ) -> None:
+    resolved = resolve_config_path(config)
+    if resolved is None:
+        typer.echo("config: using defaults (no config.toml found)")
+    else:
+        typer.echo(f"config: {resolved}")
     report = asyncio.run(_doctor(config_path=config))
     _render_doctor(report)
     if not report.ok:

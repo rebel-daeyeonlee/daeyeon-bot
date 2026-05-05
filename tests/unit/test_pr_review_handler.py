@@ -127,7 +127,7 @@ def _manual_event(
         "repo": repo,
         "pr_number": pr_number,
         "head_sha": head_sha,
-        "request_gen": "manual_1700000000" if force else "0",
+        "request_gen": 0,
         "force": force,
     }
     return make_event(
@@ -239,6 +239,15 @@ async def test_system_prompt_carries_persona_and_json_schema(tmp_path: Path) -> 
         assert '"comments"' in system
         # Persona comes first; directive appended after
         assert system.index(_PERSONA_BODY) < system.index("Output ONLY a JSON object")
+        # Slim-down invariants — these are the load-bearing rules the
+        # directive enforces on Claude. If they drift, posted summaries
+        # will regress to verbose English.
+        assert "<= 1500 chars" in system
+        assert "2500 chars" in system
+        assert "Korean" in system
+        assert "— daeyeon-bot 🐥" in system
+        assert "InlineComment" in system
+        assert "MUST NOT contain the sign-off marker" in system
     finally:
         await conn.close()
 
@@ -312,6 +321,102 @@ async def test_skipped_when_username_not_in_requested(tmp_path: Path) -> None:
         latest = await find_latest(conn, "o/r", 7, "deadbeef")
         assert latest is not None
         assert latest.status == "skipped_withdrawn"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skipped_when_repo_not_in_allowlist(tmp_path: Path) -> None:
+    """Repo allowlist gate must fire before any `gh.pr_get` round-trip."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "evil-org/some-repo",
+        7,
+        head_sha="deadbeef",
+        author="alice",
+        files=_FILES_ONE_FILE,
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            allowed_repos=["rebellions-sw/*"],
+        ),
+    )
+    try:
+        event = make_event(
+            type="pr.review.manual",
+            payload={
+                "repo": "evil-org/some-repo",
+                "pr_number": 7,
+                "head_sha": "deadbeef",
+                "request_gen": 0,
+                "force": True,  # force MUST NOT bypass the allowlist
+            },
+            created_at=datetime(2026, 5, 4, tzinfo=UTC),
+        )
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
+        assert isinstance(result, Ack)
+        # No GitHub round-trip should have happened — disallowed repo is gated
+        # before `pr_get`. (Handler returns Ack immediately.)
+        assert fake_gh.posted_reviews() == []
+        latest = await find_latest(conn, "evil-org/some-repo", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "skipped_disallowed_repo"
+        # Persona never loaded → audit row carries no persona metadata.
+        assert latest.persona_skill is None
+        assert latest.persona_mtime_ns is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_allowed_repo_proceeds_through_gate(tmp_path: Path) -> None:
+    """A repo matching the allowlist must NOT be skipped by the gate.
+
+    Verifies the gate is not a blanket short-circuit — a matching glob
+    falls through to the normal review path.
+    """
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "rebellions-sw/daeyeon-bot",
+        7,
+        head_sha="deadbeef",
+        author="alice",
+        files=_FILES_ONE_FILE,
+    )
+    factory = FakeFactory(session=FakeClaudeSession(default='{"summary": "ok", "comments": []}'))
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        factory=factory,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            allowed_repos=["rebellions-sw/*"],
+        ),
+    )
+    try:
+        event = make_event(
+            type="pr.review.manual",
+            payload={
+                "repo": "rebellions-sw/daeyeon-bot",
+                "pr_number": 7,
+                "head_sha": "deadbeef",
+                "request_gen": 0,
+                "force": False,
+            },
+            created_at=datetime(2026, 5, 4, tzinfo=UTC),
+        )
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        latest = await find_latest(conn, "rebellions-sw/daeyeon-bot", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "posted"
     finally:
         await conn.close()
 
@@ -478,7 +583,10 @@ async def test_force_supersede_prepends_header_and_chains_audit(
 
         posted = fake_gh.posted_reviews()
         assert len(posted) == 2
-        assert "Updated review for SHA deadbeef" in posted[1]["body"]
+        # Supersede header is italicized markdown wrapping `_…_`, so the
+        # SHA is enclosed in backticks; assert the parts independently.
+        assert "Updated review for SHA" in posted[1]["body"]
+        assert "deadbeef" in posted[1]["body"]
         assert "supersedes earlier bot review" in posted[1]["body"]
 
         latest = await find_latest(conn, "o/r", 7, "deadbeef")
@@ -538,6 +646,37 @@ async def test_redaction_in_inline_comment_blocks_post(tmp_path: Path) -> None:
         with pytest.raises(PermanentError, match="redaction"):
             await handler.handle(event, _ctx(factory))
         assert fake_gh.posted_reviews() == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_entropy_only_hit_in_summary_posts_unchanged(tmp_path: Path) -> None:
+    """A4: entropy-only redaction hits must not block posting. The summary
+    is posted as-is and a `pr_review.redaction_entropy` warning is emitted."""
+    import secrets as stdlib_secrets
+
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    high_entropy = stdlib_secrets.token_urlsafe(32)
+    summary_with_entropy = (
+        f"Reviewed at deadbeef. Saw an opaque identifier `{high_entropy}` in the test fixture."
+    )
+    factory = FakeFactory(
+        session=FakeClaudeSession(
+            default=json.dumps({"summary": summary_with_entropy, "comments": []})
+        )
+    )
+    handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh, factory=factory)
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        # Summary posted with the high-entropy token intact.
+        assert high_entropy in posted[0]["body"]
     finally:
         await conn.close()
 

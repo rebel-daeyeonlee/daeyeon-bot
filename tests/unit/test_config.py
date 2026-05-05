@@ -142,3 +142,15 @@ def test_github_config_extra_forbidden() -> None:
     """GitHubConfig rejects unknown keys (extra='forbid')."""
     with pytest.raises(Exception):  # noqa: B017
         GitHubConfig(unknown_field="x")  # type: ignore[call-arg]
+
+
+def test_typo_in_section_rejected(tmp_path: Path) -> None:
+    """D3: a misspelled top-level section like `[handlrs.pr_review]` must
+    raise at boot rather than silently no-op."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        "[handlrs.pr_review]\nenabled = true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception):  # noqa: B017
+        load(str(cfg_path))

@@ -63,6 +63,11 @@ migrate:
 setup-token:
     ./scripts/setup-token.sh
 
+# Rotate token: store new OAuth token + restart launchd agent.
+# Rolls Keychain back to the previous token if the restart fails.
+rotate-token:
+    ./scripts/setup-token.sh --rotate
+
 install-mac:
     ./scripts/install-mac.sh
 

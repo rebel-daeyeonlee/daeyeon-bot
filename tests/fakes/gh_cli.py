@@ -45,6 +45,10 @@ class FakeGh:
     post_review_response_id: int = 9876543
     raise_on_post: Exception | None = None
     raise_on_search: Exception | None = None
+    # Captures the most recent `extra_query` arg `search_review_requested`
+    # was called with, so trigger tests can assert the search-side
+    # `allowed_repos` filter was actually plumbed through.
+    last_extra_query: str = ""
 
     _prs: dict[tuple[str, int], _FakePr] = field(default_factory=dict)
     _search_set: set[tuple[str, int]] = field(default_factory=set)
@@ -125,7 +129,13 @@ class FakeGh:
             raise AuthError("fake gh: not logged in")
         return self.user_login
 
-    async def search_review_requested(self, username: str) -> list[dict[str, Any]]:
+    async def search_review_requested(
+        self, username: str, *, extra_query: str = ""
+    ) -> list[dict[str, Any]]:
+        # Record the most recent extra_query so trigger tests can assert
+        # the search-side filter actually reaches the gh layer. Filtering
+        # is faked at the operator's request via `_search_set` directly.
+        self.last_extra_query = extra_query
         if self.raise_on_search is not None:
             raise self.raise_on_search
         if not self.auth_ok:
@@ -181,7 +191,9 @@ class FakeGh:
         commit_id: str,
         body: str,
         comments: list[dict[str, Any]],
+        login: str | None = None,
     ) -> dict[str, Any]:
+        del login  # the real wrapper uses this for 5xx dedup; fake never 5xx-loops
         if self.raise_on_post is not None:
             raise self.raise_on_post
         if not self.auth_ok:

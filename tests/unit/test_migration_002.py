@@ -8,20 +8,26 @@ import pytest
 
 from daeyeon_bot.infra.storage import apply_migrations, open_db
 
+_LATEST_SCHEMA_VERSION = 4
+
 
 @pytest.mark.asyncio
 async def test_migration_002_brings_schema_to_version_2(tmp_path: Path) -> None:
-    """After apply_migrations, schema_version must be 2 and both new tables exist."""
+    """After apply_migrations, schema_version is current and both 002 tables exist.
+
+    Named for migration 002 historically; now asserts the running tip
+    (currently 4 — extends `pr_review_audit.status` CHECK constraint).
+    """
     db_path = tmp_path / "state.db"
     conn = await open_db(db_path)
     try:
         version = await apply_migrations(conn)
-        assert version == 2
+        assert version == _LATEST_SCHEMA_VERSION
 
         async with conn.execute("SELECT value FROM meta WHERE key = 'schema_version'") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row["value"] == "2"
+        assert row["value"] == str(_LATEST_SCHEMA_VERSION)
 
         async with conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -46,7 +52,7 @@ async def test_migration_002_is_idempotent(tmp_path: Path) -> None:
     try:
         await apply_migrations(conn)
         version_again = await apply_migrations(conn)
-        assert version_again == 2
+        assert version_again == _LATEST_SCHEMA_VERSION
     finally:
         await conn.close()
 

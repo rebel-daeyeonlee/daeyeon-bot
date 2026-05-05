@@ -5,7 +5,12 @@ from __future__ import annotations
 import secrets as stdlib_secrets
 from typing import cast
 
-from daeyeon_bot.infra.logging import REDACTED, redact_processor, redact_text
+from daeyeon_bot.infra.logging import (
+    REDACTED,
+    redact_processor,
+    redact_text,
+    redact_with_provenance,
+)
 
 
 def test_slack_token_redacted() -> None:
@@ -112,3 +117,34 @@ def test_redact_text_handles_multiple_secrets_in_one_string() -> None:
     assert "xoxb-" not in out
     assert "AKIA" not in out
     assert out.count(REDACTED) >= 2
+
+
+def test_redact_with_provenance_named_token_reasons() -> None:
+    text = "auth=xoxb-1234567890-abcdefghij and key=AKIAIOSFODNN7EXAMPLE"
+    redacted, spans = redact_with_provenance(text)
+    reasons = sorted({reason for _, _, reason in spans})
+    assert reasons == ["aws", "slack"]
+    assert REDACTED in redacted
+
+
+def test_redact_with_provenance_entropy_reason() -> None:
+    high_entropy = stdlib_secrets.token_urlsafe(48)
+    redacted, spans = redact_with_provenance(f"value={high_entropy}")
+    reasons = [reason for _, _, reason in spans]
+    assert "entropy" in reasons
+    assert REDACTED in redacted
+
+
+def test_redact_with_provenance_named_wins_over_entropy_on_overlap() -> None:
+    """A `ghp_…` PAT also matches the entropy fallback. The named match
+    must take precedence so callers see `gh`, not `entropy`."""
+    pat = "ghp_" + "A" * 36
+    _, spans = redact_with_provenance(pat)
+    reasons = [reason for _, _, reason in spans]
+    assert reasons == ["gh"]
+
+
+def test_redact_with_provenance_clean_text_no_spans() -> None:
+    redacted, spans = redact_with_provenance("nothing secret here")
+    assert spans == []
+    assert redacted == "nothing secret here"

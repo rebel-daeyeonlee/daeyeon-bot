@@ -22,6 +22,7 @@ from typing import cast
 import aiosqlite
 import structlog
 
+from daeyeon_bot.app import ratelimit
 from daeyeon_bot.app.registry import HandlerRecord, HandlerRegistry
 from daeyeon_bot.core.errors import (
     AuthError,
@@ -80,6 +81,16 @@ class Dispatcher:
         once Phase A is requested — the caller is responsible for `drain()`."""
         while not self._is_done():
             if self.is_paused():
+                await self._wait_for_stop_or_tick()
+                continue
+            # Rate-limit gate sits parallel to PAUSE: bucket-empty → don't claim.
+            # Row stays `pending` so `attempt` doesn't burn (see CONTRACTS §5
+            # and OPTIMIZATION_PLAN §A3 for the design rationale).
+            if not await ratelimit.take(
+                self.db,
+                ratelimit.CLAUDE_CALL_BUCKET,
+                now_iso=self.clock.now().isoformat(),
+            ):
                 await self._wait_for_stop_or_tick()
                 continue
             job = await outbox.claim_one(self.db, claimed_by=self.claim_id, now=self.clock.now())
@@ -202,11 +213,20 @@ class Dispatcher:
                     ),
                 )
                 result = cast("HandlerResult", raw_result)
-            except AuthError:
-                # Auth errors halt the daemon. The current row stays 'running'
-                # until the next boot's recover_interrupted_rows handles it.
+            except AuthError as exc:
+                # Auth errors halt the daemon. Mark the row 'interrupted' so
+                # the next boot's recovery has an explicit breadcrumb (and so
+                # `inspect status` shows AuthError as the cause) — without
+                # this, the row stays 'running' and recovery still works but
+                # the operator has no record of why we stopped.
                 # Lifecycle reports exit 78 (Phase 4 wires the exit code).
-                _log.error("dispatcher.auth_error", outbox_id=job.outbox_id)
+                _log.error("dispatcher.auth_error", outbox_id=job.outbox_id, error=str(exc))
+                await outbox.mark_interrupted(
+                    self.db,
+                    outbox_ids=[job.outbox_id],
+                    now=self.clock.now(),
+                    reason=f"AuthError: {exc}",
+                )
                 self.stop()
                 return
             except RateLimitError as exc:

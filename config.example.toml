@@ -24,6 +24,16 @@ backup_keep = 5
 # How long dormant gh_review_requested_state rows live before prune.
 gh_state_dormant_days = 90
 
+[ratelimit]
+# Token-bucket gate the dispatcher consults before each claim. Capacity
+# is burst budget; refill is the steady-state rate. Defaults are a soft
+# 60/min cap with full-minute burst headroom — see migration 003.
+# Bumping refill above poll rate (default ~2 polls/s) means the bucket
+# never drains during idle polling; lowering it lets idle polling impose
+# a softer per-minute floor.
+claude_call_capacity = 60.0
+claude_call_refill_per_sec = 1.0
+
 [ratelimit.defaults]
 global_per_hour = 30
 global_per_day = 200
@@ -75,6 +85,11 @@ accepts = ["manual.message"]
 enabled = true
 idempotent = true
 dedup_ttl_seconds = 86400
+# `concurrency = 2` lets the second PR's `gh` prep work overlap with the
+# first PR's Claude wait — useful for batches (e.g. 5 PRs queued after PTO).
+# The Claude SDK itself is single-concurrent per session, so the wins come
+# from `gh pr_get`/`pr_files` and SQLite I/O. Trade-off: doubles per-cycle
+# `gh` traffic on your shared 5000/hr quota. Default 1 is the safe rollout.
 concurrency = 1
 accepts = ["gh.review_requested", "pr.review.manual"]
 # Active persona (skill directory name under <skills_root>/<name>/SKILL.md).
@@ -88,6 +103,21 @@ min_persona_chars = 200
 # Set to "~/.claude/skills" if you keep your personas in the standard
 # Claude Code skills directory, or any absolute path you prefer.
 # skills_root = "~/.claude/skills"
+
+# Repo allowlist (SECURITY BOUNDARY — empty list = no filter, legacy behavior).
+# Each entry is a `fnmatch` glob over `owner/name`. Match is case-insensitive.
+# Enforced in two layers: (1) the trigger narrows its GitHub search query to
+# the same set when expressible (`user:owner` / `repo:owner/name`), reducing
+# poll traffic; (2) the handler re-checks every event before any `gh.pr_get`,
+# so manual CLI events and unexpressible globs (e.g. `*foo*`) still get gated.
+# `force = true` does NOT bypass this — it is a security boundary, not a
+# quality knob. A blocked PR yields `audit.status = skipped_disallowed_repo`.
+# Examples:
+#   allowed_repos = ["rebellions-sw/*"]                          # whole org
+#   allowed_repos = ["rebellions-sw/daeyeon-bot",                # specific repos
+#                    "rebellions-sw/another-repo"]
+#   allowed_repos = ["rebellions-sw/*", "octo/cat"]              # mixed
+allowed_repos = []
 
 [handlers.pr_review.size_budget]
 max_lines = 1000      # additions + deletions across all changed files

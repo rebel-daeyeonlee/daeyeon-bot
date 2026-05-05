@@ -28,7 +28,7 @@ class ReviewOutput(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    summary: str = Field(min_length=1, max_length=8000)
+    summary: str = Field(min_length=1, max_length=2500)
     comments: list[InlineComment] = Field(default_factory=list, max_length=200)
 
 

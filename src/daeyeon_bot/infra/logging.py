@@ -21,16 +21,19 @@ import structlog
 
 REDACTED = "***REDACTED***"
 
+RedactReason = str  # one of: "slack" | "aws" | "jwt" | "anthropic" | "gh" | "entropy"
+
 # Order matters only for performance; matches are replaced wherever they appear.
-_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  # Slack
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS Access Key ID
-    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),  # JWT
-    re.compile(r"sk-ant-oat[A-Za-z0-9_-]{10,}"),  # Anthropic OAuth
-    re.compile(r"sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{10,}"),  # Anthropic API key
-    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),  # GitHub personal access token
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),  # GitHub fine-grained PAT
+_NAMED_PATTERNS: tuple[tuple[RedactReason, re.Pattern[str]], ...] = (
+    ("slack", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("aws", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")),
+    ("anthropic", re.compile(r"sk-ant-oat[A-Za-z0-9_-]{10,}")),
+    ("anthropic", re.compile(r"sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{10,}")),
+    ("gh", re.compile(r"\bghp_[A-Za-z0-9]{20,}\b")),
+    ("gh", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
 )
+_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = tuple(p for _, p in _NAMED_PATTERNS)
 
 # Entropy fallback parameters.
 _MIN_ENTROPY_BITS_PER_CHAR = 4.5
@@ -77,6 +80,27 @@ def redact_text(text: str) -> str:
     return out
 
 
+def redact_with_provenance(text: str) -> tuple[str, list[tuple[int, int, RedactReason]]]:
+    """Same redaction as `redact_text`, plus the spans + reasons for each match.
+
+    Spans use the *original* `text` offsets (not the redacted output's), so
+    callers can correlate flags back to the model output without re-running
+    a regex. The redacted text is the same as `redact_text(text)`.
+    """
+    spans: list[tuple[int, int, RedactReason]] = []
+    for reason, pattern in _NAMED_PATTERNS:
+        for m in pattern.finditer(text):
+            spans.append((m.start(), m.end(), reason))
+    for m in _TOKENISH_RE.finditer(text):
+        if _shannon_entropy(m.group(0)) >= _MIN_ENTROPY_BITS_PER_CHAR:
+            # Skip if already covered by a named match — named wins on overlap.
+            if any(start <= m.start() and m.end() <= end for start, end, _ in spans):
+                continue
+            spans.append((m.start(), m.end(), "entropy"))
+    spans.sort()
+    return redact_text(text), spans
+
+
 def _maybe_redact_match(match: re.Match[str]) -> str:
     candidate = match.group(0)
     if _shannon_entropy(candidate) >= _MIN_ENTROPY_BITS_PER_CHAR:
@@ -113,4 +137,11 @@ def _redact_value(value: object) -> object:
     return value
 
 
-__all__ = ["REDACTED", "init", "redact_processor", "redact_text"]
+__all__ = [
+    "REDACTED",
+    "RedactReason",
+    "init",
+    "redact_processor",
+    "redact_text",
+    "redact_with_provenance",
+]

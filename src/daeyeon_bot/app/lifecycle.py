@@ -27,13 +27,14 @@ import contextlib
 import signal
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 import aiosqlite
 import structlog
 
-from daeyeon_bot.app import heartbeat, pause
+from daeyeon_bot.app import heartbeat, pause, ratelimit
 from daeyeon_bot.app.config import Config, load
 from daeyeon_bot.app.container import Container, ContainerOverrides, build
 from daeyeon_bot.app.dispatcher import Dispatcher
@@ -82,6 +83,10 @@ async def boot(options: BootOptions | None = None) -> None:
         db = await storage.open_db(config.db_path)
         try:
             await storage.apply_migrations(db)
+            # 4b. apply config-driven rate-limit knobs on top of the seed
+            #     row from migration 003. UPSERT preserves `tokens` so a
+            #     warm bucket survives restarts.
+            await _apply_ratelimit_config(db, config)
             # 5. secrets — fail fast so launchd/systemd surfaces exit 78.
             #    When tests inject a fake claude session factory, skip the
             #    real token probe (no SDK subprocess will spawn).
@@ -94,6 +99,23 @@ async def boot(options: BootOptions | None = None) -> None:
             _log.info("boot.exit")
     finally:
         pid_lock.close()
+
+
+async def _apply_ratelimit_config(db: aiosqlite.Connection, config: Config) -> None:
+    """UPSERT the `claude_call` bucket with config-driven capacity/refill.
+
+    Preserves `tokens` so a warm bucket survives daemon restarts. The seed
+    row comes from migration 003; this just lets operators tune capacity
+    and refill via `[ratelimit]` without touching SQL.
+    """
+    await ratelimit.upsert_bucket(
+        db,
+        name=ratelimit.CLAUDE_CALL_BUCKET,
+        capacity=config.ratelimit.claude_call_capacity,
+        refill_per_sec=config.ratelimit.claude_call_refill_per_sec,
+        now_iso=datetime.now(tz=UTC).isoformat(),
+    )
+    await db.commit()
 
 
 def _maybe_load_oauth_token(config: Config, options: BootOptions) -> str | None:

@@ -21,7 +21,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from daeyeon_bot.core.errors import (
     AuthError,
@@ -49,6 +49,12 @@ _RATE_LIMIT_PHRASES = (
     "api rate limit exceeded",
     "x-ratelimit-remaining: 0",
 )
+
+
+def _is_http_5xx(message: str) -> bool:
+    """True if `message` mentions an HTTP 5xx code (e.g. a TransientError text)."""
+    match = _HTTP_CODE_RE.search(message)
+    return match is not None and 500 <= int(match.group(1)) < 600
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,14 +88,23 @@ class GhCli:
             raise PermanentError("gh api /user returned no login")
         return login
 
-    async def search_review_requested(self, username: str) -> list[dict[str, Any]]:
+    async def search_review_requested(
+        self, username: str, *, extra_query: str = ""
+    ) -> list[dict[str, Any]]:
         """Search open PRs awaiting review by `username`.
+
+        `extra_query` is appended verbatim to the base query — used by the
+        trigger to inject a repo allowlist (`(repo:a/b OR user:c)`) that
+        narrows traffic at the GitHub side instead of relying on a
+        client-side filter alone. Empty string keeps the legacy behavior.
 
         Returns the flattened `items` list from `GET /search/issues`.
         """
         if not username:
             raise PermanentError("github.username is empty; cannot build search query")
         query = f"is:open is:pr review-requested:{username} archived:false"
+        if extra_query:
+            query = f"{query} {extra_query}"
         payload = await self._api(
             "GET",
             "/search/issues",
@@ -129,22 +144,97 @@ class GhCli:
         commit_id: str,
         body: str,
         comments: list[dict[str, Any]],
+        login: str | None = None,
     ) -> dict[str, Any]:
-        """Post one review object. `event` is always "COMMENT" (FR-010a)."""
+        """Post one review object. `event` is always "COMMENT" (FR-010a).
+
+        On HTTP 5xx (server accepted the POST then died on the response leg),
+        if `login` is provided, probe the reviews list for a matching
+        `(commit_id, login)` review and return it as if the POST had
+        succeeded — the GitHub server already created the row, so retrying
+        would post a duplicate. If the probe finds nothing or itself fails,
+        the original `TransientError` propagates so the dispatcher retries.
+        """
         request: dict[str, Any] = {
             "commit_id": commit_id,
             "event": _REVIEW_EVENT,
             "body": body,
             "comments": comments,
         }
-        payload = await self._api(
-            "POST",
-            f"/repos/{repo}/pulls/{pr_number}/reviews",
-            stdin_json=request,
-        )
+        try:
+            payload = await self._api(
+                "POST",
+                f"/repos/{repo}/pulls/{pr_number}/reviews",
+                stdin_json=request,
+            )
+        except TransientError as exc:
+            if login is not None and _is_http_5xx(str(exc)):
+                existing = await self._discover_existing_review(
+                    repo, pr_number, commit_id=commit_id, login=login
+                )
+                if existing is not None:
+                    return existing
+            raise
         if not isinstance(payload, dict):
             raise PermanentError("gh post review returned non-object")
         return payload
+
+    async def list_reviews_at(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        commit_id: str,
+        login: str,
+    ) -> list[dict[str, Any]]:
+        """Return submitted reviews on `pr_number` matching `(commit_id, login)`.
+
+        Pending reviews (`submitted_at == null`) are excluded — those don't
+        count as posted. `commit_id` filtering is client-side because the
+        endpoint doesn't accept a SHA filter.
+        """
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/reviews",
+            extra=("-f", "per_page=100"),
+            paginate=True,
+        )
+        if not isinstance(payload, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("commit_id") != commit_id:
+                continue
+            if raw.get("submitted_at") in (None, ""):
+                continue
+            user = raw.get("user")
+            if not isinstance(user, dict) or user.get("login") != login:
+                continue
+            out.append(cast("dict[str, Any]", raw))
+        return out
+
+    async def _discover_existing_review(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        commit_id: str,
+        login: str,
+    ) -> dict[str, Any] | None:
+        """Best-effort dedup probe. On any failure return None — the original
+        TransientError will propagate and the dispatcher will retry."""
+        try:
+            matches = await self.list_reviews_at(repo, pr_number, commit_id=commit_id, login=login)
+        except Exception:
+            # Best-effort dedup: any failure means the original TransientError
+            # propagates and the dispatcher retries. Documented in post_review.
+            return None
+        if not matches:
+            return None
+        # Take the most recently submitted matching review.
+        return max(matches, key=lambda r: str(r.get("submitted_at", "")))
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -241,8 +331,7 @@ def _safe_decode(b: bytes) -> str:
 def _merge_paginated_arrays(text: str) -> list[Any]:
     """`gh --paginate` on array endpoints emits `[..]\\n[..]\\n...`."""
     out: list[Any] = []
-    for chunk in _split_json_chunks(text):
-        loaded: Any = json.loads(chunk)
+    for loaded in _iter_json_documents(text):
         if isinstance(loaded, list):
             out.extend(loaded)  # type: ignore[arg-type]
         else:
@@ -257,8 +346,7 @@ def _merge_paginated_objects(text: str) -> dict[str, Any]:
     """
     merged: dict[str, Any] = {}
     items: list[Any] = []
-    for chunk in _split_json_chunks(text):
-        loaded: Any = json.loads(chunk)
+    for loaded in _iter_json_documents(text):
         if not isinstance(loaded, dict):
             continue
         if not merged:
@@ -270,36 +358,27 @@ def _merge_paginated_objects(text: str) -> dict[str, Any]:
     return merged
 
 
-def _split_json_chunks(text: str) -> list[str]:
-    """Split a `gh --paginate` blob into individual JSON documents."""
-    chunks: list[str] = []
-    depth = 0
-    start = 0
-    in_string = False
-    escape = False
-    for i, ch in enumerate(text):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch in "[{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch in "]}":
-            depth -= 1
-            if depth == 0:
-                chunks.append(text[start : i + 1])
-    if not chunks and text.strip():
-        chunks.append(text.strip())
-    return chunks
+def _iter_json_documents(text: str) -> list[Any]:
+    """Parse a `gh --paginate` blob into a list of JSON documents.
+
+    `gh --paginate` concatenates one JSON object per page back-to-back with
+    no separator. `JSONDecoder.raw_decode` peels them off one at a time —
+    no hand-rolled brace-depth state machine, and the JSON parser handles
+    quoting/escapes correctly by construction.
+    """
+    decoder = json.JSONDecoder()
+    documents: list[Any] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        obj, end = decoder.raw_decode(text, i)
+        documents.append(obj)
+        i = end
+    return documents
 
 
 class _suppress:

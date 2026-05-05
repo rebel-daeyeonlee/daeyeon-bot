@@ -22,6 +22,7 @@ AuditStatus = Literal[
     "skipped_withdrawn",
     "skipped_too_large",
     "skipped_already_reviewed",
+    "skipped_disallowed_repo",
     "failed",
 ]
 

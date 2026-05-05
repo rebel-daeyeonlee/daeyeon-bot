@@ -28,6 +28,7 @@ from daeyeon_bot.app.registry import (
     build_handler_registry,
     build_trigger_registry,
 )
+from daeyeon_bot.app.supervisor import TriggerSupervisor
 from daeyeon_bot.core.errors import QuotaError
 from daeyeon_bot.core.time import Clock, SystemClock
 from daeyeon_bot.handlers.pr_review import PauseGuard
@@ -205,9 +206,27 @@ def _build_gh_review_requested_deps(
     def _storage_factory() -> Any:
         return storage.connection(db_path)
 
+    pause_flag_path = config.pause_flag_path
+
+    def _pause_check() -> bool:
+        return pause_mod.is_paused(pause_flag_path)
+
+    supervisor = TriggerSupervisor()
+
+    async def _report_permanent_failure(reason: str) -> bool:
+        async with storage.connection(db_path) as conn:
+            return await supervisor.record_failure(
+                conn,
+                trigger_name="gh_review_requested",
+                reason=reason,
+                at=clock.now(),
+            )
+
     return GhReviewRequestedDeps(
         gh=gh,
         storage_factory=_storage_factory,
         github_username=github_username,
         clock=clock,
+        pause_check=_pause_check,
+        permanent_failure_reporter=_report_permanent_failure,
     )

@@ -11,9 +11,9 @@
 | 💡 **MINOR** | nit. 네이밍 · 주석 · 사소한 중복. 별도 PR 가능. |
 
 표기 규칙 (deterministic):
-- **PR-bound 영어 출력**: ASCII만 사용. 헤더 라인은 `CRITICAL` / `MAJOR` / `MINOR`, Verdict는 `PASS` / `CONCERNS` / `FAIL`. 이모지 사용 금지 (PR 호스트마다 렌더링 차이).
-- **한국어 토론(채팅)**: 이모지 포함. `🚨 CRITICAL` / `⚠️ MAJOR` / `💡 MINOR`, `✅ PASS` / `⚠️ CONCERNS` / `❌ FAIL`.
-- 두 표기를 섞지 않는다 — 출력 1개 안에서는 한 가지만.
+- **PR-bound 출력 (default)**: 본문 산문은 한국어, 라벨·룰 ID·`file:line`·코드 식별자·verdict 라벨은 ASCII 영어 토큰. 라벨 자체에는 이모지 금지(`CRITICAL` / `MAJOR` / `MINOR`, `PASS` / `CONCERNS` / `FAIL`) — PR 호스트별 렌더링 차이를 피한다.
+- **채팅 토론**: 라벨 앞에 이모지 토큰 허용. `🚨 CRITICAL` / `⚠️ MAJOR` / `💡 MINOR`, `✅ PASS` / `⚠️ CONCERNS` / `❌ FAIL`. 한 출력 안에서는 한 가지 표기만.
+- **사용자가 영어 본문을 명시 요청한 경우에만** PR-bound 본문도 영어. 그 외엔 한국어 default.
 - 예외: PR-bound caller의 sign-off 줄(`— daeyeon-bot 🐥`)은 ASCII-only 규칙에서 의도적으로 제외 — 봇 식별 마커. [delivery.md §Sign-off](delivery.md#sign-off) 참조.
 
 ## Verdict
@@ -24,48 +24,92 @@
 | ⚠️ **CONCERNS** | CRITICAL 0개, MAJOR ≥ 1개. 같은 PR에서 fix 후 머지. |
 | ❌ **FAIL** | CRITICAL ≥ 1개. 머지 금지. fix 후 재리뷰. |
 
-Verdict 라인은 review 마지막에 한 줄로. Recommendation Rationale은 한 문장.
+Verdict 라인 형식: `**Verdict**: <PASS | CONCERNS | FAIL> — <한 문장 근거>`. 본문 첫 줄에 위치하되, role-primed인 경우 `**Reviewer**: as Senior <Role>` 한 줄이 그 위에 들어간다. 근거는 별도 섹션이 아니라 같은 줄에 통합 — 별도 Recommendation Rationale 섹션을 두지 않는다.
 
 ## Review Summary 템플릿
 
-영어 PR-bound 출력의 표준 형태. 한국어 Overview 1줄은 *옵션* — 사용자의 destination이 모호하거나 채팅에서 요지 전달이 필요할 때만 추가 (영어 body는 그대로 유지).
+PR-bound 출력의 표준 형태. **본문 산문은 한국어**, 라벨·룰 ID·`file:line`·코드 식별자는 영어 ASCII 유지. 채팅 caller는 이모지/sign-off 정책만 다름 ([delivery.md](delivery.md) §Caller modes).
+
+### Summary 본문 분량 (HARD)
+
+- **Target ≤ 1500자, hard cap 2500자.** 초과 시 Pydantic validation 실패 → 1회 재시도 → DeadLetter.
+- **개요 단락이 본문의 절반 이상**이어야 한다. Findings 표가 본문을 점령하면 슬림화 실패 — finding 산문은 inline으로 옮겨라.
+- 허용 섹션만: (옵션) Reviewer 라인, Verdict 라인, 개요, Findings 표(N≤6 평면 표 / N>6 `<details open>` 로 감싸기), Positive(0–2 bullets, 없으면 생략), sign-off.
+- **금지**: Detail 산문(`### N. [SEV] ...`), 코드 펜스, 멀티문장 표 셀.
 
 ### Findings 표 분량 처리
 
+**모든 finding의 evidence·fix 산문은 `comments[]`의 InlineComment로**. 본문 표는 한 줄 요약만. CRITICAL/MAJOR는 inline 필수, MINOR는 권장(강제 X).
+
 | Findings 총 N | 출력 방식 |
 |---|---|
-| **N ≤ 15** | 평면 표 그대로. 모든 항목 Detail에. |
-| **15 < N ≤ 30** | 표는 평면 유지하되 severity 순(CRITICAL → MAJOR → MINOR)으로 정렬. Detail은 **파일별 그룹**으로 묶어 `### path/to/file.py` 헤더 아래 finding 나열. |
-| **N > 30, CRITICAL ≤ 15** | 표 상단 15개(severity desc)만 표시 + `…and <N-15> more (see Appendix)` 한 줄. 나머지는 같은 형식의 Appendix 섹션으로. CRITICAL은 *전부* 본문에 들어와야 함 — Appendix로 밀지 말 것. |
-| **N > 30, CRITICAL > 15** | 본문 표 = **CRITICAL 전부** (15-row cap 무시; CRITICAL이 본문을 가득 채움). MAJOR/MINOR는 전부 Appendix로. CRITICAL "all-in-main" 원칙이 15-row cap을 항상 이긴다. |
+| **N ≤ 6** | 평면 표 그대로. 표에 모든 행, Detail 산문 없음. |
+| **6 < N ≤ 30** | 표 전체를 `<details open><summary><b>Findings: N CRITICAL / M MAJOR / K MINOR</b></summary> ... </details>` 로 감싸기 (default expanded — 사용자가 접고 싶으면 토글 가능). severity 순 정렬(CRITICAL → MAJOR → MINOR). |
+| **N > 30, CRITICAL ≤ 15** | `<details open>` 안에 상단 15개(severity desc) + `…and <N-15> more (see Appendix)` 한 줄. 나머지는 같은 형식 Appendix 섹션으로. CRITICAL은 *전부* 본문에 — Appendix로 밀지 말 것. |
+| **N > 30, CRITICAL > 15** | 본문 표 = **CRITICAL 전부** (15-row cap 무시). MAJOR/MINOR는 전부 Appendix로. CRITICAL "all-in-main" 원칙이 15-row cap을 항상 이긴다. |
 
 **Rule column convention**: catalog ID(`[G35]`, `[P1]`, …) 가 매칭되면 그 ID를. 매칭 룰이 없으면 `—` (em dash). `—` 행도 SKILL.md hard-rule을 통과해야 한다 — 평문 룰 서술 + `file:line` 앵커 + fix hint 필수.
 
+**설명 셀 규칙**: ≤ 80자, 한 줄, 줄바꿈/코드 펜스/멀티문장 금지. Evidence·fix는 inline으로.
+
+### 템플릿 (PR-bound, default role, N ≤ 6)
+
 ```
-## Review Summary
+**Verdict**: <PASS | CONCERNS | FAIL> — <한 문장 근거>
 
-**Mode**: <PR review | File review | Pending-change | Review-of-reviews | Plan review>
-**Scope**: <PR #123 | files: a/b.py, c/d.yaml | HEAD..main>
-**Reviewer**: <Senior DevOps Engineer (default — line omitted when default) | as Senior X (when role-primed and role ≠ default)>
+**개요**
+<2–3문장 한국어. 이 PR이 무엇을 바꾸는지, 누구에게 영향이 가는지, 주요 위험 표면.
+finding 나열 금지 — walkthrough 성격의 단락.>
 
-**Overview**
-<1–2 sentence English. If role-primed, lead with the role's concern.>
-<선택: 한국어 한 줄 — "요지: ...">
+| # | Severity | File:Line | Rule | 설명 |
+|---|----------|-----------|------|------|
+| 1 | CRITICAL | path/to/file.py:42 | [G35] | 예외 무시 — daily-regression flake 원인. |
+| 2 | CRITICAL | .github/workflows/ci.yml:88 | [P1] | `continue-on-error: true` 가 unit-test 실패 가림. |
+| 3 | MAJOR    | .github/workflows/ci.yml:14 | [P2] | `timeout-minutes` 누락 — runner 무한 보유 가능. |
+| 4 | MAJOR    | scripts/release.sh:23 | — | rollback 경로 부재 — forward path만 문서화. |
+| 5 | MINOR    | scripts/deploy.sh:12 | [N3] | `tmp` → `release_artifact_dir` 권장. |
 
-**Findings: <N> CRITICAL / <M> MAJOR / <K> MINOR**
+**Positive**
+- `scripts/migrate.py` migration이 idempotent — 재실행 가능.
+- `_log.error` 가 structured field 포함 — Loki query 친화.
 
-| # | Severity | File:Line | Rule | Description |
-|---|----------|-----------|------|-------------|
-| 1 | CRITICAL | path/to/file.py:42 | [G35] | Swallowed exception (`except Exception: pass`); daily-regression flake source. |
-| 2 | CRITICAL | .github/workflows/ci.yml:88 | [P1] | `continue-on-error: true` masks unit-test failures. |
-| 3 | MAJOR    | .github/workflows/ci.yml:14 | [P2] | Job missing `timeout-minutes` — runner can be held indefinitely. |
-| 4 | MAJOR    | scripts/release.sh:23 | — | Release rollback path missing — only forward path documented. (free-form rule; passes hard-rules.) |
-| 5 | MINOR    | scripts/deploy.sh:12 | [N3] | `tmp` → `release_artifact_dir`. |
+— daeyeon-bot 🐥
+```
 
-**Detail**
+**N > 6 변형**: 위 표를 통째로 다음으로 감싼다 — `<details open><summary><b>Findings: N CRITICAL / M MAJOR / K MINOR</b></summary>` ... `</details>`. default-expanded 이므로 사용자가 토글로 접을 수 있다.
 
-### 1. [CRITICAL] path/to/file.py:42 — Swallowed exception
-<2–4 line evidence + suggested fix. Quote the offending line.>
+**Role-primed 변형**: Verdict 위에 `**Reviewer**: as Senior <Role>` 한 줄 추가, sign-off도 `— daeyeon-bot 🐥 (as Senior <Role>)`.
+
+Findings 0개(`**Verdict**: PASS`)면 표 자체 생략 — Verdict + 개요 + (옵션) Positive + sign-off. PR-bound 본문에서는 verdict 라벨 앞에 이모지를 붙이지 않는다(예: `✅ PASS` 금지, `PASS` 만 사용) — 채팅 caller에서만 이모지 토큰 허용.
+
+### Sign-off (필수)
+
+PR-bound 출력은 본문 **마지막 줄**에 빈 줄 하나 띄우고:
+
+```
+— daeyeon-bot 🐥
+```
+
+Role-primed: `— daeyeon-bot 🐥 (as Senior SRE)` 처럼 괄호 첨가. 누락 시 봇 식별 불가 — [delivery.md §Sign-off](delivery.md#sign-off) 가 SoT.
+
+## Inline comment 형식
+
+본문 Findings 표의 모든 산문(evidence·fix·실패 시나리오)이 **여기로** 간다. 본문은 한 줄, inline은 multi-line + code fence 허용.
+
+**필수 vs 선택**:
+- CRITICAL / MAJOR finding → InlineComment 1개 **필수**.
+- MINOR → 권장 (강제 X).
+
+**기본 한 줄 형태** (간단한 finding):
+
+```
+[CRITICAL] path/to/file.py:42 — ConnectionError 무음 처리. 좁혀잡고 structured field로 로깅 권장 — daily-regression flake 원인.
+```
+
+**확장 형태** (evidence + fix가 길 때):
+
+```
+[CRITICAL] path/to/file.py:42 — 예외 무시로 telemetry 실패가 silently 가려짐.
 
 ```python
 # offending
@@ -75,39 +119,15 @@ except Exception:
     pass
 ```
 
-Suggested fix: narrow to `ConnectionError`, log with `_log.error("telemetry.fetch_failed", err=...)`, propagate to retry.
-
-### 2. [CRITICAL] .github/workflows/ci.yml:88 — continue-on-error masks unit failures
-<2–4 line evidence + suggested fix.>
-
-### 3. [MAJOR] .github/workflows/ci.yml:14 — Job missing timeout-minutes
-...
-
-**Positive Observations**
-- Idempotent migration in `scripts/migrate.py`. Re-runnable.
-- `_log.error` includes structured fields — Loki query친화적.
-
-**Recommendation Rationale**
-<One sentence — why this verdict, not another.>
-
-**Verdict**: FAIL — 2 CRITICAL must clear before merge.
-```
-
-(채팅 caller일 때는 Severity §표기 규칙에 따라 `❌ FAIL` 등 이모지 형태로 치환.)
-
-## Inline comment 형식
-
-PR inline comment로 그대로 게시 가능한 형태:
-
-```
-[CRITICAL] path/to/file.py:42 — Silently swallows ConnectionError. Suggest narrowing to ConnectionError and logging with structured fields; otherwise daily-regression flake source.
+수정: `ConnectionError` 로 좁히고 `_log.error("telemetry.fetch_failed", err=...)` 로 logging,
+재시도 경로로 propagate. daily-regression이 깨지면 이 줄에서 시작된다.
 ```
 
 규칙:
-- `[SEVERITY] file:line — sentence.` 한 줄.
-- 끝에 마침표.
-- 가능하면 한 줄 안에 fix hint 포함. 길어지면 두 번째 문장에.
-- 영어. (사용자가 한국어를 명시하면 한국어.)
+- 첫 줄은 항상 `[SEVERITY] file:line — 한국어 한 문장.` 마침표 포함.
+- 한국어 산문 + ASCII 라벨/`file:line`/룰 ID/코드 식별자.
+- 사용자가 영어 출력 명시 요청한 경우에만 영어.
+- 한 inline 안에서 같은 finding의 evidence + fix를 묶는다 — 산문을 본문 표로 다시 보내지 말 것.
 
 ## Pushback 처리
 
@@ -164,9 +184,9 @@ Verdict 옵션:
 
 `"[role] 입장에서 리뷰해줘"` 패턴.
 
-- **Default = Senior DevOps Engineer** — 사용자가 role을 지정하지 않으면 이 페르소나가 default. Overview 첫 줄에 role 태그를 *생략*한다 (이미 known).
-- **Role을 지정한 경우 (default와 다름)** — Overview 첫 줄에 `as Senior <Role>:` 명시. 그 row의 차원을 Findings 표 정렬에서 위로 끌어올림.
-- **Default를 다시 명시한 경우** ("DevOps 입장에서") — 굳이 role 태그를 추가하지 않는다 (no-op). 사용자가 다른 페르소나에서 돌아왔음을 알리는 신호로만 처리.
+- **Default = Senior DevOps Engineer** — 사용자가 role을 지정하지 않으면 이 페르소나가 default. `**Reviewer**:` 라인을 *생략*한다 (이미 known). Sign-off도 괄호 첨가 없이 `— daeyeon-bot 🐥`.
+- **Role을 지정한 경우 (default와 다름)** — Verdict 라인 **바로 위**에 `**Reviewer**: as Senior <Role>` 한 줄을 추가한다. 그 row의 차원을 Findings 표 정렬에서 위로 끌어올림. Sign-off도 `— daeyeon-bot 🐥 (as Senior <Role>)` 로 변경.
+- **Default를 다시 명시한 경우** ("DevOps 입장에서") — Reviewer 라인을 추가하지 않는다 (no-op). 사용자가 다른 페르소나에서 돌아왔음을 알리는 신호로만 처리.
 
 | Role | 가장 먼저 보는 차원 |
 |---|---|

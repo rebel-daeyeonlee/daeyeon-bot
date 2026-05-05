@@ -154,8 +154,11 @@ class RealClaudeSession:
             return
         try:
             await client.disconnect()
-        except CLIConnectionError:  # pragma: no cover — best-effort
-            return
+        except Exception as disconnect_exc:  # pragma: no cover — best-effort teardown
+            # Broad catch: __aexit__ must not mask the original exception that
+            # was unwinding the `async with`. Any disconnect failure is
+            # logged and swallowed so the caller's exception (if any) wins.
+            _log.warning("claude.disconnect_failed", error=str(disconnect_exc))
 
     async def query(self, prompt: str, *, system: str | None = None) -> str:
         if not self._entered:
@@ -164,7 +167,7 @@ class RealClaudeSession:
         client = await self._ensure_connected(effective_system)
         try:
             await client.query(prompt)
-            return await _collect_assistant_text(client)
+            return await _collect_assistant_text(client, prompt_chars=len(prompt))
         except ProcessError as exc:
             _raise_process_error(exc)
         except CLIConnectionError as exc:
@@ -195,7 +198,7 @@ class RealClaudeSession:
         return client
 
 
-async def _collect_assistant_text(client: ClaudeSDKClient) -> str:
+async def _collect_assistant_text(client: ClaudeSDKClient, *, prompt_chars: int) -> str:
     """Drain the response stream and concatenate assistant text blocks.
 
     Empty results — no `AssistantMessage`/`TextBlock` ever yielded, or only
@@ -224,6 +227,10 @@ async def _collect_assistant_text(client: ClaudeSDKClient) -> str:
                     parts.append(block.text)
     text = "".join(parts)
     if not text.strip():
+        # `prompt_chars` is the only context the operator gets when triaging
+        # repeated empties — a near-zero prompt is a serializer bug, a
+        # near-cap prompt suggests we're hitting an SDK truncation path.
+        _log.warning("claude.empty_assistant_text", prompt_chars=prompt_chars)
         raise TransientError("claude returned no assistant text")
     return text
 

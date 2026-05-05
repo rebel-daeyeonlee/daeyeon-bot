@@ -56,6 +56,10 @@ async def run_until_stopped(
                     elapsed_s=round(elapsed_s, 3),
                     tick_s=tick_s,
                     threshold_s=stale_threshold_s,
+                    hint=(
+                        "event loop blocked or system paused; check journald for"
+                        " concurrent blocking ops, raise tick_s, or reduce handler concurrency"
+                    ),
                 )
             _touch(flag_path)
             _sd_notify_watchdog()

@@ -270,6 +270,93 @@ async def test_empty_stdout_returns_empty_dict() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_review_5xx_dedups_via_reviews_list() -> None:
+    """If the POST returns 5xx but the row exists, return the matching review.
+
+    GitHub occasionally accepts the POST then 502/503s on the response leg —
+    a naive retry would post a duplicate review. With `login` provided, the
+    wrapper probes `GET /pulls/{n}/reviews`, filters by `(commit_id, login,
+    submitted_at != null)`, and returns the existing row instead of raising.
+    """
+    cli = GhCli()
+    matching_review = {
+        "id": 12345,
+        "commit_id": "abc123",
+        "submitted_at": "2026-05-04T14:31:02Z",
+        "user": {"login": "daeyeon-bot"},
+        "state": "COMMENTED",
+    }
+    other_review = {
+        "id": 999,
+        "commit_id": "older_sha",
+        "submitted_at": "2026-04-01T00:00:00Z",
+        "user": {"login": "daeyeon-bot"},
+    }
+    pending_review = {
+        "id": 998,
+        "commit_id": "abc123",
+        "submitted_at": None,
+        "user": {"login": "daeyeon-bot"},
+    }
+
+    async def factory(*args: Any, **_kwargs: Any) -> _FakeProc:
+        if "POST" in args:
+            return _FakeProc(returncode=1, stderr=b"HTTP 502: Bad Gateway\n")
+        # GET /reviews — return the candidate list.
+        body = json.dumps([other_review, pending_review, matching_review]).encode()
+        return _FakeProc(returncode=0, stdout=body)
+
+    with _patch_subprocess(factory):
+        out = await cli.post_review(
+            "owner/repo",
+            42,
+            commit_id="abc123",
+            body="Summary",
+            comments=[],
+            login="daeyeon-bot",
+        )
+    assert out["id"] == 12345
+    assert out["submitted_at"] == "2026-05-04T14:31:02Z"
+
+
+@pytest.mark.asyncio
+async def test_post_review_5xx_without_login_propagates() -> None:
+    """Without `login`, the wrapper can't dedup — TransientError must propagate."""
+    cli = GhCli()
+    with _patch_subprocess(_err_factory(1, b"HTTP 502: Bad Gateway\n")):
+        with pytest.raises(TransientError):
+            await cli.post_review(
+                "owner/repo",
+                42,
+                commit_id="abc123",
+                body="Summary",
+                comments=[],
+            )
+
+
+@pytest.mark.asyncio
+async def test_post_review_5xx_no_match_propagates() -> None:
+    """If the dedup probe finds nothing, the original TransientError propagates."""
+    cli = GhCli()
+
+    async def factory(*args: Any, **_kwargs: Any) -> _FakeProc:
+        if "POST" in args:
+            return _FakeProc(returncode=1, stderr=b"HTTP 503: Service Unavailable\n")
+        return _FakeProc(returncode=0, stdout=json.dumps([]).encode())
+
+    with _patch_subprocess(factory):
+        with pytest.raises(TransientError):
+            await cli.post_review(
+                "owner/repo",
+                42,
+                commit_id="abc123",
+                body="Summary",
+                comments=[],
+                login="daeyeon-bot",
+            )
+
+
+@pytest.mark.asyncio
 async def test_gh_cli_missing_raises_permanent() -> None:
     """If `gh` isn't on PATH, FileNotFoundError → PermanentError."""
 

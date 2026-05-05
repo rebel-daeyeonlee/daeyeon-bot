@@ -15,16 +15,15 @@ from daeyeon_bot.core.errors import ValidationError
 from daeyeon_bot.core.events import Event, make_event
 from daeyeon_bot.handlers.pr_review import (
     _append_folded_bullets,  # pyright: ignore[reportPrivateUsage]
-    _inline_to_api,  # pyright: ignore[reportPrivateUsage]
     _parse_payload,  # pyright: ignore[reportPrivateUsage]
     _read_author,  # pyright: ignore[reportPrivateUsage]
     _read_head_sha,  # pyright: ignore[reportPrivateUsage]
     _read_requested_logins,  # pyright: ignore[reportPrivateUsage]
     _read_review_id,  # pyright: ignore[reportPrivateUsage]
     _read_submitted_at,  # pyright: ignore[reportPrivateUsage]
-    _render_user_message,  # pyright: ignore[reportPrivateUsage]
     _strip_code_fence,  # pyright: ignore[reportPrivateUsage]
 )
+from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment
 
 # ── _parse_payload ─────────────────────────────────────────────────────────
@@ -38,25 +37,43 @@ def _event(payload: dict[str, object]) -> Event:
     )
 
 
-def test_parse_payload_returns_normalized_tuple() -> None:
+def test_parse_payload_returns_normalized_struct() -> None:
     ev = _event(
         {
             "repo": "octo/cat",
             "pr_number": 7,
             "head_sha": "abc",
-            "request_gen": "1",
+            "request_gen": 1,
             "force": True,
         }
     )
-    repo, pr_number, head_sha, gen, force = _parse_payload(ev)
-    assert (repo, pr_number, head_sha, gen, force) == ("octo/cat", 7, "abc", "1", True)
+    parsed = _parse_payload(ev)
+    assert (parsed.repo, parsed.pr_number, parsed.head_sha, parsed.request_gen, parsed.force) == (
+        "octo/cat",
+        7,
+        "abc",
+        1,
+        True,
+    )
+
+
+def test_parse_payload_coerces_legacy_string_request_gen() -> None:
+    """Pre-A5 payloads stored `request_gen` as a string. Tolerate them."""
+    ev = _event({"repo": "o/r", "pr_number": 1, "head_sha": "z", "request_gen": "3"})
+    assert _parse_payload(ev).request_gen == 3
+
+
+def test_parse_payload_rejects_non_int_request_gen() -> None:
+    ev = _event({"repo": "o/r", "pr_number": 1, "head_sha": "z", "request_gen": "abc"})
+    with pytest.raises(ValidationError):
+        _parse_payload(ev)
 
 
 def test_parse_payload_defaults_request_gen_to_zero() -> None:
     ev = _event({"repo": "o/r", "pr_number": 1, "head_sha": "z"})
-    _, _, _, gen, force = _parse_payload(ev)
-    assert gen == "0"
-    assert force is False
+    parsed = _parse_payload(ev)
+    assert parsed.request_gen == 0
+    assert parsed.force is False
 
 
 def test_parse_payload_missing_repo_raises() -> None:
@@ -183,23 +200,56 @@ def test_append_folded_bullets_no_trailing_newline() -> None:
     assert out.startswith("Summary line.\n\n- [a.py near L3]")
 
 
-# ── _inline_to_api ────────────────────────────────────────────────────────
+def test_append_folded_bullets_inserts_before_signoff() -> None:
+    """Sign-off must remain the last non-empty line — `_OUTPUT_DIRECTIVE`
+    enforces this on Claude's side, the helper must not break it after.
+    """
+    summary = "Verdict: PASS — looks fine.\n\n개요\n간단한 변경.\n\n— daeyeon-bot 🐥"
+    out = _append_folded_bullets(
+        summary,
+        [InlineComment(path="a.py", line=3, side="RIGHT", body="nit")],
+    )
+    last_non_empty = next(line for line in reversed(out.split("\n")) if line.strip())
+    assert last_non_empty == "— daeyeon-bot 🐥"
+    assert "- [a.py near L3] nit" in out
+    bullets_idx = out.index("- [a.py near L3]")
+    signoff_idx = out.index("— daeyeon-bot 🐥")
+    assert bullets_idx < signoff_idx
+
+
+def test_append_folded_bullets_handles_role_primed_signoff() -> None:
+    summary = (
+        "Verdict: CONCERNS — major fix 권장.\n\n"
+        "**Reviewer**: as Senior SRE\n\n"
+        "개요\n변경 요약.\n\n"
+        "— daeyeon-bot 🐥 (as Senior SRE)"
+    )
+    out = _append_folded_bullets(
+        summary,
+        [InlineComment(path="b.py", line=7, side="RIGHT", body="evidence")],
+    )
+    last_non_empty = next(line for line in reversed(out.split("\n")) if line.strip())
+    assert last_non_empty == "— daeyeon-bot 🐥 (as Senior SRE)"
+    assert "- [b.py near L7] evidence" in out
+
+
+# ── inline_to_api ─────────────────────────────────────────────────────────
 
 
 def test_inline_to_api_single_line_anchor() -> None:
-    payload = _inline_to_api(InlineComment(path="x.py", line=5, side="RIGHT", body="ok"))
+    payload = inline_to_api(InlineComment(path="x.py", line=5, side="RIGHT", body="ok"))
     assert payload == {"path": "x.py", "line": 5, "side": "RIGHT", "body": "ok"}
 
 
 def test_inline_to_api_multi_line_anchor_includes_start_line() -> None:
-    payload = _inline_to_api(
+    payload = inline_to_api(
         InlineComment(path="x.py", line=10, side="RIGHT", body="ok", start_line=5)
     )
     assert payload["start_line"] == 5
     assert payload["start_side"] == "RIGHT"
 
 
-# ── _render_user_message ──────────────────────────────────────────────────
+# ── render_user_message ───────────────────────────────────────────────────
 
 
 def test_render_user_message_omits_diff_for_non_string_patch() -> None:
@@ -212,7 +262,7 @@ def test_render_user_message_omits_diff_for_non_string_patch() -> None:
             "patch": None,
         }
     ]
-    out = _render_user_message(
+    out = render_user_message(
         repo="o/r",
         pr_number=1,
         title="t",
@@ -235,7 +285,7 @@ def test_render_user_message_includes_diff_when_patch_is_string() -> None:
             "patch": "@@ -1,1 +1,1 @@\n-old\n+new\n",
         }
     ]
-    out = _render_user_message(
+    out = render_user_message(
         repo="o/r",
         pr_number=1,
         title="t",

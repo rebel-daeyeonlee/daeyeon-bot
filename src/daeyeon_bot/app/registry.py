@@ -6,6 +6,7 @@ root stays small and tests can build narrow registries.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
@@ -167,13 +168,20 @@ class GhReviewRequestedDeps:
 
     The trigger writes events directly via `storage_factory` (so the state
     UPSERT and the events INSERT commit in one TX). `gh` is a `GhCli` or
-    a `FakeGh`; `clock` defaults to `SystemClock`.
+    a `FakeGh`; `clock` defaults to `SystemClock`. `pause_check` is the
+    sync flag-file probe (`app.pause.is_paused`) bound to the configured
+    `pause_flag_path`; on True the trigger sleeps one interval without
+    hitting the GitHub API. `permanent_failure_reporter` records each
+    `PermanentError` against `TriggerSupervisor` and returns True once the
+    sliding window is tripped — the trigger then stops.
     """
 
     gh: Any
     storage_factory: StorageFactory
     github_username: str
     clock: Clock
+    pause_check: Callable[[], bool]
+    permanent_failure_reporter: gh_review_requested_trigger.PermanentFailureReporter
 
 
 def build_trigger_registry(
@@ -225,12 +233,22 @@ def instantiate_trigger(
             if isinstance(entry, GhReviewRequestedTriggerEntry)
             else config.gh_review_requested_trigger_entry()
         )
+        # Inherit the pr_review handler's allowed_repos so the search query
+        # narrows to the same set the handler will accept. Two layers but
+        # one source of truth — operators only edit `[handlers.pr_review]`.
+        pr_review_entry = config.pr_review_handler_entry()
+        search_extra_query = gh_review_requested_trigger.build_search_extra_query(
+            pr_review_entry.allowed_repos
+        )
         instance = gh_review_requested_trigger.GhReviewRequestedTrigger(
             gh=gh_review_requested_deps.gh,
             storage_factory=gh_review_requested_deps.storage_factory,
             github_username=gh_review_requested_deps.github_username,
             poll_interval_seconds=float(gh_entry.poll_interval_seconds),
             clock=gh_review_requested_deps.clock,
+            pause_check=gh_review_requested_deps.pause_check,
+            permanent_failure_reporter=gh_review_requested_deps.permanent_failure_reporter,
+            search_extra_query=search_extra_query,
         )
         return TriggerRecord(
             name=name,

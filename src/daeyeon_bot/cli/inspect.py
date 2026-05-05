@@ -9,6 +9,7 @@ from pathlib import Path
 
 import typer
 
+from daeyeon_bot.app import ratelimit as ratelimit_mod
 from daeyeon_bot.app.config import Config, load
 from daeyeon_bot.app.registry import build_handler_registry
 from daeyeon_bot.app.supervisor import list_quarantined, unquarantine
@@ -274,6 +275,30 @@ def _format_audit_row(row: AuditRow) -> str:
         f"{when}  {row.repo}#{row.pr_number}@{row.head_sha[:8]}"
         f"  status={row.status}  {review}  persona={persona}{chain}{err}"
     )
+
+
+@app.command("ratelimit", help="Show token-bucket state for each rate-limit bucket.")
+def ratelimit_cmd(
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+) -> None:
+    rows = asyncio.run(_ratelimit_snapshot(config_path=config))
+    if not rows:
+        typer.echo("(no rate-limit buckets — run `just migrate`)")
+        return
+    typer.echo(f"{'name':16s} {'tokens':>8s} {'capacity':>10s} {'refill/s':>10s}  last_refill")
+    for name, tokens, capacity, refill_per_sec, last_refill in rows:
+        typer.echo(
+            f"{name:16s} {tokens:8.2f} {capacity:10.2f} {refill_per_sec:10.3f}  {last_refill}"
+        )
+
+
+async def _ratelimit_snapshot(
+    *, config_path: str | None
+) -> list[tuple[str, float, float, float, str]]:
+    cfg = load(config_path)
+    async with storage.connection(cfg.db_path) as conn:
+        await storage.apply_migrations(conn)
+        return await ratelimit_mod.snapshot(conn)
 
 
 @handlers.command("ls", help="List configured handlers and their effective manifests.")

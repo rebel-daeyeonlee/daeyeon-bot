@@ -9,6 +9,7 @@ without standing up a full daemon. The full TaskGroup wiring lives in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,10 @@ import pytest
 from daeyeon_bot.core.errors import AuthError
 from daeyeon_bot.core.time import Clock, SystemClock
 from daeyeon_bot.infra import storage
-from daeyeon_bot.triggers.gh_review_requested import GhReviewRequestedTrigger
+from daeyeon_bot.triggers.gh_review_requested import (
+    GhReviewRequestedTrigger,
+    build_search_extra_query,
+)
 from tests.fakes.gh_cli import FakeGh
 
 REPO = "octo/cat"
@@ -41,12 +45,16 @@ def _trigger(*, gh: FakeGh, db_path: Path, **kwargs: Any) -> GhReviewRequestedTr
         async with storage.connection(db_path) as conn:
             yield conn
 
+    pause_check = kwargs.pop("pause_check", lambda: False)
+    permanent_failure_reporter = kwargs.pop("permanent_failure_reporter", None)
     return GhReviewRequestedTrigger(
         gh=gh,
         storage_factory=factory,
         github_username=kwargs.pop("username", "daeyeon-lee"),
         poll_interval_seconds=kwargs.pop("poll_interval_seconds", 0.01),
         clock=kwargs.pop("clock", SystemClock()),
+        pause_check=pause_check,
+        permanent_failure_reporter=permanent_failure_reporter,
     )
 
 
@@ -116,8 +124,7 @@ async def test_first_observation_emits_gen_one(db_path: Path) -> None:
     events = await _events_for(db_path, REPO, PR)
     assert len(events) == 1
     assert events[0]["type"] == "gh.review_requested"
-    assert "request_gen" in events[0]["payload_json"]
-    assert '"1"' in events[0]["payload_json"]
+    assert '"request_gen": 1' in events[0]["payload_json"]
     assert await _outbox_handlers(db_path) == ["pr_review"]
 
 
@@ -152,7 +159,7 @@ async def test_new_push_increments_gen(db_path: Path) -> None:
     assert state["in_pending_set"] is True
     events = await _events_for(db_path, REPO, PR)
     assert len(events) == 2
-    assert '"2"' in events[1]["payload_json"]
+    assert '"request_gen": 2' in events[1]["payload_json"]
 
 
 async def test_re_request_after_withdrawal_increments_gen(db_path: Path) -> None:
@@ -173,7 +180,7 @@ async def test_re_request_after_withdrawal_increments_gen(db_path: Path) -> None
     assert state["in_pending_set"] is True
     events = await _events_for(db_path, REPO, PR)
     assert len(events) == 2
-    assert '"2"' in events[1]["payload_json"]
+    assert '"request_gen": 2' in events[1]["payload_json"]
 
 
 async def test_permanent_withdrawal_keeps_state_no_emit(db_path: Path) -> None:
@@ -315,8 +322,10 @@ async def test_poll_once_skips_non_dict_items(db_path: Path) -> None:
     from typing import cast
 
     class _BadGh(FakeGh):
-        async def search_review_requested(self, username: str) -> list[dict[str, Any]]:
-            base = await super().search_review_requested(username)
+        async def search_review_requested(
+            self, username: str, *, extra_query: str = ""
+        ) -> list[dict[str, Any]]:
+            base = await super().search_review_requested(username, extra_query=extra_query)
             return [*base, cast("dict[str, Any]", "not-a-dict")]  # type: ignore[list-item]
 
     gh = _BadGh()
@@ -389,3 +398,241 @@ async def test_extract_head_sha_handles_malformed_payloads() -> None:
     assert _extract_head_sha({"head": {"sha": ""}}) is None
     assert _extract_head_sha({"head": {"sha": 123}}) is None
     assert _extract_head_sha({"head": {"sha": "abc"}}) == "abc"
+
+
+async def test_run_loop_skips_polling_while_paused(db_path: Path) -> None:
+    """B2: while `pause_check` returns True, the trigger must not call
+    `search_review_requested`. Once it flips False, polling resumes."""
+
+    class _CountingGh(FakeGh):
+        search_calls: int = 0
+
+        async def search_review_requested(
+            self, username: str, *, extra_query: str = ""
+        ) -> list[dict[str, Any]]:
+            self.search_calls += 1
+            return await super().search_review_requested(username, extra_query=extra_query)
+
+    gh = _CountingGh()
+    gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
+
+    paused = {"flag": True}
+    trig = _trigger(
+        gh=gh,
+        db_path=db_path,
+        pause_check=lambda: paused["flag"],
+        poll_interval_seconds=0.001,
+    )
+
+    task = asyncio.create_task(trig.run(_unused_emit, _unused_ctx))  # type: ignore[arg-type]
+    try:
+        # Let the loop spin a few iterations while paused. No GitHub calls.
+        await asyncio.sleep(0.02)
+        assert gh.search_calls == 0
+
+        # Flip the flag — next iteration should issue at least one search.
+        paused["flag"] = False
+        await asyncio.sleep(0.05)
+        assert gh.search_calls >= 1
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _unused_emit(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover — never called
+    raise AssertionError("emit must not be called by gh_review_requested")
+
+
+_unused_ctx: Any = object()
+
+
+async def test_run_loop_stops_when_failure_reporter_returns_true(db_path: Path) -> None:
+    """B3: on PermanentError, the trigger reports the failure; if the
+    reporter returns True (quarantine threshold tripped), the loop exits."""
+    from daeyeon_bot.core.errors import PermanentError
+
+    class _AlwaysFailGh(FakeGh):
+        async def search_review_requested(
+            self, username: str, *, extra_query: str = ""
+        ) -> list[dict[str, Any]]:
+            del username, extra_query
+            raise PermanentError("simulated bug")
+
+    gh = _AlwaysFailGh()
+    calls = {"count": 0}
+
+    async def _reporter(reason: str) -> bool:
+        calls["count"] += 1
+        # Trip after the 3rd failure.
+        return calls["count"] >= 3
+
+    trig = _trigger(
+        gh=gh,
+        db_path=db_path,
+        permanent_failure_reporter=_reporter,
+        poll_interval_seconds=0.001,
+    )
+
+    # `run` should return on its own (no cancellation needed) once the
+    # reporter signals quarantine.
+    await asyncio.wait_for(trig.run(_unused_emit, _unused_ctx), timeout=1.0)
+    assert calls["count"] == 3
+
+
+class _CountingGh(FakeGh):
+    """FakeGh that counts `pr_get` calls and stamps each search hit
+    with a configurable `updated_at`. Used to exercise the C2 cache.
+    """
+
+    item_updated_at: str | None = None
+    pr_get_count: int = 0
+
+    async def search_review_requested(
+        self, username: str, *, extra_query: str = ""
+    ) -> list[dict[str, Any]]:
+        base = await super().search_review_requested(username, extra_query=extra_query)
+        if self.item_updated_at is not None:
+            for item in base:
+                item["updated_at"] = self.item_updated_at
+        return base
+
+    async def pr_get(self, repo: str, pr_number: int) -> dict[str, Any]:
+        self.pr_get_count += 1
+        return await super().pr_get(repo, pr_number)
+
+
+async def test_poll_once_skips_pr_get_for_fresh_state(db_path: Path) -> None:
+    """C2: when state.last_observed_at >= item.updated_at, the cached
+    head_sha is reused and `pr_get` is skipped (saves a gh round-trip
+    per cycle for steady-state PRs).
+    """
+    gh = _CountingGh()
+    gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
+    trig = _trigger(gh=gh, db_path=db_path)
+
+    # First poll: no state row → pr_get runs to learn head_sha.
+    first = await trig.poll_once()
+    assert first == 1
+    assert gh.pr_get_count == 1
+
+    # Second poll: search hint is stamped 2020 (well before the state's
+    # last_observed_at, which was set to `clock.now()` above) → cache hit.
+    gh.pr_get_count = 0
+    gh.item_updated_at = "2020-01-01T00:00:00Z"
+    second = await trig.poll_once()
+    assert second == 0  # head unchanged, no emit
+    assert gh.pr_get_count == 0  # ← the cache prevented the round-trip
+
+
+async def test_poll_once_calls_pr_get_when_item_is_fresher(db_path: Path) -> None:
+    """C2: when item.updated_at > state.last_observed_at, the search hint
+    indicates churn — `pr_get` must run to refresh the head SHA. Confirms
+    the cache doesn't go too far and silently miss real reviewer/SHA churn.
+    """
+    gh = _CountingGh()
+    gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
+    trig = _trigger(gh=gh, db_path=db_path)
+
+    await trig.poll_once()
+    gh.pr_get_count = 0
+    gh.item_updated_at = "9999-12-31T00:00:00Z"
+    await trig.poll_once()
+    assert gh.pr_get_count == 1
+
+
+async def test_poll_once_calls_pr_get_when_search_lacks_updated_at(
+    db_path: Path,
+) -> None:
+    """C2 graceful degradation: if the search payload omits `updated_at`,
+    the cache must fall back to the safe path (call pr_get) rather than
+    silently reuse a possibly-stale SHA.
+    """
+    gh = _CountingGh()
+    gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
+    trig = _trigger(gh=gh, db_path=db_path)
+
+    await trig.poll_once()
+    gh.pr_get_count = 0
+    gh.item_updated_at = None  # no `updated_at` in the search hit
+    await trig.poll_once()
+    assert gh.pr_get_count == 1
+
+
+async def test_run_loop_does_not_report_transient_failures(db_path: Path) -> None:
+    """B3: TransientError / RateLimitError must NOT increment the supervisor —
+    those are normal blips, not bug-shaped failures."""
+    from daeyeon_bot.core.errors import TransientError
+
+    class _TransientGh(FakeGh):
+        calls: int = 0
+
+        async def search_review_requested(
+            self, username: str, *, extra_query: str = ""
+        ) -> list[dict[str, Any]]:
+            self.calls += 1
+            if self.calls > 3:
+                # Recover after a few transient blips.
+                return await super().search_review_requested(username, extra_query=extra_query)
+            raise TransientError("blip")
+
+    gh = _TransientGh()
+    reporter_calls = {"count": 0}
+
+    async def _reporter(reason: str) -> bool:
+        reporter_calls["count"] += 1
+        return False
+
+    trig = _trigger(
+        gh=gh,
+        db_path=db_path,
+        permanent_failure_reporter=_reporter,
+        poll_interval_seconds=0.001,
+    )
+
+    task = asyncio.create_task(trig.run(_unused_emit, _unused_ctx))
+    try:
+        # Wait for several iterations, including the recovery.
+        await asyncio.sleep(0.05)
+        assert gh.calls >= 4
+        assert reporter_calls["count"] == 0
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+# ── build_search_extra_query mapping ──────────────────────────────────────
+
+
+def test_build_search_extra_query_empty_returns_empty_string() -> None:
+    assert build_search_extra_query([]) == ""
+
+
+def test_build_search_extra_query_all_owner_globs_dedupes_to_user_clause() -> None:
+    # Same owner twice + different owner → unique `user:` per owner.
+    fragment = build_search_extra_query(["rebellions-sw/*", "rebellions-sw/*", "octo/*"])
+    assert fragment == "(user:rebellions-sw OR user:octo)"
+
+
+def test_build_search_extra_query_all_specific_emits_repo_clauses() -> None:
+    fragment = build_search_extra_query(["rebellions-sw/daeyeon-bot", "rebellions-sw/other"])
+    assert fragment == "(repo:rebellions-sw/daeyeon-bot OR repo:rebellions-sw/other)"
+
+
+def test_build_search_extra_query_specific_subsumed_by_owner_glob() -> None:
+    # `rebellions-sw/*` already covers `rebellions-sw/daeyeon-bot`; specific
+    # entry must be dropped to avoid redundant `repo:` clause.
+    fragment = build_search_extra_query(
+        ["rebellions-sw/*", "rebellions-sw/daeyeon-bot", "octo/cat"]
+    )
+    assert fragment == "(user:rebellions-sw OR repo:octo/cat)"
+
+
+def test_build_search_extra_query_complex_glob_falls_back_to_handler_only() -> None:
+    # `*foo*` and bare entries can't be expressed as a GitHub search clause;
+    # fall back to "" so handler-side fnmatch gate still enforces.
+    assert build_search_extra_query(["*foo*"]) == ""
+    assert build_search_extra_query([""]) == ""
+    assert build_search_extra_query(["no-slash"]) == ""
+    assert build_search_extra_query(["*/repo"]) == ""

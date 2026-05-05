@@ -88,7 +88,7 @@ violates this layering fails lint.
 
 ```
 trigger.emit_one()
-   └── infra/outbox.write_event_and_outbox_rows()           [single tx]
+   └── infra/outbox.insert_event() + enqueue_handler()      [single tx]
             ↓
 dispatcher poll loop (every ~200 ms)
    └── infra/outbox.claim_one()                             [atomic UPDATE]
@@ -219,8 +219,9 @@ flags itself.
 - `pytest-asyncio` mode is `auto` — async tests don't need
   `@pytest.mark.asyncio`.
 - Coverage targets (`PLAN.md` §6.3): core/app ≥ 90 %, infra ≥ 80 %, cli ≥ 60 %.
-  Current overall: 77 % (cli/lifecycle.py and cli/ops.py drag it down on
-  paths that need a real launchd / systemd to exercise).
+  Current overall: 83 % (cli/lifecycle.py and cli/ops.py still drag the cli
+  bucket below 60 % on paths that need a real launchd / systemd to exercise —
+  see `docs/OPTIMIZATION_PLAN.md` D1a/D1b).
 
 ## Runtime layout
 
@@ -276,7 +277,9 @@ Exit codes the CLI returns:
 
 1. `src/daeyeon_bot/triggers/<name>.py` exposing `MANIFEST: TriggerManifest`
    and an async `emit_one(...)` that writes through
-   `infra/outbox.write_event_and_outbox_rows`.
+   `infra/outbox.insert_event()` + `infra/outbox.enqueue_handler()` in a
+   single transaction (the `events.UNIQUE(source, source_dedup_key)`
+   constraint is what makes a re-emit a no-op).
 2. Register it in `app/registry.py:instantiate_trigger`.
 3. `[triggers.<name>] enabled = true` in `config.example.toml`.
 4. Wire it into the supervisor (`app/supervisor.py`) if it's a long-running

@@ -173,6 +173,7 @@ daeyeon-bot inspect events ls              # recent events
 daeyeon-bot inspect events get <event_id>  # full event + outbox/runs history
 daeyeon-bot inspect handlers ls            # registered handlers + manifests
 daeyeon-bot inspect pr-review              # last PR-review attempts (audit table)
+daeyeon-bot inspect ratelimit              # token-bucket state for each bucket
 ```
 
 ## Exit codes wrappers care about

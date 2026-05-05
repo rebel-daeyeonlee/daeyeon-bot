@@ -50,6 +50,16 @@ daeyeon-bot ops replay <event_id>             # dry-run
 daeyeon-bot ops replay <event_id> --confirm   # bumps attempt_epoch
 ```
 
+### Inspect rate-limit state
+```bash
+daeyeon-bot inspect ratelimit                 # token-bucket snapshot
+```
+Shows each bucket's `tokens / capacity / refill_per_sec / last_refill`.
+The dispatcher decrements `claude_call` (seeded by migration 003) before
+every claim. If `tokens` stays at 0 for long stretches, polling is
+outpacing refill — bump `[ratelimit].claude_call_refill_per_sec` in
+`config.toml`.
+
 ---
 
 ## 2. Mac / Linux parity
@@ -286,10 +296,11 @@ default; configurable via `[handlers.pr_review].persona_skill`. The
 skill is reloaded from disk on every event by mtime — no daemon
 restart needed when the persona changes.
 
-The feature ships behind `[handlers.pr_review].enabled = false` by
-default. The bundled `daeyeon-bot-code-review` skill lives in the repo
-at `.claude/skills/`, and the loader looks there by default — flipping
-the handler on works without any extra setup.
+The feature ships with `[handlers.pr_review].enabled = true` and the
+bundled `daeyeon-bot-code-review` skill lives in the repo at
+`.claude/skills/`, which the loader uses as the default `skills_root`.
+Disable by flipping `enabled = false` if you need the daemon up before
+GitHub auth is wired.
 
 If you keep your own personas under `~/.claude/skills/` (or anywhere
 else), point the loader at that directory:
@@ -322,6 +333,7 @@ persona=<skill> [supersedes=[…]] [err=…]`. Statuses you'll see:
 | `skipped_withdrawn` | `requested_reviewers` no longer includes the bot — request was rescinded. |
 | `skipped_too_large` | PR diff exceeds the 1000-line / 50-file budget. Operator must `--force` or wait for a smaller follow-up. |
 | `skipped_already_reviewed` | An audit row already exists for this `(repo, pr, head_sha)`. Use `daeyeon-bot dev fire-pr-review --pr 'o/r#N' --force` to supersede. |
+| `skipped_disallowed_repo` | The PR's `owner/name` did not match `[handlers.pr_review].allowed_repos`. Security boundary; `--force` does **not** bypass. Add the glob to the allowlist if the block was unintended. |
 | `failed` | Handler errored — see `err=…`; for the queue row use `daeyeon-bot inspect status` (counts) or `sqlite3 ~/.daeyeon-bot/state.db "SELECT id,event_id,handler,err FROM outbox WHERE status='dead_letter'"`. |
 
 ### Fix a `persona unavailable` DLQ entry
@@ -345,8 +357,8 @@ configured persona skill can't be read at handle-time. Recovery:
 
 ### Raise the size budget
 
-`[handlers.pr_review].max_diff_lines` (default 1000) and
-`max_changed_files` (default 50) gate "too-large" PRs. To temporarily
+`[handlers.pr_review.size_budget].max_lines` (default 1000) and
+`max_files` (default 50) gate "too-large" PRs. To temporarily
 override for a one-off review without changing config, fire it manually
 with `--force`:
 
@@ -357,20 +369,39 @@ daeyeon-bot dev fire-pr-review --pr 'o/r#123' --force
 `--force` also overrides `skipped_already_reviewed` and produces a
 "Supersedes review #<old>" header on the new review body — the prior
 `review_id` is appended to the audit row's `superseded_review_ids`
-JSON array (visible via `inspect pr-review --pr o/r#123`).
+JSON array (visible via `inspect pr-review --pr o/r#123`). It does
+**not** bypass `allowed_repos` (security boundary).
 
 To raise the budget durably, edit `config.toml`:
 
 ```toml
-[handlers.pr_review]
-max_diff_lines = 2000
-max_changed_files = 80
+[handlers.pr_review.size_budget]
+max_lines = 2000
+max_files = 80
 ```
 
 `gh_state_dormant_days` (default 90) controls how long withdrawn
 `gh_review_requested_state` rows linger before pruning — the prune
 pass deletes only `in_pending_set = 0` rows past that horizon, so live
 review requests are never lost.
+
+### Limit which repos the bot reviews
+
+`[handlers.pr_review].allowed_repos` is a security boundary. Each
+entry is a case-insensitive `fnmatch` glob over `owner/name`. An empty
+list means "no filter" (legacy behaviour). The check runs in two
+layers — the `gh_review_requested` trigger narrows its GitHub search
+query to the same set when expressible (cuts poll traffic), and the
+handler re-checks every event before any `gh.pr_get` so manual CLI
+events and unexpressible globs (e.g. `*foo*`) still get gated.
+
+```toml
+[handlers.pr_review]
+allowed_repos = ["rebellions-sw/*", "octo/cat"]
+```
+
+Blocked PRs land as `audit.status = skipped_disallowed_repo`. Confirm
+with `daeyeon-bot inspect pr-review --pr 'owner/repo#N'`.
 
 ### `gh auth status` is broken
 

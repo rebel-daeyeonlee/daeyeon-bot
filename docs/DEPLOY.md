@@ -117,7 +117,8 @@ Edit `config.toml`. The defaults work for most boxes, but verify:
 | `[handlers.pr_review].persona_skill` | Which directory under `<skills_root>/` contains `SKILL.md`. | Default `daeyeon-bot-code-review` (ships with the repo). |
 | `[handlers.pr_review].skills_root` | Where to look up the persona. | Commented-out by default → uses repo-bundled `.claude/skills/`. Set to `~/.claude/skills` if you want to edit the persona without touching the repo. |
 | `[handlers.pr_review.size_budget]` | Per-PR diff cap. | `max_lines=1000`, `max_files=50`. Bigger PRs are skipped unless `--force`. |
-| `[ratelimit.defaults]` | Hard caps on Claude calls. | `30/hr` global, `200/day` global, `10/hr/handler`. Tune to match your subscription. |
+| `[handlers.pr_review].allowed_repos` | Security boundary — `fnmatch` globs over `owner/name`. | Empty list (default) = no filter (legacy). Once set, blocked PRs land as `skipped_disallowed_repo`; `--force` does **not** bypass. |
+| `[ratelimit]` | Token bucket the dispatcher consults before every claim. | `claude_call_capacity = 60.0`, `claude_call_refill_per_sec = 1.0` — soft 60/min cap with full burst. Migration 003 seeds these. |
 | `[routing]` | event.type → list of handler names. | Stock entries cover the built-ins. Don't remove them unless you know why. |
 
 `config.toml` is **not committed**. Keep it under your dotfiles or a
@@ -227,8 +228,9 @@ shorter than `min_persona_chars` (default 200). Failures land as
 
 ```bash
 just migrate
-sqlite3 ~/.daeyeon-bot/state.db "SELECT version FROM meta;"
-# → expect the current schema version (>=2 with PR-review feature).
+sqlite3 ~/.daeyeon-bot/state.db "SELECT value FROM meta WHERE key='schema_version';"
+# → expect '4' on this revision (001 init, 002 PR review, 003 ratelimit
+#   seed, 004 skipped_disallowed_repo audit status).
 ```
 
 State directory layout after first boot:
@@ -381,6 +383,7 @@ daeyeon-bot inspect tail --n 20
 daeyeon-bot inspect handlers ls
 daeyeon-bot inspect pr-review --n 20
 daeyeon-bot inspect pr-review --pr 'owner/repo#N'
+daeyeon-bot inspect ratelimit         # token-bucket state per bucket
 
 # Operations
 daeyeon-bot lifecycle pause          # touches PAUSE — blocks Claude calls
@@ -416,9 +419,9 @@ the operator-facing summary.
 | `[retention]` | `dedup_default_ttl_days` | `7` | Default dedup-key TTL. |
 | `[retention]` | `backup_keep` | `5` | Snapshots kept under `backups/`. |
 | `[retention]` | `gh_state_dormant_days` | `90` | Withdrawn `gh_review_requested_state` rows pruned after this. |
-| `[ratelimit.defaults]` | `global_per_hour` | `30` | Global Claude-call cap. |
-| `[ratelimit.defaults]` | `global_per_day` | `200` | Global daily cap. |
-| `[ratelimit.defaults]` | `handler_per_hour` | `10` | Per-handler hourly cap. |
+| `[ratelimit]` | `claude_call_capacity` | `60.0` | Burst budget for the active token bucket. |
+| `[ratelimit]` | `claude_call_refill_per_sec` | `1.0` | Steady-state refill rate (tokens / second). |
+| `[ratelimit.defaults]` | `global_per_hour` / `global_per_day` / `handler_per_hour` | `30` / `200` / `10` | Legacy aggregate caps; retained for forward compat. The active gate is `[ratelimit]` above. |
 | `[secrets]` | `provider` | `keychain` | `keychain` \| `file` \| `env`. |
 | `[secrets]` | `keychain_service` / `_account` | `daeyeon-bot` / `oauth_token` | Keychain coords. |
 | `[secrets]` | `file_path` | `/etc/daeyeon-bot/oauth_token` | Linux 0600 file path. |
@@ -433,6 +436,8 @@ the operator-facing summary.
 | `[handlers.pr_review]` | `persona_skill` | `daeyeon-bot-code-review` | Skill directory name. |
 | `[handlers.pr_review]` | `skills_root` | _(commented)_ | Override location. |
 | `[handlers.pr_review]` | `min_persona_chars` | `200` | Below this → persona invalid. |
+| `[handlers.pr_review]` | `concurrency` | `1` | Bump to `2` to overlap `gh` prep with Claude wait when batching PRs (doubles `gh` traffic). |
+| `[handlers.pr_review]` | `allowed_repos` | `[]` | Security allowlist of `fnmatch` globs over `owner/name`. Empty = no filter. |
 | `[handlers.pr_review.size_budget]` | `max_lines` | `1000` | Per-PR diff cap. |
 | `[handlers.pr_review.size_budget]` | `max_files` | `50` | Per-PR file-count cap. |
 

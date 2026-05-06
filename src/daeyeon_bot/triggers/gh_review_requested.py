@@ -92,12 +92,14 @@ class GhReviewRequestedTrigger:
     # returns True the trigger stops; the operator releases via
     # `inspect triggers --unquarantine`.
     permanent_failure_reporter: PermanentFailureReporter | None = None
-    # Optional GitHub-search filter fragment (e.g. `(user:rebellions-sw)` or
-    # `(repo:owner/a OR repo:owner/b)`) appended to the base query so the
-    # `gh.review_requested` poll only returns PRs the operator's
+    # Optional GitHub-search filter fragment (e.g. `user:rebellions-sw`
+    # or `repo:owner/name` — bare, no parens) appended to the base query
+    # so the `gh.review_requested` poll only returns PRs the operator's
     # `[handlers.pr_review].allowed_repos` actually permits. Empty string
-    # = no extra filter. Built in `app/registry.py` by
-    # `build_search_extra_query`.
+    # = no extra filter (multi-owner allowlists fall here — GitHub Search
+    # rejects OR-ed `user:`/`repo:` qualifiers, so the handler-side
+    # fnmatch gate is the only enforcement). Built in `app/registry.py`
+    # by `build_search_extra_query`.
     search_extra_query: str = ""
 
     async def run(self, emit: EmitFn, ctx: TriggerContext) -> None:
@@ -228,21 +230,24 @@ class GhReviewRequestedTrigger:
 def build_search_extra_query(allowed_repos: list[str]) -> str:
     """Translate `allowed_repos` glob list into a GitHub search-query fragment.
 
-    GitHub search syntax supports `repo:owner/name`, `user:owner`, `org:owner`
-    (each AND-able by space, OR-able with literal `OR`). This helper picks the
-    tightest fragment expressible:
+    GitHub Search does NOT support OR-ing `user:` / `repo:` / `org:`
+    qualifiers — `(repo:a OR repo:b)` returns 0 silently and
+    `(user:a OR user:b)` errors HTTP 422 (qualifiers can't be combined
+    with logical operators). Even wrapping a *single* qualifier in
+    parens (`(user:a)`) silently returns 0. Only a bare qualifier can
+    narrow the query; anything broader has to fall back to the
+    handler-side fnmatch gate.
 
     - Empty list → ``""`` (no filter; legacy behavior).
-    - All entries are `owner/*` globs → de-dup owners, emit
-      ``"(user:o1 OR user:o2 ...)"``.
-    - All entries are exact ``owner/name`` (no glob) → emit
-      ``"(repo:o/a OR repo:o/b ...)"``.
-    - Mixed (some `owner/*`, some specific) → combine: dedup owners with
-      `user:`, then add specific repos that aren't already covered by an
-      `owner/*` grant: ``"(user:o1 OR repo:o2/specific)"``.
-    - Anything outside those forms (e.g. ``"*foo*"``, ``"*"``, no ``/``) →
-      return ``""`` and rely on the handler's fnmatch gate. The trigger logs
-      this so operators see why the search wasn't narrowed.
+    - All entries reduce to a single owner (any mix of ``owner/*`` and
+      ``owner/name``) → narrow with that owner:
+        - exactly one specific ``owner/name``, no ``owner/*`` →
+          ``"repo:owner/name"``
+        - any ``owner/*`` grant or ≥2 specifics → ``"user:owner"``
+    - Multiple owners (any combination) → ``""`` + warn; handler-side
+      gate still enforces the per-repo allowlist.
+    - Unexpressible entries (e.g. ``"*foo*"``, ``"*"``, no ``/``) are
+      dropped silently; if no expressible entries remain, ``""`` + warn.
 
     The helper never raises — a malformed entry just falls back to handler-only
     filtering instead of breaking the poll loop.
@@ -252,18 +257,15 @@ def build_search_extra_query(allowed_repos: list[str]) -> str:
 
     user_owners: list[str] = []
     specific: list[str] = []
-    fell_back = False
     seen_user: set[str] = set()
     seen_repo: set[str] = set()
 
     for raw in allowed_repos:
         entry = raw.strip()
         if not entry or "/" not in entry:
-            fell_back = True
             continue
         owner, _, name = entry.partition("/")
         if not owner or not name or "*" in owner:
-            fell_back = True
             continue
         if name == "*":
             key = owner.lower()
@@ -272,7 +274,6 @@ def build_search_extra_query(allowed_repos: list[str]) -> str:
                 user_owners.append(owner)
             continue
         if "*" in name or "?" in name or "[" in name:
-            fell_back = True
             continue
         # Skip specific entries already covered by an owner/* in the same list.
         if owner.lower() in seen_user:
@@ -286,7 +287,7 @@ def build_search_extra_query(allowed_repos: list[str]) -> str:
     # Trim specifics whose owner appears later (after we've finished the pass).
     specific = [r for r in specific if r.partition("/")[0].lower() not in seen_user]
 
-    if fell_back and not user_owners and not specific:
+    if not user_owners and not specific:
         _log.warning(
             "gh_review_requested.search_extra_query.fallback",
             allowed_repos=list(allowed_repos),
@@ -294,10 +295,22 @@ def build_search_extra_query(allowed_repos: list[str]) -> str:
         )
         return ""
 
-    fragments = [f"user:{o}" for o in user_owners] + [f"repo:{r}" for r in specific]
-    if not fragments:
+    # GitHub Search rejects OR-ed user:/repo: qualifiers, so we can only
+    # narrow when the entire allowlist resolves to a single owner.
+    owners_lc = {o.lower() for o in user_owners} | {r.partition("/")[0].lower() for r in specific}
+    if len(owners_lc) > 1:
+        _log.warning(
+            "gh_review_requested.search_extra_query.fallback",
+            allowed_repos=list(allowed_repos),
+            reason="multi-owner allowlist; GitHub search can't OR qualifiers",
+        )
         return ""
-    return "(" + " OR ".join(fragments) + ")"
+
+    if not user_owners and len(specific) == 1:
+        return f"repo:{specific[0]}"
+
+    owner = user_owners[0] if user_owners else specific[0].partition("/")[0]
+    return f"user:{owner}"
 
 
 def _parse_search_item(item: dict[str, Any]) -> tuple[str, int] | None:

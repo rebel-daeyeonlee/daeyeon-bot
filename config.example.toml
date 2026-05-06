@@ -110,6 +110,9 @@ min_persona_chars = 200
 # the same set when expressible (`user:owner` / `repo:owner/name`), reducing
 # poll traffic; (2) the handler re-checks every event before any `gh.pr_get`,
 # so manual CLI events and unexpressible globs (e.g. `*foo*`) still get gated.
+# Multi-owner allowlists (entries spanning ≥2 owners, e.g. `["a/*", "b/*"]`)
+# also fall through to handler-only gating — GitHub Search rejects OR-ed
+# `user:`/`repo:` qualifiers, so the trigger can't narrow such queries.
 # `force = true` does NOT bypass this — it is a security boundary, not a
 # quality knob. A blocked PR yields `audit.status = skipped_disallowed_repo`.
 # Examples:

@@ -609,24 +609,45 @@ def test_build_search_extra_query_empty_returns_empty_string() -> None:
     assert build_search_extra_query([]) == ""
 
 
-def test_build_search_extra_query_all_owner_globs_dedupes_to_user_clause() -> None:
-    # Same owner twice + different owner → unique `user:` per owner.
-    fragment = build_search_extra_query(["rebellions-sw/*", "rebellions-sw/*", "octo/*"])
-    assert fragment == "(user:rebellions-sw OR user:octo)"
+def test_build_search_extra_query_single_owner_glob_emits_user_clause() -> None:
+    fragment = build_search_extra_query(["rebellions-sw/*", "rebellions-sw/*"])
+    assert fragment == "user:rebellions-sw"
 
 
-def test_build_search_extra_query_all_specific_emits_repo_clauses() -> None:
+def test_build_search_extra_query_multi_owner_drops_narrowing() -> None:
+    # GitHub Search rejects OR-ed `user:` qualifiers (HTTP 422). Drop the
+    # narrow-fragment and rely on the handler-side fnmatch gate.
+    fragment = build_search_extra_query(["rebellions-sw/*", "octo/*"])
+    assert fragment == ""
+
+
+def test_build_search_extra_query_single_specific_emits_repo_clause() -> None:
+    fragment = build_search_extra_query(["rebellions-sw/daeyeon-bot"])
+    assert fragment == "repo:rebellions-sw/daeyeon-bot"
+
+
+def test_build_search_extra_query_same_owner_specifics_collapse_to_user() -> None:
+    # `(repo:a OR repo:b)` silently returns 0 from GitHub Search; collapse
+    # multiple same-owner specifics to a single `user:` qualifier and let
+    # the handler-side gate filter to the explicit list.
     fragment = build_search_extra_query(["rebellions-sw/daeyeon-bot", "rebellions-sw/other"])
-    assert fragment == "(repo:rebellions-sw/daeyeon-bot OR repo:rebellions-sw/other)"
+    assert fragment == "user:rebellions-sw"
 
 
 def test_build_search_extra_query_specific_subsumed_by_owner_glob() -> None:
     # `rebellions-sw/*` already covers `rebellions-sw/daeyeon-bot`; specific
-    # entry must be dropped to avoid redundant `repo:` clause.
+    # entry is dropped, leaving a single owner -> single `user:` clause.
+    fragment = build_search_extra_query(["rebellions-sw/*", "rebellions-sw/daeyeon-bot"])
+    assert fragment == "user:rebellions-sw"
+
+
+def test_build_search_extra_query_mixed_owners_drops_narrowing() -> None:
+    # Mixed `owner/*` + specific from a different owner can't be narrowed
+    # because GitHub Search doesn't accept OR-ed qualifiers.
     fragment = build_search_extra_query(
         ["rebellions-sw/*", "rebellions-sw/daeyeon-bot", "octo/cat"]
     )
-    assert fragment == "(user:rebellions-sw OR repo:octo/cat)"
+    assert fragment == ""
 
 
 def test_build_search_extra_query_complex_glob_falls_back_to_handler_only() -> None:
@@ -636,3 +657,23 @@ def test_build_search_extra_query_complex_glob_falls_back_to_handler_only() -> N
     assert build_search_extra_query([""]) == ""
     assert build_search_extra_query(["no-slash"]) == ""
     assert build_search_extra_query(["*/repo"]) == ""
+
+
+@pytest.mark.parametrize(
+    "allowed_repos",
+    [
+        ["rebellions-sw/*"],
+        ["rebellions-sw/daeyeon-bot"],
+        ["rebellions-sw/repo1", "rebellions-sw/repo2"],
+        ["rebellions-sw/*", "rebellions-sw/repo1"],
+    ],
+)
+def test_build_search_extra_query_never_wraps_in_parens(allowed_repos: list[str]) -> None:
+    # Load-bearing contract: GitHub Search silently returns 0 for any qualifier
+    # wrapped in parens — even a lone `(user:owner)`. Pin "no parens" explicitly
+    # so a future rewrite that keeps fragments well-formed but parenthesizes
+    # them (e.g. for a multi-clause attempt) can't pass review unnoticed.
+    fragment = build_search_extra_query(allowed_repos)
+    assert fragment != ""
+    assert "(" not in fragment
+    assert ")" not in fragment

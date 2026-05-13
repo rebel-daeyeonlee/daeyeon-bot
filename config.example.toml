@@ -23,6 +23,8 @@ dedup_default_ttl_days = 7
 backup_keep = 5
 # How long dormant gh_review_requested_state rows live before prune.
 gh_state_dormant_days = 90
+# How long dormant jira_assigned_state rows (in_pending_set=0) live before prune.
+jira_state_dormant_days = 180
 
 [ratelimit]
 # Token-bucket gate the dispatcher consults before each claim. Capacity
@@ -61,6 +63,28 @@ username = ""
 # Per-call timeout for `gh api` invocations (seconds).
 gh_call_timeout_seconds = 30
 
+[jira]
+# Atlassian Cloud host (single-tenant — Rebellions).
+base_url = "https://rbln.atlassian.net/"
+# Optional override for the discovered regression-failure issuetype name.
+# Leave empty for autodiscovery against {"TC Failure", "Bug"} in that order.
+issuetype_override = ""
+# Per-call timeout for httpx (seconds).
+timeout_seconds = 30
+
+[loki]
+# SSW cluster-internal Loki — no auth.
+base_url = "http://loki.ssw.rbln.in"
+# Per-stream byte cap; longer slices get truncated client-side.
+per_stream_max_bytes = 1048576
+# Per-request timeout for httpx (seconds).
+timeout_seconds = 30
+# Loki kernel/syslog label-schema templates. {host} is substituted with the
+# hostname-by-name at query time. Override only if promtail/vector labels
+# diverge from defaults.
+kernel_query_template = '{hostname="{host}", job=~"varlogs|systemd-journal", filename=~".*kern.*"}'
+syslog_query_template = '{hostname="{host}", job=~"varlogs|systemd-journal", filename=~".*syslog.*"}'
+
 # ─── Triggers ──────────────────────────────────────────────────────────────────
 # A trigger is enabled if its section exists with `enabled = true`.
 
@@ -70,6 +94,15 @@ enabled = true
 [triggers.gh_review_requested]
 enabled = true
 poll_interval_seconds = 300
+
+[triggers.jira_assigned]
+# Default off — flip in local config.toml to start polling.
+enabled = false
+poll_interval_seconds = 300              # 5 min
+max_per_cycle = 200                      # safety cap per cycle
+# Also match tickets assigned to this Jira Atlassian Team. Empty string
+# disables team match (assignee-only mode).
+team_name = "DevOps"
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
 # Manifest fields here override the handler's compile-time defaults.
@@ -126,6 +159,45 @@ allowed_repos = []
 max_lines = 1000      # additions + deletions across all changed files
 max_files = 50        # changed-file count
 
+[handlers.jira_triage]
+# Default off — flip in local config.toml after authoring the persona +
+# storing JIRA_USER / JIRA_API_TOKEN / SSW_AUTOMATION_PASSWORD secrets.
+enabled = false
+idempotent = true
+dedup_ttl_seconds = 86400
+concurrency = 1
+accepts = ["jira.assigned", "jira.triage.manual"]
+# Allowed Jira project keys. Empty list = no auto-trigger ever fires
+# (defense in depth). SSWCI is the v1 target.
+allowed_projects = ["SSWCI"]
+# Persona (skill directory name under <skills_root>/<name>/SKILL.md).
+# `daeyeon-bot-jira-triage` ships with this repo under .claude/skills/.
+persona_skill = "daeyeon-bot-jira-triage"
+min_persona_chars = 200
+# Per-event wall-clock budget covering all stages (Jira fetch, ssw-bundle
+# checkout, Loki query, SSH fetch, Claude call, comment post). Two timeouts
+# in a row → DeadLetter.
+timeout_seconds = 600
+# Project-root-relative path for the bot's dedicated ssw-bundle clone.
+# Absolute paths also accepted. The bot refuses to operate on the operator's
+# working tree (~/ssw-bundle) regardless of this setting.
+ssw_bundle_path = "var/ssw-bundle"
+# Safety guard. Set true ONLY if you knowingly point ssw_bundle_path outside
+# the project root. Never enable casually.
+allow_external_ssw_bundle = false
+# SSH known-hosts file (under state_dir). Policy is `accept-new` on first
+# contact; subsequent contacts verify strictly. File mode is enforced 0600.
+ssh_known_hosts_path = "jira_triage_known_hosts"
+# Per-file size cap when fetching from the SSH log dump.
+ssh_max_file_bytes = 10485760           # 10 MB
+# Files to fetch from <run-dir>/. Missing files are silently skipped.
+ssh_fetch_globs = ["output.xml", "dmesg.log", "console.log"]
+# Custom-field IDs override (leave empty for autodiscovery against field
+# names "Branch", "Commit", "Team" via getJiraIssueTypeMetaWithFields).
+branch_field_id = ""
+commit_field_id = ""
+team_field_id = ""
+
 # ─── Routing ───────────────────────────────────────────────────────────────────
 # event.type → list of handler names. A type with no entry is dropped (logged).
 
@@ -133,3 +205,5 @@ max_files = 50        # changed-file count
 "manual.message" = ["echo"]
 "gh.review_requested" = ["pr_review"]
 "pr.review.manual"    = ["pr_review"]
+"jira.assigned"       = ["jira_triage"]
+"jira.triage.manual"  = ["jira_triage"]

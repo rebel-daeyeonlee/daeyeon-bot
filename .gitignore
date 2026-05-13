@@ -55,6 +55,12 @@ config.local.toml
 *.log
 logs/
 
-# Tool-local state (Claude Code, spec runner)
-.claude/
+# Tool-local state (Claude Code, spec runner) — but bundled persona skills
+# under `.claude/skills/` are part of the repo and need to be committable.
+.claude/*
+!.claude/skills/
 .specify/
+
+# Bot-managed ssw-bundle clone (auto-created on first triage). See
+# specs/002-jira-triage-bot/contracts/ssw-bundle-checkout-surface.md.
+var/

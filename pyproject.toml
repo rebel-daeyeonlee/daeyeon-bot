@@ -25,6 +25,10 @@ dependencies = [
     "typer>=0.12",
     "keyring>=25.0",
     "uuid-utils>=0.9",
+    # Jira REST + Loki HTTP (basic auth helper built in).
+    "httpx>=0.27,<1.0",
+    # SSH log-dump fetcher for jira_triage handler.
+    "asyncssh>=2.14,<3.0",
 ]
 
 [project.scripts]

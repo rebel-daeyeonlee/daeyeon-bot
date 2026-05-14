@@ -266,6 +266,33 @@ async def test_disallowed_project_audit_skipped(tmp_path: Path) -> None:
         await conn.close()
 
 
+def test_parse_epic_description_extracts_branch_and_commit() -> None:
+    """SSWCI Epics put branch/commit in description wiki markup, not custom fields."""
+    from daeyeon_bot.handlers import jira_triage as _jt
+
+    _parse_epic_description = _jt._parse_epic_description  # pyright: ignore[reportPrivateUsage]
+
+    text = (
+        "*Branch*: release/v3.2\n"
+        "*Commit*: 140112e9203598c72f568501eecac706cc125dcf\n"
+        "*Host*: ssw-giga-02\n"
+    )
+    out = _parse_epic_description(text)
+    assert out["branch"] == "release/v3.2"
+    assert out["commit"] == "140112e9203598c72f568501eecac706cc125dcf"
+
+
+def test_parse_epic_description_handles_missing_fields() -> None:
+    from daeyeon_bot.handlers import jira_triage as _jt
+
+    _parse_epic_description = _jt._parse_epic_description  # pyright: ignore[reportPrivateUsage]
+
+    assert _parse_epic_description("") == {}
+    assert _parse_epic_description("nothing here") == {}
+    only_branch = _parse_epic_description("*Branch*: release/v3.2")
+    assert only_branch == {"branch": "release/v3.2"}
+
+
 @pytest.mark.asyncio
 async def test_missing_epic_branch_audit_skipped(tmp_path: Path) -> None:
     conn = await _open(tmp_path)

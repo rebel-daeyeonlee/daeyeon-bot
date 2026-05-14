@@ -183,13 +183,12 @@ class JiraClient:
         branch_id = _field_id_by_name(chosen_fields, "Branch")
         commit_id = _field_id_by_name(chosen_fields, "Commit")
         team_id = _field_id_by_name(chosen_fields, "Team")
-        if not branch_id or not commit_id:
-            raise PermanentError(
-                "jira discover_fields: project schema missing Branch and/or Commit"
-                f" custom field (branch={branch_id!r} commit={commit_id!r});"
-                " set [handlers.jira_triage].branch_field_id and .commit_field_id"
-                " explicitly to override"
-            )
+        # Branch/Commit may legitimately be absent from the project schema —
+        # ssw-bundle's `jira_bug.py` puts those values into the Epic
+        # description's wiki markup (`*Branch*: ...`), NOT into Jira custom
+        # fields. The handler's `_resolve_epic` falls back to description
+        # parsing when these IDs are empty. We log warning at boot but don't
+        # raise.
         return FieldDiscovery(
             branch_field_id=branch_id,
             commit_field_id=commit_id,

@@ -126,14 +126,26 @@ def _maybe_load_oauth_token(config: Config, options: BootOptions) -> str | None:
     """
     if options.overrides is not None and options.overrides.claude_session_factory is not None:
         return None
-    provider = secrets.build_provider(
+    provider = _build_secrets_provider(config, options)
+    return provider.load_oauth_token() if provider is not None else None
+
+
+def _build_secrets_provider(config: Config, options: BootOptions) -> secrets.SecretsProvider | None:
+    """Construct the SecretsProvider per `[secrets]`, or None when tests
+    have already supplied a Claude factory (no real boot-time probe needed).
+
+    Same gating logic as `_maybe_load_oauth_token` — keeps OAuth + named
+    secret loading in sync.
+    """
+    if options.overrides is not None and options.overrides.claude_session_factory is not None:
+        return None
+    return secrets.build_provider(
         name=config.secrets.provider,
         keychain_service=config.secrets.keychain_service,
         keychain_account=config.secrets.keychain_account,
         file_path=config.secrets.file_path,
         insecure_env_allowed=options.insecure_env_allowed,
     )
-    return provider.load_oauth_token()
 
 
 async def _run_supervised(
@@ -144,7 +156,14 @@ async def _run_supervised(
     oauth_token: str | None,
 ) -> None:
     """Build the container, recover, then run dispatcher + heartbeat under TaskGroup."""
-    container = await build(config, db, oauth_token=oauth_token, overrides=options.overrides)
+    secrets_provider = _build_secrets_provider(config, options)
+    container = await build(
+        config,
+        db,
+        oauth_token=oauth_token,
+        secrets_provider=secrets_provider,
+        overrides=options.overrides,
+    )
     clock = container.clock
     await _recover_outbox(db, container, clock)
 

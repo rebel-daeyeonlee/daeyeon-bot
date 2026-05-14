@@ -140,21 +140,25 @@ async def test_discover_fields_resolves_branch_and_commit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discover_fields_raises_when_branch_or_commit_missing() -> None:
+async def test_discover_fields_tolerates_missing_branch_commit_fields() -> None:
+    """SSWCI doesn't have Branch/Commit as Jira custom fields — the handler
+    falls back to parsing the Epic description wiki markup. discover_fields
+    must NOT raise on absence."""
     payload = {
         "projects": [
             {
                 "key": "SSWCI",
-                "issuetypes": [
-                    {"name": "Bug", "fields": {"customfield_10042": {"name": "Branch"}}}
-                ],
+                "issuetypes": [{"name": "Bug", "fields": {}}],
             }
         ]
     }
     transport = httpx.MockTransport(lambda req: httpx.Response(200, json=payload))
     client = _client(transport)
-    with pytest.raises(PermanentError, match="missing Branch and/or Commit"):
-        await client.discover_fields(project_keys=["SSWCI"])
+    disc = await client.discover_fields(project_keys=["SSWCI"])
+    assert disc.branch_field_id == ""
+    assert disc.commit_field_id == ""
+    assert disc.team_field_id == ""
+    assert disc.issuetype_name == "Bug"
 
 
 @pytest.mark.asyncio

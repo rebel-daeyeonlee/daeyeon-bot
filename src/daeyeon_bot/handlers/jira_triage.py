@@ -431,27 +431,45 @@ class JiraTriageHandler:
     # ── Stage helpers ──────────────────────────────────────────────────────
 
     async def _resolve_epic(self, issue: IssueDetail) -> tuple[EpicMeta | None, tuple[str, ...]]:
-        """Read branch + commit from the parent Epic's custom fields.
+        """Resolve branch + commit from the parent Epic.
 
-        Returns `(epic, ())` on success or `(None, missing)` with the list
-        of missing field names. The handler treats either field absent as
+        Source order (first hit wins per field):
+          1. Epic's custom field (`branch_field_id`/`commit_field_id`) — when
+             the Jira tenant has those fields configured. Discovered at boot
+             via `getJiraIssueTypeMetaWithFields`.
+          2. Epic's description wiki markup (`*Branch*: ...` / `*Commit*: ...`).
+             This is the ssw-bundle convention — `inv/test_report/jira_bug.py`
+             writes branch/commit into the Bug description, and the Epic
+             aggregates the run's branch/commit at the top of its description.
+
+        Returns `(epic, ())` on success or `(None, missing)` with the list of
+        unresolvable fields. The handler treats either field absent as
         `skipped_missing_metadata`.
         """
         epic_key = issue.parent_key
         if epic_key is None:
             return (None, ("parent_epic",))
         epic_issue = await self.jira.issue_get(epic_key, expand=["names"])
+
+        # 1) custom field path
         branch_id = self.config.branch_field_id or self.field_discovery.branch_field_id
         commit_id = self.config.commit_field_id or self.field_discovery.commit_field_id
-        branch_val = epic_issue.raw_fields.get(branch_id)
-        commit_val = epic_issue.raw_fields.get(commit_id)
+        branch_val = _str_or_none(epic_issue.raw_fields.get(branch_id)) if branch_id else None
+        commit_val = _str_or_none(epic_issue.raw_fields.get(commit_id)) if commit_id else None
+
+        # 2) description wiki-markup fallback (ssw-bundle convention)
+        if branch_val is None or commit_val is None:
+            parsed = _parse_epic_description(epic_issue.description_text)
+            if branch_val is None:
+                branch_val = parsed.get("branch")
+            if commit_val is None:
+                commit_val = parsed.get("commit")
+
         missing: list[str] = []
-        if not isinstance(branch_val, str) or not branch_val.strip():
+        if not branch_val:
             missing.append("branch")
-            branch_val = None
-        if not isinstance(commit_val, str) or not commit_val.strip():
+        if not commit_val:
             missing.append("commit")
-            commit_val = None
         if missing:
             return (None, tuple(missing))
         # 40-hex validation defers to ssw_bundle.ensure_checkout.
@@ -773,6 +791,41 @@ def _parse_payload(event: Event) -> _Payload:
         assignment_gen=assignment_gen,
         assignee_path=str(p.get("assignee_path", "user")),
     )
+
+
+_BRANCH_RE = re.compile(r"\*Branch\*:\s*(?P<v>\S+)", re.IGNORECASE)
+_COMMIT_RE = re.compile(r"\*Commit\*:\s*(?P<v>[0-9a-fA-F]{7,40})", re.IGNORECASE)
+
+
+def _str_or_none(value: object) -> str | None:
+    """Coerce raw Jira field value to non-empty str, or None."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _parse_epic_description(description: str) -> dict[str, str]:
+    """Extract `branch` / `commit` from Epic description wiki markup.
+
+    ssw-bundle convention (`inv/test_report/jira_bug.py`):
+        *Branch*: release/v3.2
+        *Commit*: 140112e9203598c72f568501eecac706cc125dcf
+
+    `commit` accepts 7-40 hex chars (short SHA tolerated, full preferred —
+    ssw_bundle.ensure_checkout validates 40-hex strictly so a short SHA
+    will surface as `skipped_unresolvable_commit` rather than as
+    `skipped_missing_metadata`).
+    """
+    out: dict[str, str] = {}
+    if not description:
+        return out
+    bm = _BRANCH_RE.search(description)
+    if bm:
+        out["branch"] = bm.group("v").strip()
+    cm = _COMMIT_RE.search(description)
+    if cm:
+        out["commit"] = cm.group("v").strip()
+    return out
 
 
 def _project_allowed(issue_key: str, allowed_projects: list[str]) -> bool:

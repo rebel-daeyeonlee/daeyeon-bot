@@ -89,12 +89,18 @@ async def build(
     db: aiosqlite.Connection,
     *,
     oauth_token: str | None = None,
+    secrets_provider: SecretsProvider | None = None,
     overrides: ContainerOverrides | None = None,
 ) -> Container:
     """Wire concrete dependencies. `db` must already be opened + migrated.
 
     Async because resolving `github.username` may require one boot-time
     `gh api /user` round-trip when the operator has not pinned it in config.
+
+    `secrets_provider` (when supplied) lets feature handlers that need named
+    secrets (jira_triage's JIRA_USER/JIRA_API_TOKEN/SSW_AUTOMATION_PASSWORD)
+    resolve them via the same provider chain the OAuth token uses. Tests
+    skip it by passing FakeJira via `overrides.jira`.
     """
     overrides = overrides or ContainerOverrides()
     factory = overrides.claude_session_factory or _build_real_factory(config, oauth_token)
@@ -140,6 +146,7 @@ async def build(
         overrides=overrides,
         persona_loader=persona_loader,
         oauth_token=oauth_token,
+        secrets_provider=secrets_provider,
     )
 
     triggers = build_trigger_registry(
@@ -183,6 +190,7 @@ async def _build_jira_deps(  # noqa: PLR0912, PLR0915 — composition root branc
     overrides: ContainerOverrides,
     persona_loader: PersonaLoader | None,
     oauth_token: str | None,
+    secrets_provider: SecretsProvider | None = None,
 ) -> tuple[JiraTriageDeps | None, JiraAssignedDeps | None]:
     """Construct the feature-002 deps if the handler/trigger is enabled.
 
@@ -196,18 +204,21 @@ async def _build_jira_deps(  # noqa: PLR0912, PLR0915 — composition root branc
 
     # Resolve credentials. Tests may inject a FakeJira via overrides.jira;
     # in that case we skip the real httpx + secrets path entirely.
+    # Production: secrets_provider was built by lifecycle and passed in.
     jira_client: Any
+    effective_secrets = overrides.secrets_provider or secrets_provider
     if overrides.jira is not None:
         jira_client = overrides.jira
     else:
-        if overrides.secrets_provider is None:
+        if effective_secrets is None:
             raise RuntimeError(
-                "container.build: jira_triage / jira_assigned require"
-                " secrets_provider override OR a jira override (FakeJira)"
+                "container.build: jira_triage / jira_assigned require a"
+                " secrets_provider (production path) OR a jira override"
+                " (test path)"
             )
         del oauth_token  # not used here — jira has its own (user,token).
-        user = overrides.secrets_provider.load_secret("jira_user")
-        token = overrides.secrets_provider.load_secret("jira_api_token")
+        user = effective_secrets.load_secret("jira_user")
+        token = effective_secrets.load_secret("jira_api_token")
         jira_client = JiraClient(
             base_url=config.jira.base_url,
             user=user,
@@ -244,11 +255,12 @@ async def _build_jira_deps(  # noqa: PLR0912, PLR0915 — composition root branc
         if overrides.ssh is not None:
             ssh_client: Any = overrides.ssh
         else:
-            if overrides.secrets_provider is None:
+            if effective_secrets is None:
                 raise RuntimeError(
-                    "container.build: jira_triage needs secrets_provider for SSW_AUTOMATION_PASSWORD"
+                    "container.build: jira_triage needs secrets_provider for"
+                    " SSW_AUTOMATION_PASSWORD"
                 )
-            ssh_password = overrides.secrets_provider.load_secret("ssw_automation_password")
+            ssh_password = effective_secrets.load_secret("ssw_automation_password")
             triage_entry = config.jira_triage_handler_entry()
             ssh_client = SshLogClient(
                 username="automation",

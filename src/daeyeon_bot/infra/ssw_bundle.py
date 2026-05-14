@@ -4,7 +4,8 @@ Lives at `<project_root>/var/ssw-bundle/` by default. The bot reads
 files at a given commit via:
   1. `git fetch --prune --filter=blob:none origin`
   2. `git checkout --force --detach <commit_sha>`
-  3. `git submodule update --init --recursive --depth 1`
+  3. `git submodule update --init --depth 1`  (top-level only, not
+     recursive — see ensure_checkout for why)
 
 Path guards (constructor-time):
   - Refuses if clone_path resolves outside project_root unless
@@ -42,7 +43,7 @@ class UnresolvableCommitError(PermanentError):
 
 
 class SubmoduleInitError(PermanentError):
-    """git submodule update --init --recursive failed."""
+    """git submodule update --init failed."""
 
     def __init__(self, message: str, failed_paths: tuple[str, ...] = ()) -> None:
         super().__init__(message)
@@ -141,12 +142,20 @@ class SswBundleClient:
                 raise UnresolvableCommitError(
                     f"ssw_bundle: commit {commit_sha} unresolvable on branch {branch}: {exc}"
                 ) from exc
-            # 3. Submodules.
+            # 3. Submodules — top-level only, NOT recursive.
+            #
+            # Triage reads source under `products/<vendor>/<comp>/` which
+            # lives in first-level submodules (products/common/umd,
+            # products/atom/fw, ...). Recursive init follows their internal
+            # vendor chains (umd → rbln-spdm → SPDM-Responder-Validator →
+            # libspdm → openssl → krb5) — hundreds of MB of crypto/protocol
+            # deps the bot never reads, plus a slow chain that fails on
+            # `index.lock` collisions when interrupted mid-fetch.
             stdout = ""
             stderr = ""
             try:
                 stdout, stderr = await self._git_run(
-                    ["submodule", "update", "--init", "--recursive", "--depth", "1"],
+                    ["submodule", "update", "--init", "--depth", "1"],
                     cwd=self.clone_path,
                     op="submodule_update",
                 )

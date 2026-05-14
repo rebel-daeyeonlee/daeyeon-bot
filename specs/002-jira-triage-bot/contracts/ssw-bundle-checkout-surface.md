@@ -69,14 +69,20 @@ or never on origin), `git checkout` exits non-zero; the wrapper raises
 ### 4. `git submodule update` (per triage)
 
 ```bash
-git submodule update --init --recursive --depth 1
+git submodule update --init --depth 1
 ```
 
 - `--init` initializes any submodule not yet registered locally.
-- `--recursive` walks nested submodules (none currently, but cheap
-  insurance).
 - `--depth 1` is a shallow submodule fetch — only the commit pinned by
   the super-repo, not the submodule's history. Saves bandwidth and disk.
+- **Intentionally NOT `--recursive`**: the bot reads source files under
+  `products/<vendor>/<comp>/` (first-level submodules like
+  `products/common/umd`, `products/atom/fw`). Their *internal* vendor
+  chains (e.g. `umd → rbln-spdm → SPDM-Responder-Validator → libspdm →
+  openssl → krb5`) carry hundreds of MB of crypto/protocol deps the
+  triage handler never reads, and the deep chain is fragile — any
+  interrupted fetch leaves `index.lock` files that block subsequent
+  attempts.
 
 If any submodule fails to init (network error, key rejected, commit
 GC'd from the submodule's remote), the command exits non-zero. The

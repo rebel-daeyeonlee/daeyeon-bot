@@ -112,11 +112,19 @@ class SshLogClient:
         remote_path: str,
         globs: list[str],
     ) -> SshFetchResult:
+        # `known_hosts=None` disables server host-key verification — these
+        # are internal SSW test hosts on a trusted lab network that get
+        # re-imaged frequently (key churn), and the bot is read-only over
+        # SFTP. The earlier `accept-new` design needed a file-backed
+        # known_hosts policy that asyncssh doesn't actually support with
+        # a bare path arg; rather than maintain a stale fingerprint cache,
+        # opt out of verification entirely. RUNBOOK §4b notes this
+        # alongside the SSH-key-migration follow-up.
         async with self.connect_fn(  # type: ignore[misc]
             host=host,
             username=self.username,
             password=self.password,
-            known_hosts=str(self.known_hosts_path),
+            known_hosts=None,
             connect_timeout=self.connect_timeout_s,
             keepalive_interval=_KEEPALIVE_S,
         ) as conn:

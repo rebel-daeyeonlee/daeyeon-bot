@@ -17,12 +17,12 @@ Layout (top-to-bottom):
   h3. Evidences
   *<source>* @ <citation> — {{<quote>}}
   ...
-  {expand:title=...}{noformat}<windowed excerpt>{noformat}{expand}
+  {code:title=...}<windowed excerpt>{code}
 
   h3. Analysis
   <layer_rationale paragraph>
   *<source>* @ <citation> — {{<quote>}}
-  {expand:title=...}{noformat}<TC block / code excerpt>{noformat}{expand}
+  {code:title=...}<TC block / code excerpt>{code}
 
   h3. Action Items
   * <imperative>
@@ -34,7 +34,7 @@ Layout (top-to-bottom):
 
 Attachment policy — we never dump full slices; only **±5 lines around
 each cited evidence quote**, overlapping windows merged. Empty / errored
-streams render as a one-line diagnostic, no {expand} block. Total body
+streams render as a one-line diagnostic, no {code} block. Total body
 is capped at `_BODY_CAP_BYTES`; tail attachments are truncated to fit.
 """
 
@@ -97,14 +97,20 @@ def bold(text: str) -> str:
     return f"*{text}*"
 
 
-def expand(*, title: str, body: str) -> str:
-    """Render a Jira `{expand:title=...}` collapsible block.
+def code_block(*, title: str, body: str) -> str:
+    """Render a Jira `{code:title=...}` block.
 
-    Jira renders this as a click-to-expand toggle in Cloud — perfect for
-    keeping the comment scannable by default while leaving the raw log
-    available for verification.
+    Used for log excerpts attached to the comment. Cloud's v2 wiki parser
+    doesn't process the `{expand}` macro (it survives as literal text),
+    so we use `{code}` which IS supported and gives a clean titled box
+    with monospace body and a visible delimiter. No collapse — content
+    is always shown.
+
+    The `|` inside the macro head terminates the title attribute, so any
+    pipe in `title` is escaped.
     """
-    return f"{{expand:title={title}}}\n{body}\n{{expand}}"
+    safe_title = title.replace("|", "/")
+    return f"{{code:title={safe_title}}}\n{body.rstrip()}\n{{code}}"
 
 
 # ── Attachment building ──────────────────────────────────────────────────────
@@ -248,7 +254,7 @@ def _render_windowed_block(*, source: str, text: str, quotes: list[str]) -> str:
     rendered = _render_excerpt(lines, windows)
     total = sum(w.end - w.start + 1 for w in windows)
     title = f"{source} — {total} lines around cited evidence"
-    return expand(title=title, body=noformat(rendered))
+    return code_block(title=title, body=rendered)
 
 
 def _render_tc_block(test_code: str, tc_name: str) -> str:
@@ -280,7 +286,7 @@ def _render_tc_block(test_code: str, tc_name: str) -> str:
         block_lines, [_LineWindow(0, len(block_lines) - 1)], base_line=start + 1
     )
     title = f"test_code (TC block, lines {start + 1}-{end})"
-    return expand(title=title, body=noformat(rendered))
+    return code_block(title=title, body=rendered)
 
 
 def _windows_for_quotes(lines: list[str], quotes: list[str], *, padding: int) -> list[_LineWindow]:
@@ -474,24 +480,24 @@ def _duplicates_section(dups: tuple[SuspectedDuplicate, ...]) -> list[str]:
 
 
 def _truncate_to_cap(body: str) -> str:
-    """Drop trailing `{expand}` blocks (and their preceding blank) until under cap."""
+    """Drop trailing `{code:title=...}` blocks (and their preceding blank) until under cap."""
     if len(body.encode("utf-8")) <= _BODY_CAP_BYTES:
         return body
     parts = body.split("\n")
     while len(("\n".join(parts) + "\n").encode("utf-8")) > _BODY_CAP_BYTES:
         close_idx: int | None = None
         for i in range(len(parts) - 1, -1, -1):
-            if parts[i].strip() == "{expand}":
+            if parts[i].strip() == "{code}":
                 close_idx = i
                 break
         if close_idx is None:
-            # No more {expand} blocks — fall back to char truncation.
+            # No more {code} blocks — fall back to char truncation.
             text = "\n".join(parts)
             cap_chars = _BODY_CAP_BYTES - 256
             return text[:cap_chars] + "\n... [body truncated to fit comment limit]\n"
         open_idx = close_idx
         for j in range(close_idx - 1, -1, -1):
-            if parts[j].startswith("{expand:title="):
+            if parts[j].startswith("{code:title="):
                 open_idx = j
                 break
         del parts[open_idx : close_idx + 1]
@@ -530,9 +536,9 @@ __all__ = [
     "build_log_attachments",
     "bullet",
     "code",
+    "code_block",
     "duplicate_bullet",
     "evidence_bullet",
-    "expand",
     "h3",
     "noformat",
     "quote",

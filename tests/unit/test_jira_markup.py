@@ -24,9 +24,9 @@ from daeyeon_bot.infra.jira_markup import (
     build_log_attachments,
     bullet,
     code,
+    code_block,
     duplicate_bullet,
     evidence_bullet,
-    expand,
     h3,
     noformat,
     quote,
@@ -68,11 +68,17 @@ def test_bold_wraps_with_stars() -> None:
     assert bold("x") == "*x*"
 
 
-def test_expand_emits_title_and_close() -> None:
-    out = expand(title="loki.kernel — 3 lines", body="payload")
-    assert out.startswith("{expand:title=loki.kernel — 3 lines}\n")
+def test_code_block_emits_title_and_close() -> None:
+    out = code_block(title="loki.kernel — 3 lines", body="payload")
+    assert out.startswith("{code:title=loki.kernel — 3 lines}\n")
     assert "payload" in out
-    assert out.endswith("\n{expand}")
+    assert out.endswith("\n{code}")
+
+
+def test_code_block_escapes_pipe_in_title() -> None:
+    """`|` inside `{code:title=...}` terminates the title attribute — escape it."""
+    out = code_block(title="ssh.dmesg | tail -100", body="x")
+    assert "|" not in out.split("\n", 1)[0].replace("{code:title=", "")
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -221,7 +227,7 @@ def test_build_comment_action_items_renders_bullets() -> None:
 
 
 def test_attachments_windows_around_cited_quote_in_loki_kernel() -> None:
-    """Cited line gets ±5-line window, lines numbered, emitted as `{expand}`."""
+    """Cited line gets ±5-line window, lines numbered, emitted as `{code}`."""
     lines = tuple(f"kernel line {i}" for i in range(1, 21))
     slc = LokiSlice(stream="kernel", lines=lines, truncated=False)
     snap = _snapshot(loki_slices=(slc,))
@@ -236,7 +242,7 @@ def test_attachments_windows_around_cited_quote_in_loki_kernel() -> None:
     )
     atts = build_log_attachments(snap, triage)
     block = atts.expand_blocks["loki.kernel"]
-    assert block.startswith("{expand:title=loki.kernel —")
+    assert block.startswith("{code:title=loki.kernel —")
     # The window is lines 10 ± 5 = lines 5..15 (0-based 4..14 → 1-based 5..15).
     assert "kernel line 10" in block
     assert "kernel line 5" in block
@@ -358,7 +364,7 @@ def test_build_comment_embeds_expand_blocks_for_cited_sources() -> None:
     )
     atts = build_log_attachments(snap, triage)
     out = build_comment(triage, attachments=atts)
-    assert "{expand:title=loki.kernel —" in out
+    assert "{code:title=loki.kernel —" in out
     assert "TDR detected" in out
 
 

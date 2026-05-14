@@ -793,8 +793,22 @@ def _parse_payload(event: Event) -> _Payload:
     )
 
 
-_BRANCH_RE = re.compile(r"\*Branch\*:\s*(?P<v>\S+)", re.IGNORECASE)
-_COMMIT_RE = re.compile(r"\*Commit\*:\s*(?P<v>[0-9a-fA-F]{7,40})", re.IGNORECASE)
+# Wiki-markup `*Branch*: <value>` / `*Commit*: <value>` (ssw-bundle's
+# jira_bug.py:177 convention used for Suite-Setup-Skip bug bodies).
+_BRANCH_WIKI_RE = re.compile(r"\*Branch\*:\s*(?P<v>\S+)", re.IGNORECASE)
+_COMMIT_WIKI_RE = re.compile(r"\*Commit\*:\s*(?P<v>[0-9a-fA-F]{7,40})", re.IGNORECASE)
+
+# Jira markdown-table row in SSWCI Epic descriptions:
+#   | **Commit (Branch)** | [2486620](https://github.com/.../commit/2486620) (dev) |
+# Both branch and commit live in the same row's value cell. Capture the
+# linked SHA from `[<sha>](...)`, skip the markdown URL `(http...)`, then
+# grab the trailing `(branch)` parenthetical.
+_COMMIT_BRANCH_TABLE_RE = re.compile(
+    r"\*\*Commit\s*\(Branch\)\*\*\s*\|\s*"
+    r"\[(?P<sha>[0-9a-fA-F]{7,40})\]"  # linked SHA
+    r"\([^)]+\)"  # markdown URL — consume it
+    r"\s*\((?P<branch>[^)\s][^)]*?)\)",  # trailing (branch)
+)
 
 
 def _str_or_none(value: object) -> str | None:
@@ -805,26 +819,33 @@ def _str_or_none(value: object) -> str | None:
 
 
 def _parse_epic_description(description: str) -> dict[str, str]:
-    """Extract `branch` / `commit` from Epic description wiki markup.
+    """Extract `branch` / `commit` from an Epic description.
 
-    ssw-bundle convention (`inv/test_report/jira_bug.py`):
-        *Branch*: release/v3.2
-        *Commit*: 140112e9203598c72f568501eecac706cc125dcf
+    Two formats supported:
+      (A) ssw-bundle Suite-Setup-Skip body — wiki markup:
+            *Branch*: release/v3.2
+            *Commit*: 140112e9...
+      (B) ssw-bundle test-run Epic body — Jira markdown table:
+            | **Commit (Branch)** | [2486620](url) (dev) |
 
-    `commit` accepts 7-40 hex chars (short SHA tolerated, full preferred —
-    ssw_bundle.ensure_checkout validates 40-hex strictly so a short SHA
-    will surface as `skipped_unresolvable_commit` rather than as
-    `skipped_missing_metadata`).
+    Both branch and commit are captured if present. `commit` accepts 7-40
+    hex (short SHA tolerated by `git checkout`; ssw_bundle validates).
     """
     out: dict[str, str] = {}
     if not description:
         return out
-    bm = _BRANCH_RE.search(description)
+    # Format A
+    bm = _BRANCH_WIKI_RE.search(description)
     if bm:
         out["branch"] = bm.group("v").strip()
-    cm = _COMMIT_RE.search(description)
+    cm = _COMMIT_WIKI_RE.search(description)
     if cm:
         out["commit"] = cm.group("v").strip()
+    # Format B — fills any gaps left by format A.
+    tm = _COMMIT_BRANCH_TABLE_RE.search(description)
+    if tm:
+        out.setdefault("commit", tm.group("sha").strip())
+        out.setdefault("branch", tm.group("branch").strip())
     return out
 
 

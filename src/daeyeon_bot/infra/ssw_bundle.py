@@ -29,7 +29,12 @@ from pathlib import Path
 
 from daeyeon_bot.core.errors import ConfigError, PermanentError, TransientError
 
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# 7-40 hex — short SHAs are accepted by `git checkout`; SSWCI Epic
+# descriptions sometimes carry only 7-char shorts (e.g. `2486620`). If
+# the short form is ambiguous in the clone, the subsequent
+# `git checkout` exits non-zero and we surface
+# `UnresolvableCommitError` → audit `skipped_unresolvable_commit`.
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 class UnresolvableCommitError(PermanentError):

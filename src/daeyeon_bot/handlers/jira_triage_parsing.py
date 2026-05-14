@@ -88,7 +88,9 @@ _SSH_URL_RE = re.compile(
     r"(?P<path>/mnt/data/logs/regression-test/"
     r"(?P<run_id>[\d\-]+)/"
     r"(?P<host2>[\w.-]+)/"
-    r"(?P<tc>TC-\d+-\S+))"
+    # `[\w-]+` stops at `)` so we don't slurp the trailing markdown-link
+    # delimiter when the URL is embedded as `[Link](ssh://...)`.
+    r"(?P<tc>TC-\d+-[\w-]+))"
 )
 
 

@@ -115,6 +115,9 @@ class _StubProvider:
     def load_oauth_token(self) -> str:
         return "stub-token-12345"
 
+    def load_secret(self, key: str) -> str:
+        return f"stub-secret-{key}"
+
 
 async def test_token_check_ok_when_provider_returns_token(
     fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch

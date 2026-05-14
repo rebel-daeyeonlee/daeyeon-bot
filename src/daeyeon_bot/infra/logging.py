@@ -21,7 +21,8 @@ import structlog
 
 REDACTED = "***REDACTED***"
 
-RedactReason = str  # one of: "slack" | "aws" | "jwt" | "anthropic" | "gh" | "entropy"
+RedactReason = str
+# one of: "slack" | "aws" | "jwt" | "anthropic" | "gh" | "atlassian" | "literal" | "entropy"
 
 # Order matters only for performance; matches are replaced wherever they appear.
 _NAMED_PATTERNS: tuple[tuple[RedactReason, re.Pattern[str]], ...] = (
@@ -32,8 +33,38 @@ _NAMED_PATTERNS: tuple[tuple[RedactReason, re.Pattern[str]], ...] = (
     ("anthropic", re.compile(r"sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{10,}")),
     ("gh", re.compile(r"\bghp_[A-Za-z0-9]{20,}\b")),
     ("gh", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    # Atlassian Cloud API tokens — feature 002 (`JIRA_API_TOKEN`).
+    # Documented prefix `ATATT` followed by base64url body.
+    ("atlassian", re.compile(r"\bATATT[A-Za-z0-9_-]{40,}\b")),
 )
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = tuple(p for _, p in _NAMED_PATTERNS)
+
+# Literal-string patterns registered at boot via `register_literal_secret()`.
+# Used for secrets whose shape is too weak for a generic regex
+# (e.g. `SSW_AUTOMATION_PASSWORD="automation"` — a 10-char dictionary word
+# that the entropy fallback won't catch).
+_LITERAL_REDACTIONS: list[re.Pattern[str]] = []
+
+
+def register_literal_secret(value: str) -> None:
+    """Register a literal string value to scrub from every log line.
+
+    Called once at boot per loaded named secret. Pass the secret value as
+    a plain string; we compile a word-boundary-anchored regex so we don't
+    over-redact innocent substrings.
+    """
+    if not value or len(value) < 3:
+        # Below 3 chars is too noisy — would scrub common words. Operator
+        # should pick a longer secret if they want literal redaction.
+        return
+    pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])")
+    _LITERAL_REDACTIONS.append(pattern)
+
+
+def clear_literal_secrets_for_testing() -> None:
+    """Test helper: clear the registered-literal list. Tests only."""
+    _LITERAL_REDACTIONS.clear()
+
 
 # Entropy fallback parameters.
 _MIN_ENTROPY_BITS_PER_CHAR = 4.5
@@ -72,8 +103,10 @@ def redact_processor(
 
 
 def redact_text(text: str) -> str:
-    """Redact known-shape and high-entropy tokens in `text`."""
+    """Redact known-shape, literal, and high-entropy tokens in `text`."""
     out = text
+    for pattern in _LITERAL_REDACTIONS:
+        out = pattern.sub(REDACTED, out)
     for pattern in _TOKEN_PATTERNS:
         out = pattern.sub(REDACTED, out)
     out = _TOKENISH_RE.sub(_maybe_redact_match, out)
@@ -91,6 +124,9 @@ def redact_with_provenance(text: str) -> tuple[str, list[tuple[int, int, RedactR
     for reason, pattern in _NAMED_PATTERNS:
         for m in pattern.finditer(text):
             spans.append((m.start(), m.end(), reason))
+    for pattern in _LITERAL_REDACTIONS:
+        for m in pattern.finditer(text):
+            spans.append((m.start(), m.end(), "literal"))
     for m in _TOKENISH_RE.finditer(text):
         if _shannon_entropy(m.group(0)) >= _MIN_ENTROPY_BITS_PER_CHAR:
             # Skip if already covered by a named match — named wins on overlap.
@@ -140,8 +176,10 @@ def _redact_value(value: object) -> object:
 __all__ = [
     "REDACTED",
     "RedactReason",
+    "clear_literal_secrets_for_testing",
     "init",
     "redact_processor",
     "redact_text",
     "redact_with_provenance",
+    "register_literal_secret",
 ]

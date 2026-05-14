@@ -32,6 +32,9 @@ class RetentionSection(BaseModel):
     dedup_default_ttl_days: int = 7
     backup_keep: int = 5
     gh_state_dormant_days: int = 90
+    # Dormant jira_assigned_state rows (in_pending_set=0) are pruned after
+    # this many days. Feature 002.
+    jira_state_dormant_days: int = 180
 
 
 class RateLimitDefaults(BaseModel):
@@ -70,6 +73,34 @@ class GitHubConfig(BaseModel):
     gh_call_timeout_seconds: int = 30
 
 
+class JiraConfig(BaseModel):
+    """Jira REST integration knobs. Auth = basic (JIRA_USER, JIRA_API_TOKEN)."""
+
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = "https://rbln.atlassian.net/"
+    # Override for the autodiscovered regression-failure issuetype name.
+    # Leave empty to autodiscover against {"TC Failure", "Bug"} at boot.
+    issuetype_override: str = ""
+    timeout_seconds: int = 30
+
+
+class LokiConfig(BaseModel):
+    """Loki HTTP query knobs. Cluster-internal, no auth."""
+
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = "http://loki.ssw.rbln.in"
+    per_stream_max_bytes: int = 1_048_576  # 1 MB
+    timeout_seconds: int = 30
+    # LogQL templates for kernel/syslog streams. `{host}` is substituted at
+    # query time with the hostname-by-name.
+    kernel_query_template: str = (
+        '{hostname="{host}", job=~"varlogs|systemd-journal", filename=~".*kern.*"}'
+    )
+    syslog_query_template: str = (
+        '{hostname="{host}", job=~"varlogs|systemd-journal", filename=~".*syslog.*"}'
+    )
+
+
 class TriggerEntry(BaseModel):
     """Runtime override for a trigger. Extra keys are passed to the trigger constructor."""
 
@@ -81,6 +112,16 @@ class GhReviewRequestedTriggerEntry(TriggerEntry):
     """Typed view of `[triggers.gh_review_requested]`."""
 
     poll_interval_seconds: int = 300
+
+
+class JiraAssignedTriggerEntry(TriggerEntry):
+    """Typed view of `[triggers.jira_assigned]`."""
+
+    poll_interval_seconds: int = 300
+    max_per_cycle: int = 200
+    # Also match tickets assigned to this Atlassian Team. Empty string
+    # disables team match (assignee-only mode).
+    team_name: str = "DevOps"
 
 
 class HandlerEntry(BaseModel):
@@ -125,6 +166,33 @@ class PrReviewHandlerEntry(HandlerEntry):
     allowed_repos: list[str] = Field(default_factory=list)
 
 
+class JiraTriageHandlerEntry(HandlerEntry):
+    """Typed view of `[handlers.jira_triage]`. Feature 002."""
+
+    # Allowed Jira project keys. Empty list = auto-trigger never fires
+    # (defense in depth).
+    allowed_projects: list[str] = Field(default_factory=lambda: ["SSWCI"])
+    # Persona — same shape as pr_review.
+    persona_skill: str | None = None
+    min_persona_chars: int = 200
+    skills_root: str | None = None
+    # Per-event wall-clock cap covering all stages.
+    timeout_seconds: int = 600
+    # Project-root-relative path for the dedicated ssw-bundle clone.
+    ssw_bundle_path: str = "var/ssw-bundle"
+    allow_external_ssw_bundle: bool = False
+    # SSH knobs.
+    ssh_known_hosts_path: str = "jira_triage_known_hosts"
+    ssh_max_file_bytes: int = 10_485_760  # 10 MB
+    ssh_fetch_globs: list[str] = Field(
+        default_factory=lambda: ["output.xml", "dmesg.log", "console.log"]
+    )
+    # Custom-field IDs override (leave empty for autodiscovery).
+    branch_field_id: str = ""
+    commit_field_id: str = ""
+    team_field_id: str = ""
+
+
 class Config(BaseSettings):
     # `extra="forbid"` so a typo like `[handlrs.pr_review]` raises at boot
     # instead of silently dropping the section. The two leaf entries
@@ -143,6 +211,8 @@ class Config(BaseSettings):
     secrets: SecretsSection = Field(default_factory=SecretsSection)
     claude: ClaudeSection = Field(default_factory=ClaudeSection)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
+    jira: JiraConfig = Field(default_factory=JiraConfig)
+    loki: LokiConfig = Field(default_factory=LokiConfig)
 
     triggers: dict[str, TriggerEntry] = Field(default_factory=dict)
     handlers: dict[str, HandlerEntry] = Field(default_factory=dict)
@@ -163,6 +233,20 @@ class Config(BaseSettings):
         if raw is None:
             return PrReviewHandlerEntry()
         return PrReviewHandlerEntry.model_validate(raw.model_dump())
+
+    def jira_assigned_trigger_entry(self) -> JiraAssignedTriggerEntry:
+        """Typed view of `[triggers.jira_assigned]` (with defaults). Feature 002."""
+        raw = self.triggers.get("jira_assigned")
+        if raw is None:
+            return JiraAssignedTriggerEntry()
+        return JiraAssignedTriggerEntry.model_validate(raw.model_dump())
+
+    def jira_triage_handler_entry(self) -> JiraTriageHandlerEntry:
+        """Typed view of `[handlers.jira_triage]` (with defaults). Feature 002."""
+        raw = self.handlers.get("jira_triage")
+        if raw is None:
+            return JiraTriageHandlerEntry()
+        return JiraTriageHandlerEntry.model_validate(raw.model_dump())
 
     @property
     def state_dir_path(self) -> Path:

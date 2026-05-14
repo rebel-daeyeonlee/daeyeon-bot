@@ -26,7 +26,7 @@ def test_keychain_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(secrets.keyring, "get_password", _get_password)
     provider = secrets.KeychainSecrets(service="svc", account="acct")
-    with pytest.raises(AuthError, match="keychain: no token"):
+    with pytest.raises(AuthError, match="keychain: no secret"):
         provider.load_oauth_token()
 
 

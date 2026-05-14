@@ -1,24 +1,9 @@
-"""Persona dataclass — review system prompt loaded from a Claude Code skill."""
+"""Backward-compat shim — `Persona` now lives at `daeyeon_bot.core.persona`.
 
-from __future__ import annotations
+This re-export preserves the original import path used by handlers/tests
+that landed before feature 002's generalization.
+"""
 
-from dataclasses import dataclass
-from pathlib import Path
+from daeyeon_bot.core.persona import Persona
 
-
-@dataclass(frozen=True, slots=True)
-class Persona:
-    """One loaded SKILL.md persona.
-
-    `body` is the markdown after frontmatter strip; the loader uses it verbatim
-    as the Claude system prompt. `mtime_ns` is the file's mtime at load time;
-    the loader compares it on every call to decide whether to re-read.
-    """
-
-    skill_dir: Path
-    name: str
-    body: str
-    mtime_ns: int
-
-    def is_stale(self, *, current_mtime_ns: int) -> bool:
-        return current_mtime_ns != self.mtime_ns
+__all__ = ["Persona"]

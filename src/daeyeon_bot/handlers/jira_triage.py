@@ -978,6 +978,8 @@ def _build_haystack(snapshot: RunSnapshot) -> dict[str, str]:
         haystack["test_code"] = snapshot.test_code
     if snapshot.product_code:
         haystack["product_code"] = "\n".join(p.excerpt for p in snapshot.product_code)
+    if snapshot.error_log_excerpt:
+        haystack["ticket.error_log"] = snapshot.error_log_excerpt
     return haystack
 
 

@@ -165,6 +165,7 @@ UMD 증상 → 원인 backtracking 표:
   - 코드 출처 (`test_code`, `product_code`) → **Analysis** 섹션
   - 각 항목은 (source, quote, citation) 삼중. `domain != "unknown"`일 때 비어 있을 수 없다.
   - **`test_code`가 user message에서 populated인 상태이면 (즉, `(not located in suites tree)`가 아니면) Analysis 섹션에 최소 1개 `test_code` citation을 포함한다** — TC가 어떤 단언/구조를 검증하다 실패했는지 짚는 한 줄.
+  - **`=== Product code excerpts ===` 섹션이 비어있지 않으면 (`(none ...)` 아니면) Analysis 섹션에 최소 1개 `product_code` citation을 포함한다** — 해당 함수/매크로/심볼이 실제로 어디서 발화·정의되는지 짚는 한 줄. 핸들러가 error log + Loki 라인에서 distinctive identifier를 추출해 `products/` 트리를 grep해서 채워줬으므로, 그 파일/라인이 실제 root cause의 layer를 가리키는 강한 시그널이다. citation 형식 `<file_path>:<line>` (예: `products/common/umd/src/api.c:412`).
 - **`domain`** → status badge + Analysis 헤더. Domain Classification ENUM. 자유 형식 금지.
 - **`layer_rationale`** → **h3. Analysis** 본문 (1-3 문장 한국어 한 단락). *왜* 이 layer인지 — 어떤 evidence 라인이 이 layer를 가리키는지 짚는다. backtracking 표 결과 명시. 가능하면 `test_code`/`product_code` evidence를 본문 안에서도 짚어준다.
 - **`next_data`** → **h3. Action Items** (짧은 명령형 리스트. 최대 10개. 예: `["FW abort dump 캡처", "rblntrace로 재현 후 guilty command_id 식별", "같은 commit 다른 host에서 재현 여부 확인"]`. 운영자가 다음에 무엇을 해야 하는지를 단답으로 보여준다.)

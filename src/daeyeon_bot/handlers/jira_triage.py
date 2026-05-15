@@ -62,6 +62,7 @@ from daeyeon_bot.core.jira_triage.types import (
     EvidenceItem,
     LokiSlice,
     PostedComment,
+    ProductCodeFile,
     RunMeta,
     RunSnapshot,
     SshArtifact,
@@ -89,6 +90,7 @@ from daeyeon_bot.infra.jira_triage_audit import find_latest, insert_audit, recor
 from daeyeon_bot.infra.logging import redact_with_provenance
 from daeyeon_bot.infra.loki import LokiQueryBuilder, LokiQueryResult
 from daeyeon_bot.infra.persona_loader import PersonaLoader
+from daeyeon_bot.infra.source_grep import extract_tokens
 from daeyeon_bot.infra.ssw_bundle import SubmoduleInitError, UnresolvableCommitError
 
 _log = structlog.get_logger(__name__)
@@ -192,6 +194,7 @@ class _SswBundleClient(Protocol):
     async def ensure_checkout(self, *, branch: str, commit_sha: str) -> None: ...
     def read_file(self, relative_path: str) -> str | None: ...
     def grep_test_case(self, *, tc_name: str) -> Any: ...
+    async def grep_source_tokens(self, *, tokens: list[str]) -> Any: ...
 
 
 @runtime_checkable
@@ -408,11 +411,18 @@ class JiraTriageHandler:
             ssh=ssh_loc,
             host_ip=host_ip,
         )
+        # Source-code grep: pull distinctive identifiers from the error log
+        # + Loki lines and grep the checked-out `products/` tree for them.
+        # Gives the persona real implementation context (not just test_code).
+        product_code = await self._collect_product_code(
+            error_log=error_log_excerpt, loki_slices=loki_slices
+        )
+
         snapshot = RunSnapshot(
             meta=meta,
             error_log_excerpt=error_log_excerpt,
             test_code=test_code,
-            product_code=(),  # v1: empty; future work selects relevant submodule files
+            product_code=product_code,
             loki_slices=loki_slices,
             ssh_artifacts=ssh_artifacts,
             loki_error=loki_error,
@@ -613,6 +623,33 @@ class JiraTriageHandler:
             for a in result.artifacts
         )
         return (artifacts, None)
+
+    async def _collect_product_code(
+        self,
+        *,
+        error_log: str,
+        loki_slices: tuple[LokiSlice, ...],
+    ) -> tuple[ProductCodeFile, ...]:
+        """Evidence-driven source grep into the checked-out ssw-bundle/products/ tree.
+
+        Failures are logged but never raise — product_code is best-effort
+        context; a grep timeout or missing tree shouldn't block triage.
+        """
+        texts: list[str] = [error_log]
+        for slc in loki_slices:
+            texts.extend(slc.lines)
+        tokens = extract_tokens(texts)
+        if not tokens:
+            return ()
+        try:
+            return await self.ssw_bundle.grep_source_tokens(tokens=tokens)
+        except Exception as exc:
+            _log.info(
+                "jira_triage.product_code_grep_failed",
+                error=repr(exc),
+                token_count=len(tokens),
+            )
+            return ()
 
     async def _call_claude_with_retry(
         self,

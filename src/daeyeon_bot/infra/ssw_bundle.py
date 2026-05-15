@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from daeyeon_bot.core.errors import ConfigError, PermanentError, TransientError
+from daeyeon_bot.core.jira_triage.types import ProductCodeFile
+from daeyeon_bot.infra.source_grep import grep_excerpts
 
 # 7-40 hex — short SHAs are accepted by `git checkout`; SSWCI Epic
 # descriptions sometimes carry only 7-char shorts (e.g. `2486620`). If
@@ -206,6 +208,15 @@ class SswBundleClient:
             if pattern.search(text):
                 return robot_file.relative_to(self.clone_path)
         return None
+
+    async def grep_source_tokens(self, *, tokens: list[str]) -> tuple[ProductCodeFile, ...]:
+        """Grep `products/` tree for each evidence-derived token; return ±10-line excerpts.
+
+        Thin delegator to `infra.source_grep.grep_excerpts` — the actual
+        subprocess + parse logic lives there so the bundle client stays
+        focused on checkout state.
+        """
+        return await grep_excerpts(bundle_path=self.clone_path, tokens=tokens)
 
     # ── plumbing ────────────────────────────────────────────────────────────
 

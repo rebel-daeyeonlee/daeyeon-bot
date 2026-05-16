@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +14,7 @@ import typer
 
 from daeyeon_bot.app.config import load
 from daeyeon_bot.app.registry import build_handler_registry
+from daeyeon_bot.cli._dev_payloads import build_jira_triage_payload, build_pr_review_payload
 from daeyeon_bot.core.errors import AuthError, PermanentError
 from daeyeon_bot.core.events import Event, make_event
 from daeyeon_bot.core.results import Ack, DeadLetter, HandlerResult, Retry
@@ -220,19 +219,9 @@ async def _fire_pr_review(*, pr: str, force: bool, dry_run: bool, config_path: s
         typer.echo(f"PR {pr} has no head SHA; aborting", err=True)
         raise typer.Exit(code=1)
 
-    # `request_gen` is INT per the handler schema; force-fire uses the wall
-    # clock to bump the generation so the audit dedup row doesn't collide
-    # with the prior (gen=0) auto-trigger row at the same SHA.
-    request_gen = int(time.time()) if force else 0
-    payload = {
-        "repo": repo,
-        "pr_number": pr_number,
-        "head_sha": head_sha,
-        "request_gen": request_gen,
-        "force": force,
-    }
-    dedup_seed = f"manual-pr-review|{repo}#{pr_number}@{head_sha}|{request_gen}|{force}"
-    dedup_key = hashlib.sha256(dedup_seed.encode("utf-8")).hexdigest()
+    payload, dedup_key = build_pr_review_payload(
+        repo=repo, pr_number=pr_number, head_sha=head_sha, force=force
+    )
 
     now = datetime.now(tz=UTC)
     event = make_event(type="pr.review.manual", payload=payload, created_at=now)
@@ -316,17 +305,7 @@ async def _fire_jira_triage(
             "no handlers configured for 'jira.triage.manual'. Edit config.toml's [routing] section."
         )
 
-    if force:
-        comment_seq = f"manual_{int(time.time())}"
-    else:
-        comment_seq = "1"
-    payload: dict[str, object] = {
-        "issue_key": issue_key,
-        "force": force,
-        "comment_seq": comment_seq,
-    }
-    dedup_seed = f"manual-jira-triage|{issue_key}|{comment_seq}"
-    dedup_key = hashlib.sha256(dedup_seed.encode("utf-8")).hexdigest()
+    payload, dedup_key = build_jira_triage_payload(issue_key=issue_key, force=force)
 
     now = datetime.now(tz=UTC)
     event = make_event(type="jira.triage.manual", payload=payload, created_at=now)

@@ -160,6 +160,15 @@ min_persona_chars = 200
 #   allowed_repos = ["rebellions-sw/*", "octo/cat"]              # mixed
 allowed_repos = []
 
+# Review the operator's OWN open PRs too (default false → own PRs are skipped
+# with audit.status = skipped_self_authored). When true, the trigger adds an
+# `author:<operator>` search and self-authored PRs flow through the same state
+# machine + handler, posted as GitHub COMMENT reviews (GitHub rejects a
+# self-APPROVE with HTTP 422, so an APPROVE verdict is downgraded to COMMENT).
+# Pair with a non-empty `allowed_repos` — with the empty allowlist above this
+# scoops up every open PR you have across all of GitHub.
+review_self = false
+
 [handlers.pr_review.size_budget]
 max_lines = 1000      # additions + deletions across all changed files
 max_files = 50        # changed-file count

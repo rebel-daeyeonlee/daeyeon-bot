@@ -49,9 +49,12 @@ class FakeGh:
     # was called with, so trigger tests can assert the search-side
     # `allowed_repos` filter was actually plumbed through.
     last_extra_query: str = ""
+    # Same, for the `author:<operator>` self-review search.
+    last_authored_extra_query: str = ""
 
     _prs: dict[tuple[str, int], _FakePr] = field(default_factory=dict)
     _search_set: set[tuple[str, int]] = field(default_factory=set)
+    _authored_set: set[tuple[str, int]] = field(default_factory=set)
     _posted_reviews: list[dict[str, Any]] = field(default_factory=list)
     _next_review_id: int = field(default=0)
     _prior_reviews: list[dict[str, Any]] = field(default_factory=list)
@@ -70,6 +73,7 @@ class FakeGh:
         body: str = "",
         files: list[dict[str, Any]] | None = None,
         in_search_set: bool = True,
+        in_authored_set: bool = False,
         draft: bool = False,
         state: str = "open",
     ) -> None:
@@ -91,6 +95,10 @@ class FakeGh:
             self._search_set.add((repo, pr_number))
         else:
             self._search_set.discard((repo, pr_number))
+        if in_authored_set:
+            self._authored_set.add((repo, pr_number))
+        else:
+            self._authored_set.discard((repo, pr_number))
 
     def update_head_sha(self, repo: str, pr_number: int, *, head_sha: str) -> None:
         pr = self._prs[(repo, pr_number)]
@@ -145,18 +153,34 @@ class FakeGh:
             raise RateLimitError("fake gh: rate limited")
         if not username:
             raise PermanentError("fake gh: empty username")
+        return self._search_items(self._search_set)
+
+    async def search_authored(
+        self, username: str, *, extra_query: str = ""
+    ) -> list[dict[str, Any]]:
+        self.last_authored_extra_query = extra_query
+        if self.raise_on_search is not None:
+            raise self.raise_on_search
+        if not self.auth_ok:
+            raise AuthError("fake gh search: not logged in")
+        if self.rate_limited:
+            raise RateLimitError("fake gh: rate limited")
+        if not username:
+            raise PermanentError("fake gh: empty username")
+        return self._search_items(self._authored_set)
+
+    def _search_items(self, keys: set[tuple[str, int]]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        for repo, pr_number in self._search_set:
+        for repo, pr_number in keys:
             pr = self._prs.get((repo, pr_number))
             if pr is None:
                 continue
-            owner_repo = repo
             items.append(
                 {
                     "number": pr_number,
-                    "repository_url": f"https://api.github.com/repos/{owner_repo}",
+                    "repository_url": f"https://api.github.com/repos/{repo}",
                     "pull_request": {
-                        "url": f"https://api.github.com/repos/{owner_repo}/pulls/{pr_number}",
+                        "url": f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
                         "draft": pr.draft,
                     },
                 }

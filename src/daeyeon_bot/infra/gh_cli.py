@@ -121,6 +121,36 @@ class GhCli:
                 return [item for item in items_raw if isinstance(item, dict)]
         return []
 
+    async def search_authored(
+        self, username: str, *, extra_query: str = ""
+    ) -> list[dict[str, Any]]:
+        """Search open PRs authored by `username`.
+
+        Used by the trigger when `[handlers.pr_review].review_self = true` so
+        the operator's own PRs get reviewed. `extra_query` carries the same
+        repo-allowlist narrowing as `search_review_requested`. The two searches
+        are disjoint — GitHub never lists you as a reviewer of your own PR — so
+        the trigger can union the results without de-duping by author.
+
+        Returns the flattened `items` list from `GET /search/issues`.
+        """
+        if not username:
+            raise PermanentError("github.username is empty; cannot build search query")
+        query = f"is:open is:pr author:{username} archived:false"
+        if extra_query:
+            query = f"{query} {extra_query}"
+        payload = await self._api(
+            "GET",
+            "/search/issues",
+            extra=("-f", f"q={query}", "-f", "per_page=100"),
+            paginate=True,
+        )
+        if isinstance(payload, dict):
+            items_raw = payload.get("items", [])
+            if isinstance(items_raw, list):
+                return [item for item in items_raw if isinstance(item, dict)]
+        return []
+
     async def pr_get(self, repo: str, pr_number: int) -> dict[str, Any]:
         """Fetch one PR's metadata via `GET /repos/{repo}/pulls/{n}`."""
         payload = await self._api("GET", f"/repos/{repo}/pulls/{pr_number}")

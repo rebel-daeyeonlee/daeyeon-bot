@@ -275,7 +275,10 @@ class PrReviewHandler:
     async def _gate_self_or_withdrawn(
         self, prep: _PrepState, now: datetime
     ) -> HandlerResult | None:
-        if prep.author_login and prep.author_login == self.github_username:
+        is_self = bool(prep.author_login) and prep.author_login == self.github_username
+        # Skip own PRs unless `review_self` opts in. The post stage forces a
+        # COMMENT event for self-authored PRs (GitHub rejects self-APPROVE).
+        if is_self and not self.config.review_self:
             await self._write_audit(
                 **prep.audit_kwargs,
                 status="skipped_self_authored",
@@ -293,7 +296,12 @@ class PrReviewHandler:
         # in the requested-reviewers list; auto runs always require it.
         if prep.force:
             return None
-        withdrawn = prep.pr_state != "open" or self.github_username not in prep.requested_logins
+        # Own PRs are never in their own requested-reviewers set, so the
+        # reviewer-membership test can't apply — only PR closure withdraws them.
+        if is_self:
+            withdrawn = prep.pr_state != "open"
+        else:
+            withdrawn = prep.pr_state != "open" or self.github_username not in prep.requested_logins
         if not withdrawn:
             return None
         await self._write_audit(
@@ -406,7 +414,11 @@ class PrReviewHandler:
         # APPROVE → GH APPROVE event (counts toward branch protection);
         # everything else → COMMENT. The schema validator already enforces
         # `verdict=APPROVE ⇔ comments==[]`, so we trust the verdict field.
-        gh_event = "APPROVE" if review.verdict == "APPROVE" else "COMMENT"
+        # Self-authored PRs (review_self) can never APPROVE — GitHub rejects a
+        # self-approval (HTTP 422) — so an APPROVE verdict is downgraded to a
+        # COMMENT review carrying the same (empty-comments) summary body.
+        is_self = sized.author_login == self.github_username
+        gh_event = "APPROVE" if (review.verdict == "APPROVE" and not is_self) else "COMMENT"
         posted = await self.gh.post_review(
             sized.repo,
             sized.pr_number,

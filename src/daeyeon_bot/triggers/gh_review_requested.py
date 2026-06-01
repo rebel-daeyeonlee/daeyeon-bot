@@ -101,6 +101,13 @@ class GhReviewRequestedTrigger:
     # fnmatch gate is the only enforcement). Built in `app/registry.py`
     # by `build_search_extra_query`.
     search_extra_query: str = ""
+    # Mirror of `[handlers.pr_review].review_self`. When true, each poll also
+    # runs an `author:<operator>` search and unions those PRs into the observed
+    # set, so the operator's own PRs flow through the same state machine and
+    # `pr_review` handler (which submits them as COMMENT reviews). The handler
+    # re-checks `review_self` before posting, so this is a traffic optimization,
+    # not the security boundary.
+    review_self: bool = False
 
     async def run(self, emit: EmitFn, ctx: TriggerContext) -> None:
         """Loop until cancelled. AuthError propagates and halts the daemon.
@@ -140,6 +147,13 @@ class GhReviewRequestedTrigger:
         items = await self.gh.search_review_requested(
             self.github_username, extra_query=self.search_extra_query
         )
+        if self.review_self:
+            # Self-authored PRs are a disjoint set (you can't be your own
+            # reviewer), so a flat append is enough — the `(repo, pr)` dict
+            # below collapses any incidental overlap.
+            items = items + await self.gh.search_authored(
+                self.github_username, extra_query=self.search_extra_query
+            )
         # `updated_at` lets us short-circuit `pr_get` for steady-state PRs:
         # if state.last_observed_at >= item.updated_at, neither the head SHA
         # nor the requested-reviewers set has changed since last cycle.

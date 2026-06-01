@@ -329,7 +329,7 @@ persona=<skill> [supersedes=[…]] [err=…]`. Statuses you'll see:
 | status | meaning |
 |---|---|
 | `posted` | Review submitted to GitHub. `review_id` is the GitHub Review ID. |
-| `skipped_self_authored` | PR author is the bot's own user — handler refuses to review its own work. |
+| `skipped_self_authored` | PR author is the bot's own user. Default behaviour. Set `[handlers.pr_review].review_self = true` to review your own PRs instead (see "Review my own PRs" below). |
 | `skipped_withdrawn` | `requested_reviewers` no longer includes the bot — request was rescinded. |
 | `skipped_too_large` | PR diff exceeds the 1000-line / 50-file budget. Operator must `--force` or wait for a smaller follow-up. |
 | `skipped_already_reviewed` | An audit row already exists for this `(repo, pr, head_sha)`. Use `daeyeon-bot dev fire-pr-review --pr 'o/r#N' --force` to supersede. |
@@ -402,6 +402,44 @@ allowed_repos = ["rebellions-sw/*", "octo/cat"]
 
 Blocked PRs land as `audit.status = skipped_disallowed_repo`. Confirm
 with `daeyeon-bot inspect pr-review --pr 'owner/repo#N'`.
+
+### Review my own PRs (`review_self`)
+
+By default the bot skips PRs it authored (`skipped_self_authored`). To
+have it review your own open PRs too, opt in:
+
+```toml
+[handlers.pr_review]
+review_self = true
+allowed_repos = ["rebellions-sw/*"]   # pair with a non-empty allowlist
+```
+
+What changes when enabled:
+
+- The `gh_review_requested` trigger runs a second `author:<operator>`
+  search each poll and unions those PRs into the observed set, so your
+  own PRs flow through the same state machine + handler.
+- Self-authored reviews are **always submitted as GitHub `COMMENT`
+  events** — GitHub rejects a self-`APPROVE` with HTTP 422, so an
+  `APPROVE` verdict is downgraded to a COMMENT review carrying the same
+  (empty-comments) summary body. The review never counts toward branch
+  protection.
+- The same `allowed_repos` boundary applies — own PRs outside the
+  allowlist still land as `skipped_disallowed_repo`.
+
+The search subject is the **GitHub login**, not an email. It resolves
+from `[github] username`, or — when that is blank (default) — from
+`gh api user` at boot. Confirm yours with `gh api user --jq .login`.
+Never put an email in `[github] username`; the search would return zero
+hits.
+
+No re-review loop: posting a COMMENT does not change the PR head SHA, so
+the state machine emits again only when you push a new commit (a new head
+SHA), exactly like a reviewer-requested PR.
+
+Pair with a non-empty `allowed_repos` — with an empty allowlist the
+`author:` search scoops up every open PR you have across all of GitHub.
+Restart the daemon after toggling (config is read at boot).
 
 ### `gh auth status` is broken
 

@@ -205,6 +205,36 @@ async def test_search_review_requested_parses_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_authored_empty_username_raises() -> None:
+    cli = GhCli()
+    with pytest.raises(PermanentError):
+        await cli.search_authored("")
+
+
+@pytest.mark.asyncio
+async def test_search_authored_builds_author_query_and_parses_items() -> None:
+    cli = GhCli()
+    captured: list[tuple[str, ...]] = []
+
+    async def factory(*args: Any, **_kwargs: Any) -> _FakeProc:
+        captured.append(tuple(str(a) for a in args))
+        return _FakeProc(
+            returncode=0,
+            stdout=json.dumps(
+                {"items": [{"number": 7, "repository_url": "https://api.github.com/repos/o/r"}]}
+            ).encode(),
+        )
+
+    with _patch_subprocess(factory):
+        items = await cli.search_authored("daeyeon-lee", extra_query="user:rebellions-sw")
+
+    assert len(items) == 1
+    assert items[0]["number"] == 7
+    flat = " ".join(captured[0])
+    assert "q=is:open is:pr author:daeyeon-lee archived:false user:rebellions-sw" in flat
+
+
+@pytest.mark.asyncio
 async def test_auth_user_returns_login() -> None:
     cli = GhCli()
     with _patch_subprocess(_ok_factory(json.dumps({"login": "daeyeon-lee"}).encode())):

@@ -280,6 +280,87 @@ async def test_skipped_self_authored(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_self_downgrades_approve_to_comment(tmp_path: Path) -> None:
+    """`review_self=True` reviews the operator's own PR, posting COMMENT not APPROVE."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "o/r",
+        7,
+        head_sha="deadbeef",
+        author=fake_gh.user_login,  # operator authored the PR
+        requested=("someone-else",),  # operator is NOT its own reviewer
+        files=_FILES_ONE_FILE,
+    )
+    factory = FakeFactory(
+        session=FakeClaudeSession(
+            default=json.dumps(
+                {
+                    "verdict": "APPROVE",
+                    "summary": (
+                        "**Verdict**: APPROVE — 모든 finding 0개.\n\n"
+                        "**개요**\n변경사항은 작고 컨벤션을 따라간다.\n\n"
+                        "— daeyeon-bot 🐥"
+                    ),
+                    "comments": [],
+                }
+            )
+        )
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        factory=factory,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            size_budget=SizeBudget(max_lines=1000, max_files=50),
+            review_self=True,
+        ),
+    )
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        # GitHub rejects a self-APPROVE → the verdict is posted as COMMENT.
+        assert posted[0]["event"] == "COMMENT"
+        assert posted[0]["comments"] == []
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "posted"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_self_disabled_still_skips_own_pr(tmp_path: Path) -> None:
+    """Default `review_self=False` keeps the `skipped_self_authored` gate."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "o/r",
+        7,
+        head_sha="deadbeef",
+        author=fake_gh.user_login,
+        requested=("someone-else",),
+        files=_FILES_ONE_FILE,
+    )
+    handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh)
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
+        assert isinstance(result, Ack)
+        assert fake_gh.posted_reviews() == []
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "skipped_self_authored"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skipped_withdrawn_when_pr_closed(tmp_path: Path) -> None:
     fake_gh = FakeGh()
     fake_gh.add_pr(

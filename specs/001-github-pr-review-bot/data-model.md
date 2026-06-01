@@ -252,6 +252,12 @@ trigger emit (auto OR manual) │                                   │
        ├─ already-reviewed?   │ Ack + audit(skipped_already_reviewed)
        │                      ▼
        ├─ self-authored?      Ack + audit(skipped_self_authored)
+       │                      (skipped UNLESS [handlers.pr_review].review_self
+       │                       = true; when enabled the own PR proceeds and is
+       │                       posted as a COMMENT review — GitHub rejects a
+       │                       self-APPROVE, so an APPROVE verdict downgrades to
+       │                       COMMENT. The trigger discovers own PRs via an
+       │                       author:<operator> search unioned into the poll.)
        │                      ▼
        ├─ withdrawn?          Ack + audit(skipped_withdrawn)
        │                      ▼

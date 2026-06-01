@@ -175,6 +175,13 @@ class PrReviewHandlerEntry(HandlerEntry):
     # Globs accepted: `owner/repo`, `owner/*`. Anything else (e.g. `*foo*`)
     # falls back to handler-only filtering.
     allowed_repos: list[str] = Field(default_factory=list)
+    # When true, also review the operator's OWN open PRs (discovered via an
+    # `author:<operator>` search in the trigger). Self-authored reviews are
+    # always submitted as GitHub `COMMENT` events — GitHub rejects a
+    # self-`APPROVE` with HTTP 422. Pairs best with a non-empty `allowed_repos`:
+    # with an empty allowlist this scoops up every open PR you have across all
+    # of GitHub. Default false preserves the `skipped_self_authored` behavior.
+    review_self: bool = False
 
 
 class JiraTriageHandlerEntry(HandlerEntry):

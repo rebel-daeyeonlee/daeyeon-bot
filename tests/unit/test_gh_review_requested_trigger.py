@@ -55,6 +55,7 @@ def _trigger(*, gh: FakeGh, db_path: Path, **kwargs: Any) -> GhReviewRequestedTr
         clock=kwargs.pop("clock", SystemClock()),
         pause_check=pause_check,
         permanent_failure_reporter=permanent_failure_reporter,
+        review_self=kwargs.pop("review_self", False),
     )
 
 
@@ -126,6 +127,50 @@ async def test_first_observation_emits_gen_one(db_path: Path) -> None:
     assert events[0]["type"] == "gh.review_requested"
     assert '"request_gen": 1' in events[0]["payload_json"]
     assert await _outbox_handlers(db_path) == ["pr_review"]
+
+
+async def test_review_self_unions_authored_search(db_path: Path) -> None:
+    """`review_self=True` folds `author:<operator>` PRs into the observed set."""
+    gh = FakeGh()
+    # A review-requested PR (someone else's) and an authored PR (operator's own).
+    gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
+    gh.add_pr(
+        REPO,
+        PR + 1,
+        head_sha="sha2",
+        author="daeyeon-lee",
+        in_search_set=False,
+        in_authored_set=True,
+    )
+    trig = _trigger(gh=gh, db_path=db_path, review_self=True)
+
+    emitted = await trig.poll_once()
+
+    assert emitted == 2
+    own = await _state_for(db_path, REPO, PR + 1)
+    assert own is not None
+    assert own["head_sha"] == "sha2"
+    assert own["request_gen"] == 1
+
+
+async def test_review_self_disabled_ignores_authored_search(db_path: Path) -> None:
+    """Default `review_self=False` never runs the authored search."""
+    gh = FakeGh()
+    gh.add_pr(
+        REPO,
+        PR + 1,
+        head_sha="sha2",
+        author="daeyeon-lee",
+        in_search_set=False,
+        in_authored_set=True,
+    )
+    trig = _trigger(gh=gh, db_path=db_path)
+
+    emitted = await trig.poll_once()
+
+    assert emitted == 0
+    # The authored PR never enters the state machine when review_self is off.
+    assert await _state_for(db_path, REPO, PR + 1) is None
 
 
 async def test_same_observation_twice_no_emit_second_time(db_path: Path) -> None:

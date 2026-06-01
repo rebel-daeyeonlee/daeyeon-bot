@@ -197,11 +197,20 @@ class PrReviewHandler:
     async def _gate_repo_allowlist(
         self, event: Event, parsed: _Parsed, now: datetime
     ) -> HandlerResult | None:
-        # Defense-in-depth: even if the trigger's search-side filter is
-        # misconfigured (or the event arrived via the manual CLI path),
-        # gate before any persona load / `gh.pr_get`. `force=True` does NOT
-        # bypass — the allowlist is a security boundary, not a quality knob.
-        if _is_repo_allowed(parsed.repo, self.config.allowed_repos):
+        # The allowlist guards the AUTO poller from fanning out to repos the
+        # operator never intended. An explicit `dev fire-pr-review` is the
+        # operator's own authorization for that specific PR, so it bypasses
+        # the allowlist (they already have `gh` access to that repo). For auto
+        # events the allowlist still gates before any persona load / `gh.pr_get`;
+        # `force=True` does NOT bypass it (the trigger sets force on re-reviews).
+        if parsed.is_manual or _is_repo_allowed(parsed.repo, self.config.allowed_repos):
+            if parsed.is_manual and not _is_repo_allowed(parsed.repo, self.config.allowed_repos):
+                _log.info(
+                    "pr_review.allowlist_bypassed_manual",
+                    repo=parsed.repo,
+                    pr_number=parsed.pr_number,
+                    head_sha=parsed.head_sha,
+                )
             return None
         await self._write_audit(
             event_id=event.id,
@@ -254,6 +263,7 @@ class PrReviewHandler:
             pr_number=parsed.pr_number,
             request_gen=parsed.request_gen,
             force=parsed.force,
+            is_manual=parsed.is_manual,
             head_sha=head_sha,
             persona=persona,
             pr=pr,
@@ -276,9 +286,10 @@ class PrReviewHandler:
         self, prep: _PrepState, now: datetime
     ) -> HandlerResult | None:
         is_self = bool(prep.author_login) and prep.author_login == self.github_username
-        # Skip own PRs unless `review_self` opts in. The post stage forces a
-        # COMMENT event for self-authored PRs (GitHub rejects self-APPROVE).
-        if is_self and not self.config.review_self:
+        # Skip own PRs unless `review_self` opts in — but an explicit manual
+        # fire always reviews. The post stage forces a COMMENT event for
+        # self-authored PRs (GitHub rejects self-APPROVE).
+        if is_self and not self.config.review_self and not prep.is_manual:
             await self._write_audit(
                 **prep.audit_kwargs,
                 status="skipped_self_authored",
@@ -292,9 +303,10 @@ class PrReviewHandler:
                 head_sha=prep.head_sha,
             )
             return Ack()
-        # Manual force re-runs honor the request even when the PR is no longer
-        # in the requested-reviewers list; auto runs always require it.
-        if prep.force:
+        # Manual fires and force re-runs honor the request even when the
+        # operator is not (or no longer) a requested reviewer; auto runs
+        # always require current membership.
+        if prep.force or prep.is_manual:
             return None
         # Own PRs are never in their own requested-reviewers set, so the
         # reviewer-membership test can't apply — only PR closure withdraws them.
@@ -519,6 +531,12 @@ class _Parsed:
     head_sha: str  # payload snapshot — may be stale by `gh.pr_get` time
     request_gen: int
     force: bool
+    # True when the event arrived via the operator's explicit `dev
+    # fire-pr-review` CLI (`pr.review.manual`), as opposed to the
+    # `gh.review_requested` auto-poller. An explicit manual fire is the
+    # operator's own authorization, so it bypasses the scope gates
+    # (allowlist / self-authored / withdrawn).
+    is_manual: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,6 +548,7 @@ class _PrepState:
     pr_number: int
     request_gen: int
     force: bool
+    is_manual: bool
     head_sha: str  # current head from pr_get (or payload if pr_get omitted it)
     persona: Persona
     pr: dict[str, Any]
@@ -611,6 +630,7 @@ def _parse_payload(event: Event) -> _Parsed:
         head_sha=head_sha,
         request_gen=request_gen,
         force=force,
+        is_manual=event.type == "pr.review.manual",
     )
 
 

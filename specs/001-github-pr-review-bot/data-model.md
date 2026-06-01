@@ -248,7 +248,13 @@ trigger emit (auto OR manual) │                                   │
        │                      │                                   │
        ▼                      │                                   │
   pr_review.handle()          │                                   │
+       │   (NOTE: an explicit pr.review.manual fire bypasses the three
+       │    SCOPE gates below — disallowed-repo / self-authored / withdrawn.
+       │    They apply to the gh.review_requested auto path only. The size
+       │    budget and already-reviewed gates still apply to both paths.)
        │                      │                                   │
+       ├─ disallowed repo?    │ Ack + audit(skipped_disallowed_repo)  [auto only]
+       │                      ▼
        ├─ already-reviewed?   │ Ack + audit(skipped_already_reviewed)
        │                      ▼
        ├─ self-authored?      Ack + audit(skipped_self_authored)

@@ -333,7 +333,7 @@ persona=<skill> [supersedes=[…]] [err=…]`. Statuses you'll see:
 | `skipped_withdrawn` | `requested_reviewers` no longer includes the bot — request was rescinded. |
 | `skipped_too_large` | PR diff exceeds the 1000-line / 50-file budget. Operator must `--force` or wait for a smaller follow-up. |
 | `skipped_already_reviewed` | An audit row already exists for this `(repo, pr, head_sha)`. Use `daeyeon-bot dev fire-pr-review --pr 'o/r#N' --force` to supersede. |
-| `skipped_disallowed_repo` | The PR's `owner/name` did not match `[handlers.pr_review].allowed_repos`. Security boundary; `--force` does **not** bypass. Add the glob to the allowlist if the block was unintended. |
+| `skipped_disallowed_repo` | An **auto** (`gh.review_requested`) event whose `owner/name` did not match `[handlers.pr_review].allowed_repos`. Security boundary; `--force` does **not** bypass it on the auto path. A manual `dev fire-pr-review` bypasses the allowlist entirely. Add the glob to the allowlist if you want the poller to pick it up automatically. |
 | `failed` | Handler errored — see `err=…`; for the queue row use `daeyeon-bot inspect status` (counts) or `sqlite3 ~/.daeyeon-bot/state.db "SELECT id,event_id,handler,err FROM outbox WHERE status='dead_letter'"`. |
 
 ### Fix a `persona unavailable` DLQ entry
@@ -369,8 +369,17 @@ daeyeon-bot dev fire-pr-review --pr 'o/r#123' --force
 `--force` also overrides `skipped_already_reviewed` and produces a
 "Supersedes review #<old>" header on the new review body — the prior
 `review_id` is appended to the audit row's `superseded_review_ids`
-JSON array (visible via `inspect pr-review --pr o/r#123`). It does
-**not** bypass `allowed_repos` (security boundary).
+JSON array (visible via `inspect pr-review --pr o/r#123`).
+
+An explicit `dev fire-pr-review` is the operator's own authorization for
+that specific PR, so the manual path **bypasses the scope gates** —
+`allowed_repos`, the self-authored skip, and the withdrawn
+(not-a-requested-reviewer) skip. You can review any PR you have `gh`
+access to without editing the allowlist. The size budget still applies
+(it posts the "too large" note rather than silently skipping), and
+`skipped_already_reviewed` still requires `--force` to supersede. The
+allowlist remains a hard boundary for the **auto-poller** only —
+`--force` on a `gh.review_requested` event does not bypass it.
 
 To raise the budget durably, edit `config.toml`:
 
@@ -392,8 +401,10 @@ entry is a case-insensitive `fnmatch` glob over `owner/name`. An empty
 list means "no filter" (legacy behaviour). The check runs in two
 layers — the `gh_review_requested` trigger narrows its GitHub search
 query to the same set when expressible (cuts poll traffic), and the
-handler re-checks every event before any `gh.pr_get` so manual CLI
-events and unexpressible globs (e.g. `*foo*`) still get gated.
+handler re-checks every **auto** (`gh.review_requested`) event before any
+`gh.pr_get` so unexpressible globs (e.g. `*foo*`) still get gated.
+Explicit `dev fire-pr-review` (`pr.review.manual`) events bypass the
+allowlist — see "Raise the size budget" above.
 
 ```toml
 [handlers.pr_review]

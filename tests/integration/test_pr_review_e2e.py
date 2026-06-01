@@ -108,6 +108,7 @@ min_persona_chars = 50
 
 [routing]
 "pr.review.manual" = ["pr_review"]
+"gh.review_requested" = ["pr_review"]
 """.lstrip(),
         encoding="utf-8",
     )
@@ -275,21 +276,24 @@ async def test_self_authored_short_circuits(
         await asyncio.sleep(0.05)
     assert db_path.exists()
 
+    # Fire via the AUTO path — the self-authored short-circuit applies to the
+    # `gh.review_requested` poller, not to an explicit manual fire (which now
+    # bypasses the scope gates).
     payload = {
         "repo": repo,
         "pr_number": pr_number,
         "head_sha": head_sha,
-        "request_gen": "0",
+        "request_gen": 1,
         "force": False,
     }
     now = datetime.now(tz=UTC)
-    event = make_event(type="pr.review.manual", payload=payload, created_at=now)
+    event = make_event(type="gh.review_requested", payload=payload, created_at=now)
     async with storage.connection(db_path) as conn:
         await storage.apply_migrations(conn)
         await outbox.insert_event(
             conn,
             event,
-            source="pr_review_manual",
+            source="gh_review_requested",
             source_dedup_key=f"self-{uuid.uuid4()}",
         )
         await outbox.enqueue_handler(conn, event_id=event.id, handler="pr_review", now=now)

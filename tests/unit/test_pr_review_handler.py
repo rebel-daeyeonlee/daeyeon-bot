@@ -137,6 +137,25 @@ def _manual_event(
     )
 
 
+def _auto_event(
+    *, repo: str = "o/r", pr_number: int = 7, head_sha: str = "deadbeef", force: bool = False
+) -> Event:
+    """A `gh.review_requested` event — the auto-poller path that the scope
+    gates (allowlist / self-authored / withdrawn) actually apply to."""
+    payload = {
+        "repo": repo,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "request_gen": 2 if force else 1,
+        "force": force,
+    }
+    return make_event(
+        type="gh.review_requested",
+        payload=payload,
+        created_at=datetime.now(tz=UTC),
+    )
+
+
 def _ctx(factory: FakeFactory | Callable[[], FakeClaudeSession]) -> _Ctx:
     if isinstance(factory, FakeFactory):
         callable_factory: Callable[[], FakeClaudeSession] = factory
@@ -267,7 +286,7 @@ async def test_skipped_self_authored(tmp_path: Path) -> None:
     )
     handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh)
     try:
-        event = _manual_event()
+        event = _auto_event()
         await _seed_event_row(conn, event)
         result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
         assert isinstance(result, Ack)
@@ -348,7 +367,7 @@ async def test_review_self_disabled_still_skips_own_pr(tmp_path: Path) -> None:
     )
     handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh)
     try:
-        event = _manual_event()
+        event = _auto_event()
         await _seed_event_row(conn, event)
         result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
         assert isinstance(result, Ack)
@@ -373,7 +392,7 @@ async def test_skipped_withdrawn_when_pr_closed(tmp_path: Path) -> None:
     )
     handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh)
     try:
-        event = _manual_event()
+        event = _auto_event()
         await _seed_event_row(conn, event)
         result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
         assert isinstance(result, Ack)
@@ -398,7 +417,7 @@ async def test_skipped_when_username_not_in_requested(tmp_path: Path) -> None:
     )
     handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh)
     try:
-        event = _manual_event()
+        event = _auto_event()
         await _seed_event_row(conn, event)
         result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
         assert isinstance(result, Ack)
@@ -431,13 +450,13 @@ async def test_skipped_when_repo_not_in_allowlist(tmp_path: Path) -> None:
     )
     try:
         event = make_event(
-            type="pr.review.manual",
+            type="gh.review_requested",  # auto path — allowlist applies
             payload={
                 "repo": "evil-org/some-repo",
                 "pr_number": 7,
                 "head_sha": "deadbeef",
-                "request_gen": 0,
-                "force": True,  # force MUST NOT bypass the allowlist
+                "request_gen": 2,
+                "force": True,  # force MUST NOT bypass the allowlist on auto events
             },
             created_at=datetime(2026, 5, 4, tzinfo=UTC),
         )
@@ -487,12 +506,12 @@ async def test_allowed_repo_proceeds_through_gate(tmp_path: Path) -> None:
     )
     try:
         event = make_event(
-            type="pr.review.manual",
+            type="gh.review_requested",  # auto path — allowlist match must proceed
             payload={
                 "repo": "rebellions-sw/daeyeon-bot",
                 "pr_number": 7,
                 "head_sha": "deadbeef",
-                "request_gen": 0,
+                "request_gen": 1,
                 "force": False,
             },
             created_at=datetime(2026, 5, 4, tzinfo=UTC),
@@ -500,6 +519,88 @@ async def test_allowed_repo_proceeds_through_gate(tmp_path: Path) -> None:
         await _seed_event_row(conn, event)
         result = await handler.handle(event, _ctx(factory))
         assert isinstance(result, Ack)
+        latest = await find_latest(conn, "rebellions-sw/daeyeon-bot", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "posted"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_bypasses_disallowed_repo_and_withdrawn(tmp_path: Path) -> None:
+    """An explicit `pr.review.manual` fire reviews a PR even when the repo is
+    not in `allowed_repos` and the operator is not a requested reviewer."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "evil-org/some-repo",
+        7,
+        head_sha="deadbeef",
+        author="alice",
+        requested=("someone-else",),  # operator is NOT a requested reviewer
+        files=_FILES_ONE_FILE,
+    )
+    factory = FakeFactory(
+        session=FakeClaudeSession(default='{"verdict": "APPROVE", "summary": "ok", "comments": []}')
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        factory=factory,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            allowed_repos=["rebellions-sw/*"],  # does NOT include evil-org
+        ),
+    )
+    try:
+        event = _manual_event(repo="evil-org/some-repo")
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1  # reviewed despite disallowed repo + not-requested
+        latest = await find_latest(conn, "evil-org/some-repo", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "posted"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_reviews_own_pr_even_without_review_self(tmp_path: Path) -> None:
+    """A manual fire reviews the operator's own PR (COMMENT) even when
+    `review_self=False` — the explicit command overrides the self-skip."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "rebellions-sw/daeyeon-bot",
+        7,
+        head_sha="deadbeef",
+        author=fake_gh.user_login,  # operator's own PR
+        requested=("someone-else",),
+        files=_FILES_ONE_FILE,
+    )
+    factory = FakeFactory(
+        session=FakeClaudeSession(default='{"verdict": "APPROVE", "summary": "ok", "comments": []}')
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        factory=factory,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            allowed_repos=["rebellions-sw/*"],
+            review_self=False,  # auto path would skip; manual must not
+        ),
+    )
+    try:
+        event = _manual_event(repo="rebellions-sw/daeyeon-bot")
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        assert posted[0]["event"] == "COMMENT"  # self-APPROVE still downgraded
         latest = await find_latest(conn, "rebellions-sw/daeyeon-bot", 7, "deadbeef")
         assert latest is not None
         assert latest.status == "posted"

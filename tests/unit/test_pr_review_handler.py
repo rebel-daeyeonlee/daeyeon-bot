@@ -1043,6 +1043,47 @@ async def test_verdict_pass_emits_gh_comment_event(tmp_path: Path) -> None:
         assert len(posted) == 1
         assert posted[0]["event"] == "COMMENT"
         assert len(posted[0]["comments"]) == 1
+        # COMMENT reviews stay text-only — no celebratory GIF.
+        assert "media.giphy.com" not in posted[0]["body"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_embeds_lgtm_gif_above_signoff(tmp_path: Path) -> None:
+    """A posted APPROVE carries a curated LGTM GIF; the sign-off stays last."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    factory = FakeFactory(
+        session=FakeClaudeSession(
+            default=json.dumps(
+                {
+                    "verdict": "APPROVE",
+                    "summary": (
+                        "**Verdict**: APPROVE — 모든 finding 0개.\n\n"
+                        "**개요**\n변경사항은 작고 컨벤션을 따라간다.\n\n"
+                        "— daeyeon-bot 🐥"
+                    ),
+                    "comments": [],
+                }
+            )
+        )
+    )
+    handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh, factory=factory)
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        assert posted[0]["event"] == "APPROVE"
+        body = posted[0]["body"]
+        assert "![LGTM: " in body
+        assert "https://media.giphy.com/media/" in body
+        # Sign-off invariant: GIF goes above it, sign-off remains the last line.
+        last_non_empty = next(line for line in reversed(body.split("\n")) if line.strip())
+        assert last_non_empty == "— daeyeon-bot 🐥"
     finally:
         await conn.close()
 

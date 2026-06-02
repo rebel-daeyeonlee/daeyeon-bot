@@ -54,6 +54,7 @@ from daeyeon_bot.handlers.pr_review_diff import (
     is_anchor_in_hunk,
     parse_hunk_ranges,
 )
+from daeyeon_bot.handlers.pr_review_lgtm import pick_lgtm_gif
 from daeyeon_bot.handlers.pr_review_prompt import build_system_prompt
 from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment, ReviewOutput
@@ -431,6 +432,13 @@ class PrReviewHandler:
         # COMMENT review carrying the same (empty-comments) summary body.
         is_self = sized.author_login == self.github_username
         gh_event = "APPROVE" if (review.verdict == "APPROVE" and not is_self) else "COMMENT"
+        # House style: a real APPROVE earns a celebratory LGTM GIF in the
+        # Summary (operator preference). Only on the posted APPROVE event —
+        # COMMENT/REQUEST_CHANGES (incl. self-PRs downgraded to COMMENT) stay
+        # text-only. Inserted above the sign-off and after redaction; the GIF
+        # URL is a vetted constant so it can't trip the redaction guard.
+        if gh_event == "APPROVE":
+            summary = _insert_above_signoff(summary, pick_lgtm_gif(sized.head_sha))
         posted = await self.gh.post_review(
             sized.repo,
             sized.pr_number,
@@ -752,19 +760,18 @@ def _filter_anchors(
 _SIGNOFF_PREFIX = "— daeyeon-bot 🐥"
 
 
-def _append_folded_bullets(summary: str, folded: list[InlineComment]) -> str:
-    """Insert folded out-of-hunk bullets while keeping the sign-off as the last line.
+def _insert_above_signoff(summary: str, block: str) -> str:
+    """Inject `block` just above the sign-off line, keeping it the last line.
 
     `pr_review_prompt.OUTPUT_DIRECTIVE` requires the very last non-empty line to be the
     sign-off marker. Naively appending after the summary breaks that
     invariant whenever Claude obeyed the directive (which is the common
     path). We split on the last line whose first non-whitespace tokens
-    are the sign-off marker and inject the bullets above it. Falls back
+    are the sign-off marker and inject `block` above it. Falls back
     to plain append when no sign-off is present (e.g. older summaries
     without sign-off, or chat-mode callers).
     """
-    bullets = "\n".join(f"- [{c.path} near L{c.line}] {c.body}" for c in folded)
-    if not bullets:
+    if not block:
         return summary
     lines = summary.split("\n")
     signoff_idx: int | None = None
@@ -774,14 +781,20 @@ def _append_folded_bullets(summary: str, folded: list[InlineComment]) -> str:
             break
     if signoff_idx is None:
         if summary.endswith("\n"):
-            return summary + "\n" + bullets
-        return summary + "\n\n" + bullets
+            return summary + "\n" + block
+        return summary + "\n\n" + block
     head = lines[:signoff_idx]
     while head and head[-1] == "":
         head.pop()
     tail = lines[signoff_idx:]
-    rebuilt = [*head, "", bullets, "", *tail]
+    rebuilt = [*head, "", block, "", *tail]
     return "\n".join(rebuilt)
+
+
+def _append_folded_bullets(summary: str, folded: list[InlineComment]) -> str:
+    """Fold out-of-hunk inline comments into Summary bullets above the sign-off."""
+    bullets = "\n".join(f"- [{c.path} near L{c.line}] {c.body}" for c in folded)
+    return _insert_above_signoff(summary, bullets)
 
 
 def _enforce_redaction(summary: str, comments: list[InlineComment]) -> None:

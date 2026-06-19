@@ -497,3 +497,64 @@ async def test_loki_host_tier3_runner_fallback(tmp_path: Path) -> None:
         assert 'hostname="ssw-pc-21"' in loki.calls[0][1]
     finally:
         await conn.close()
+
+
+def test_action_items_splits_circled_numerals() -> None:
+    from daeyeon_bot.handlers.ci_triage import _action_items
+
+    items = _action_items("① 첫째 단계. ② 둘째 단계 (mp, 1) 확인. ③ 셋째.")
+    assert items == ["첫째 단계.", "둘째 단계 (mp, 1) 확인.", "셋째."]
+
+
+def test_action_items_preserves_trailing_paren() -> None:
+    from daeyeon_bot.handlers.ci_triage import _action_items
+
+    items = _action_items("① SDOC 티켓 생성(infra_env / SysFw 소유)")
+    assert items == ["SDOC 티켓 생성(infra_env / SysFw 소유)"]
+
+
+def test_action_items_falls_back_to_whole_string() -> None:
+    from daeyeon_bot.handlers.ci_triage import _action_items
+
+    assert _action_items("just one action, no enumerator") == ["just one action, no enumerator"]
+
+
+def test_render_slack_body_is_block_structured() -> None:
+    from daeyeon_bot.core.ci_triage.types import ParsedAlert, RunRef, WikiMatch
+    from daeyeon_bot.handlers.ci_triage import _render_slack_body
+    from daeyeon_bot.handlers.ci_triage_schemas import Evidence, TriageOutput
+
+    t = TriageOutput(
+        attribution="infra_env",
+        classification="device_failure",
+        owner_area="SysFw",
+        confidence="medium",
+        summary="요약문.",
+        likely_cause="원인.",
+        known_remedy="복구법.",
+        recommended_action="① 단계 하나. ② 단계 둘.",
+        rerun_advice="needs_investigation",
+        needs_human=True,
+        log_evidence=(Evidence(quote="heartbeat: 0", citation="kernel/ssw-pc-21"),),
+    )
+    alert = ParsedAlert(
+        channel_id="C1",
+        message_ts="1.1",
+        author_id=None,
+        merged_text="",
+        run_ref=RunRef(repo="rebellions-sw/ssw-bundle", run_id="42"),
+    )
+    wiki = [
+        WikiMatch(
+            path="wiki/oncall/incidents/foo-bar.md", signature_matched=True, score=3, snippet=""
+        )
+    ]
+    out = _render_slack_body(alert, t, wiki)
+
+    assert "*✅ 조치*" in out
+    assert "\n1. 단계 하나." in out and "\n2. 단계 둘." in out  # numbered, one per line
+    assert "↪️ *rerun*: needs_investigation" in out
+    assert "*🧾 근거*" in out and "> heartbeat: 0  — kernel/ssw-pc-21" in out
+    assert "• foo-bar.md" in out  # basename bullet, not full vault path
+    assert "wiki/oncall/incidents/foo-bar.md" not in out
+    assert "🤖 automated first-pass (daeyeon-bot)" in out

@@ -492,10 +492,15 @@ def _parse_event(event: Event) -> tuple[ParsedAlert, bool]:
         repo = str(payload.get("repo", ""))
         run_id = str(payload.get("run_id", ""))
         run_ref = RunRef(repo=repo, run_id=run_id) if repo and run_id else None
+        # A manual fire may carry the source alert's thread coordinates so the
+        # triage replies in that real thread under post_target="thread". Absent
+        # them, fall back to synthetic ids → the post goes to dry_run_channel.
+        thread_channel = str(payload.get("channel_id", ""))
+        thread_ts = str(payload.get("message_ts", ""))
         return (
             ParsedAlert(
-                channel_id=f"manual:{repo}",
-                message_ts=run_id,
+                channel_id=thread_channel or f"manual:{repo}",
+                message_ts=thread_ts or run_id,
                 author_id=None,
                 merged_text=f"manual triage {repo} run {run_id}",
                 run_ref=run_ref,
@@ -682,34 +687,73 @@ def _supersede_header(prior: AuditRow) -> str:
     return f"_Updated triage (supersedes earlier comment posted at {when} UTC)_\n\n"
 
 
+_CIRCLED_RE = re.compile(r"[①-⑳]")  # ① .. ⑳
+
+_ATTR_EMOJI = {
+    "infra_env": "🔧",
+    "product_regression": "🐛",
+    "flaky": "🎲",
+    "unknown": "❓",
+}
+
+
+def _action_items(text: str) -> list[str]:
+    """Split a recommended-action blob into discrete steps for a numbered list.
+    The model emits circled numerals (①②③…); fall back to newline- or
+    'N.'-delimited, or the whole string when no enumerator is present."""
+    text = text.strip()
+    if _CIRCLED_RE.search(text):
+        parts = _CIRCLED_RE.split(text)
+    else:
+        parts = re.split(r"\n+|(?:(?<=\s)|^)\d{1,2}[.)]\s+", text)
+    items: list[str] = []
+    for part in parts:
+        cleaned = part.strip().lstrip(".) 、。　").strip()
+        if cleaned:
+            items.append(cleaned)
+    return items or [text]
+
+
 def _render_slack_body(alert: ParsedAlert, t: TriageOutput, wiki_matches: list[WikiMatch]) -> str:
-    """Header-first: the actionable verdict (lines 1-3) is never truncated; only
-    the body block below it is budget-trimmed."""
+    """Block-structured mrkdwn. The verdict + action items (the actionable head)
+    and the run footer are never truncated; only the descriptive middle block is
+    budget-trimmed."""
+    emoji = _ATTR_EMOJI.get(t.attribution, "•")
     run_link = (
         f"https://github.com/{alert.run_ref.repo}/actions/runs/{alert.run_ref.run_id}"
         if alert.run_ref
         else "(no run link)"
     )
-    wiki_line = ", ".join(m.path for m in wiki_matches[:3]) or "none"
-    header = [
-        f"*{t.attribution}* · {t.owner_area} · confidence *{t.confidence}*",
-        f"action: {t.recommended_action}  |  rerun: {t.rerun_advice}",
-        f"{(alert.run_ref.repo if alert.run_ref else '?')}"
-        f" · PR {alert.pr_number if alert.pr_number is not None else '-'}"
-        f" · jobs: {', '.join(alert.failed_jobs) or '-'}  |  {run_link}",
-    ]
-    body = [
+
+    head = [
+        f"{emoji} *{t.attribution}* · {t.classification} · {t.owner_area}"
+        f" · confidence *{t.confidence}*",
         "",
-        f"summary: {t.summary}",
-        f"classification: {t.classification}",
-        f"likely cause: {t.likely_cause}",
-        f"wiki match: {wiki_line}",
+        "*✅ 조치*",
     ]
+    head += [f"{i}. {step}" for i, step in enumerate(_action_items(t.recommended_action), 1)]
+    head.append(f"↪️ *rerun*: {t.rerun_advice}")
+
+    middle: list[str] = ["", "*📋 요약*", t.summary, "", "*🔍 추정 원인*", t.likely_cause]
     if t.known_remedy:
-        body.append(f"known remedy: {t.known_remedy}")
-    body_block = _truncate("\n".join(body), 2400)
-    footer = "\n🤖 automated first-pass (daeyeon-bot)"
-    return "\n".join(header) + body_block + footer
+        middle += ["", "*🩹 복구법*", t.known_remedy]
+    evidence = [f"> {_truncate(e.quote.strip(), 160)}  — {e.citation}" for e in t.log_evidence[:2]]
+    if evidence:
+        middle += ["", "*🧾 근거*", *evidence]
+    wiki_lines = [f"• {m.path.rsplit('/', 1)[-1]}" for m in wiki_matches[:3]]
+    if wiki_lines:
+        middle += ["", "*📚 참고 wiki*", *wiki_lines]
+    middle_block = _truncate("\n".join(middle), 2200)
+
+    footer = [
+        "",
+        f"*🔗 run*  {alert.run_ref.repo if alert.run_ref else '?'}"
+        f" · PR {alert.pr_number if alert.pr_number is not None else '-'}"
+        f" · jobs: {', '.join(alert.failed_jobs) or '-'}",
+        f"<{run_link}>",
+        "🤖 automated first-pass (daeyeon-bot)",
+    ]
+    return "\n".join(head) + "\n" + middle_block + "\n" + "\n".join(footer)
 
 
 def _truncate(text: str, limit: int) -> str:

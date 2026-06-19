@@ -350,6 +350,12 @@ async def _fire_jira_triage(
 def fire_ci_triage(
     repo: str = typer.Option(..., "--repo", help="owner/repo (e.g. 'rebellions-sw/ssw-bundle')."),
     run: str = typer.Option(..., "--run", help="GitHub Actions run id (numeric)."),
+    channel: str | None = typer.Option(
+        None, "--channel", help="Source alert channel id; with --message-ts, reply in that thread."
+    ),
+    message_ts: str | None = typer.Option(
+        None, "--message-ts", help="Source alert message ts; with --channel, reply in that thread."
+    ),
     force: bool = typer.Option(
         False, "--force", "-f", help="Re-triage even when a posted audit row exists."
     ),
@@ -359,12 +365,27 @@ def fire_ci_triage(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
 ) -> None:
     asyncio.run(
-        _fire_ci_triage(repo=repo, run=run, force=force, dry_run=dry_run, config_path=config)
+        _fire_ci_triage(
+            repo=repo,
+            run=run,
+            channel=channel,
+            message_ts=message_ts,
+            force=force,
+            dry_run=dry_run,
+            config_path=config,
+        )
     )
 
 
 async def _fire_ci_triage(
-    *, repo: str, run: str, force: bool, dry_run: bool, config_path: str | None
+    *,
+    repo: str,
+    run: str,
+    channel: str | None,
+    message_ts: str | None,
+    force: bool,
+    dry_run: bool,
+    config_path: str | None,
 ) -> None:
     """Build a `ci.triage.manual` event and enqueue it via the outbox."""
     cfg = load(config_path)
@@ -376,7 +397,9 @@ async def _fire_ci_triage(
             "no handlers configured for 'ci.triage.manual'. Edit config.toml's [routing] section."
         )
 
-    payload, dedup_key = build_ci_triage_payload(repo=repo, run_id=run, force=force)
+    payload, dedup_key = build_ci_triage_payload(
+        repo=repo, run_id=run, force=force, channel_id=channel, message_ts=message_ts
+    )
     now = datetime.now(tz=UTC)
     event = make_event(type="ci.triage.manual", payload=payload, created_at=now)
 

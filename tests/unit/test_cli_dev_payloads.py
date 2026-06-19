@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from daeyeon_bot.cli._dev_payloads import (
+    build_ci_triage_payload,
     build_jira_triage_payload,
     build_pr_review_payload,
 )
@@ -126,3 +127,46 @@ def test_jira_dedup_key_varies_by_issue_key() -> None:
     _, k1 = build_jira_triage_payload(issue_key="SSWCI-100", force=False)
     _, k2 = build_jira_triage_payload(issue_key="SSWCI-200", force=False)
     assert k1 != k2
+
+
+def test_ci_triage_omits_thread_coords_by_default() -> None:
+    payload, _ = build_ci_triage_payload(
+        repo="rebellions-sw/ssw-bundle", run_id="123", force=False
+    )
+    assert payload == {"repo": "rebellions-sw/ssw-bundle", "run_id": "123", "force": False}
+
+
+def test_ci_triage_carries_thread_coords_when_both_given() -> None:
+    payload, _ = build_ci_triage_payload(
+        repo="rebellions-sw/ssw-bundle",
+        run_id="123",
+        force=False,
+        channel_id="C09SEN8MH5M",
+        message_ts="1781842790.331459",
+    )
+    assert payload["channel_id"] == "C09SEN8MH5M"
+    assert payload["message_ts"] == "1781842790.331459"
+
+
+def test_ci_triage_drops_thread_coords_when_partial() -> None:
+    """Only one of channel_id/message_ts → neither is carried (incomplete thread)."""
+    payload, _ = build_ci_triage_payload(
+        repo="rebellions-sw/ssw-bundle", run_id="123", force=False, channel_id="C09SEN8MH5M"
+    )
+    assert "channel_id" not in payload
+    assert "message_ts" not in payload
+
+
+def test_ci_triage_thread_coords_do_not_change_dedup_key() -> None:
+    """Dedup identity is (repo, run_id) — routing coords must not split it."""
+    _, k_plain = build_ci_triage_payload(
+        repo="rebellions-sw/ssw-bundle", run_id="123", force=False
+    )
+    _, k_thread = build_ci_triage_payload(
+        repo="rebellions-sw/ssw-bundle",
+        run_id="123",
+        force=False,
+        channel_id="C09SEN8MH5M",
+        message_ts="1781842790.331459",
+    )
+    assert k_plain == k_thread

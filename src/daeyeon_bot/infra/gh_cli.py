@@ -71,6 +71,8 @@ _RUN_LOG_UNAVAILABLE_PHRASES = (
     "no longer available",
     "could not find the run",
     "run not found",
+    "blobnotfound",
+    "the specified blob does not exist",
 )
 
 
@@ -187,6 +189,66 @@ class GhCli:
         if result.returncode != 0:
             self._raise_run_log_error(repo, run_id, result)
         return _safe_decode(result.stdout)
+
+    async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
+        """Fetch logs for each FAILED job of a run via the per-job logs API,
+        tolerating individual missing blobs (404 / BlobNotFound).
+
+        More robust than `run_view_log_failed`: `gh run view --log-failed` bails
+        ENTIRELY when one nested/reusable/matrix job's log blob is absent (common
+        for healthcheck runs), whereas the per-job API (the same endpoint the web
+        UI's job page uses) serves every job whose blob still exists. Raises
+        `RunLogUnavailableError` only when NO failed job's log is retrievable.
+        Falls back to `run_view_log_failed` when the run reports no failed jobs.
+        """
+        if not repo or not run_id:
+            raise PermanentError("run_failed_job_logs requires repo and run_id")
+        failed = await self._failed_jobs(repo, run_id)
+        if not failed:
+            return await self.run_view_log_failed(repo, run_id)
+        chunks: list[str] = []
+        for job_id, name in failed:
+            text = await self._job_logs(repo, job_id)
+            if text:
+                chunks.append(f"=== {name} (job {job_id}) ===\n{text}")
+        if not chunks:
+            raise RunLogUnavailableError(
+                f"gh: no retrievable logs for any failed job of run {run_id}"
+            )
+        return "\n\n".join(chunks)
+
+    async def _failed_jobs(self, repo: str, run_id: str) -> list[tuple[str, str]]:
+        """`(job_id, name)` for each failed/cancelled/timed-out job of the run."""
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/actions/runs/{run_id}/jobs",
+            extra=("-f", "per_page=100", "-f", "filter=latest"),
+        )
+        jobs_raw = payload.get("jobs") if isinstance(payload, dict) else None
+        out: list[tuple[str, str]] = []
+        if isinstance(jobs_raw, list):
+            for job in cast("list[Any]", jobs_raw):
+                if not isinstance(job, dict):
+                    continue
+                job_d = cast("dict[str, Any]", job)
+                if job_d.get("conclusion") in ("failure", "cancelled", "timed_out"):
+                    jid = job_d.get("id")
+                    if jid is not None:
+                        out.append((str(jid), str(job_d.get("name") or jid)))
+        return out
+
+    async def _job_logs(self, repo: str, job_id: str) -> str | None:
+        """Raw logs for one job via `gh api /repos/.../actions/jobs/<id>/logs`.
+        Returns None when the blob is gone (404 / BlobNotFound) so the caller can
+        skip just that job; raises (auth / rate / 5xx) for real failures."""
+        result = await self._run("api", f"/repos/{repo}/actions/jobs/{job_id}/logs")
+        if result.returncode == 0:
+            return _safe_decode(result.stdout)
+        blob = (_safe_decode(result.stderr) + _safe_decode(result.stdout)).lower()
+        if any(p in blob for p in _RUN_LOG_UNAVAILABLE_PHRASES) or "404" in blob:
+            return None
+        self._raise_run_log_error(repo, job_id, result)
+        return None  # unreachable — _raise_run_log_error always raises
 
     async def pr_get(self, repo: str, pr_number: int) -> dict[str, Any]:
         """Fetch one PR's metadata via `GET /repos/{repo}/pulls/{n}`."""

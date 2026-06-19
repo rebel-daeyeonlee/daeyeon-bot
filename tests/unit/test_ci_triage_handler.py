@@ -91,7 +91,7 @@ class _FakeGh:
     log: str = "premerge / result | rsync ... golden-base failed: No such file\n##[error]Process completed with exit code 1."
     raise_unavailable: bool = False
 
-    async def run_view_log_failed(self, repo: str, run_id: str) -> str:
+    async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
         if self.raise_unavailable:
             raise RunLogUnavailableError("could not find any workflow run")
         return self.log

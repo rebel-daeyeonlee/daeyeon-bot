@@ -77,7 +77,7 @@ class _FakeSlack:
 
 @dataclass(slots=True)
 class _FakeGh:
-    async def run_view_log_failed(self, repo: str, run_id: str) -> str:
+    async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
         return (
             "premerge / result | rsync ... golden-base failed: No such file\n"
             "##[error]Process completed with exit code 1."

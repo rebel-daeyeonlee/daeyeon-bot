@@ -66,3 +66,38 @@ async def test_unknown_nonzero_maps_to_transient() -> None:
     gh._run = _stub_run(1, stderr=b"connection reset by peer")  # type: ignore[method-assign]
     with pytest.raises(TransientError):
         await gh.run_view_log_failed("rebellions-sw/ssw-bundle", "123")
+
+
+# ── run_failed_job_logs: per-job fetch with individual 404 tolerance ──────────
+
+
+async def test_failed_job_logs_tolerates_individual_404() -> None:
+    gh = GhCli()
+
+    async def _failed_jobs(repo: str, run_id: str) -> list[tuple[str, str]]:
+        return [("111", "ci-test (matrix leaf)"), ("222", "result")]
+
+    async def _job_logs(repo: str, job_id: str) -> str | None:
+        return None if job_id == "111" else "Atom test failed\n##[error]exit 1"
+
+    gh._failed_jobs = _failed_jobs  # type: ignore[method-assign]
+    gh._job_logs = _job_logs  # type: ignore[method-assign]
+    out = await gh.run_failed_job_logs("rebellions-sw/ssw-bundle", "27800853109")
+    assert "result" in out
+    assert "Atom test failed" in out
+    assert "ci-test (matrix leaf)" not in out  # the 404'd job is skipped
+
+
+async def test_failed_job_logs_all_404_raises() -> None:
+    gh = GhCli()
+
+    async def _failed_jobs(repo: str, run_id: str) -> list[tuple[str, str]]:
+        return [("111", "a"), ("222", "b")]
+
+    async def _job_logs(repo: str, job_id: str) -> str | None:
+        return None
+
+    gh._failed_jobs = _failed_jobs  # type: ignore[method-assign]
+    gh._job_logs = _job_logs  # type: ignore[method-assign]
+    with pytest.raises(RunLogUnavailableError):
+        await gh.run_failed_job_logs("rebellions-sw/ssw-bundle", "27800853109")

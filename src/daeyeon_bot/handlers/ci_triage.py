@@ -88,7 +88,7 @@ class _SlackClient(Protocol):
 
 @runtime_checkable
 class _GhClient(Protocol):
-    async def run_view_log_failed(self, repo: str, run_id: str) -> str: ...
+    async def run_failed_job_logs(self, repo: str, run_id: str) -> str: ...
 
 
 @runtime_checkable
@@ -165,7 +165,7 @@ class CiTriageHandler:
         gh_error: str | None = None
         if alert.run_ref is not None:
             try:
-                raw = await self.gh.run_view_log_failed(alert.run_ref.repo, alert.run_ref.run_id)
+                raw = await self.gh.run_failed_job_logs(alert.run_ref.repo, alert.run_ref.run_id)
             except RunLogUnavailableError as exc:
                 gh_error = f"log_unavailable:{str(exc)[:80]}"
                 # If a Loki window is present, the device-level path still has

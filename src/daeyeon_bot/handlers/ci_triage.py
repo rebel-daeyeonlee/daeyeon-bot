@@ -371,7 +371,7 @@ class CiTriageHandler:
         )
         text = (
             f"🤖 CI Triage: alert를 확인했지만 {reason} — 수동 triage가 필요합니다."
-            f"  {run_link}\n🤖 automated first-pass (daeyeon-bot)"
+            f"  {run_link}\n🤖 daeyeon-bot"
         )
         try:
             await self.slack.post_message(
@@ -751,7 +751,7 @@ def _render_slack_body(alert: ParsedAlert, t: TriageOutput, wiki_matches: list[W
         f" · PR {alert.pr_number if alert.pr_number is not None else '-'}"
         f" · jobs: {', '.join(alert.failed_jobs) or '-'}",
         f"<{run_link}>",
-        "🤖 automated first-pass (daeyeon-bot)",
+        "🤖 daeyeon-bot",
     ]
     return "\n".join(head) + "\n" + middle_block + "\n" + "\n".join(footer)
 

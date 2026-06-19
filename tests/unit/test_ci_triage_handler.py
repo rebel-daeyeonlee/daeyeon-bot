@@ -210,7 +210,7 @@ async def test_manual_fire_happy_path_posts_dry_run(tmp_path: Path) -> None:
         assert slack.posts[0]["channel"] == "C_DRY"
         assert slack.posts[0]["thread_ts"] is None
         assert "infra_env" in slack.posts[0]["text"]
-        assert "🤖 automated first-pass" in slack.posts[0]["text"]
+        assert "🤖 daeyeon-bot" in slack.posts[0]["text"]
 
         audit = await find_latest_for_message(
             conn, channel_id="manual:rebellions-sw/ssw-bundle", message_ts="27758520154"
@@ -557,4 +557,4 @@ def test_render_slack_body_is_block_structured() -> None:
     assert "*🧾 근거*" in out and "> heartbeat: 0  — kernel/ssw-pc-21" in out
     assert "• foo-bar.md" in out  # basename bullet, not full vault path
     assert "wiki/oncall/incidents/foo-bar.md" not in out
-    assert "🤖 automated first-pass (daeyeon-bot)" in out
+    assert "🤖 daeyeon-bot" in out

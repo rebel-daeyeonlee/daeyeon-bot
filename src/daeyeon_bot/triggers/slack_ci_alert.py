@@ -176,9 +176,15 @@ class SlackCiAlertTrigger:
                 return _PollOutcome()
 
             newest_ts = messages[-1]["ts"]
-            candidates = [
-                m for m in messages if is_ci_failure_candidate(m, known_bot_ids=self.known_bot_ids)
-            ]
+            # Thread-aware candidacy: a candidate is a top-level message that is
+            # itself a CI-failure alert, OR one whose thread replies carry the run
+            # link (humans post "premerge fail" then drop the run URL in a reply).
+            # Each candidate keeps the raw_blob that actually carries the evidence.
+            candidates: list[tuple[dict[str, Any], str]] = []
+            for msg in messages:
+                raw_blob, is_candidate = await self._thread_candidacy(channel_id, msg)
+                if is_candidate:
+                    candidates.append((msg, raw_blob))
 
             # CASE 3 — new messages but no candidates: advance past the chatter.
             if not candidates:
@@ -194,8 +200,10 @@ class SlackCiAlertTrigger:
             emit_list = candidates[: self.max_per_cycle]
             capped = len(candidates) > self.max_per_cycle
             emitted = 0
-            for msg in emit_list:
-                if await self._emit_event(conn, channel_id=channel_id, msg=msg, now=now):
+            for msg, raw_blob in emit_list:
+                if await self._emit_event(
+                    conn, channel_id=channel_id, msg=msg, raw_blob=raw_blob, now=now
+                ):
                     emitted += 1
                 await slack_ci_alert_state.advance_cursor(
                     conn, channel_id=channel_id, last_seen_ts=msg["ts"], now_iso=now_iso
@@ -217,6 +225,30 @@ class SlackCiAlertTrigger:
                 )
                 await conn.commit()
             return _PollOutcome(emitted=emitted)
+
+    async def _thread_candidacy(
+        self, channel_id: str, msg: dict[str, Any]
+    ) -> tuple[str, bool]:
+        """Return (raw_blob, is_candidate) for a top-level message, looking into
+        its thread replies when the message itself isn't an alert. The run link is
+        often in a reply ("premerge fail" parent + run URL reply); we merge the
+        replies into raw_blob so the handler can extract the run from the parent's
+        thread. Only threads (`reply_count > 0`) trigger the extra fetch."""
+        parent_blob = merge_message_text(msg)
+        if is_ci_failure_candidate(msg, known_bot_ids=self.known_bot_ids):
+            return parent_blob, True
+        if int(msg.get("reply_count", 0) or 0) <= 0:
+            return parent_blob, False
+
+        parent_ts = str(msg["ts"])
+        thread = await self.slack.replies(channel_id, thread_ts=parent_ts)
+        replies = [r for r in thread if str(r.get("ts")) != parent_ts]
+        if not any(is_ci_failure_candidate(r, known_bot_ids=self.known_bot_ids) for r in replies):
+            return parent_blob, False
+
+        reply_blob = "\n".join(merge_message_text(r) for r in replies)
+        combined = f"{parent_blob}\n{reply_blob}" if parent_blob else reply_blob
+        return combined, True
 
     async def _latest_ts(self, channel_id: str) -> str | None:
         page = await self.slack.history(channel_id, limit=1)
@@ -245,6 +277,7 @@ class SlackCiAlertTrigger:
         *,
         channel_id: str,
         msg: dict[str, Any],
+        raw_blob: str,
         now: Any,
     ) -> bool:
         message_ts = str(msg["ts"])
@@ -253,7 +286,7 @@ class SlackCiAlertTrigger:
             "channel_id": channel_id,
             "message_ts": message_ts,
             "author_id": author if isinstance(author, str) else None,
-            "raw_blob": merge_message_text(msg),
+            "raw_blob": raw_blob,
         }
         seed = f"slack-ci-alert|{channel_id}|{message_ts}"
         dedup_key = hashlib.sha256(seed.encode("utf-8")).hexdigest()

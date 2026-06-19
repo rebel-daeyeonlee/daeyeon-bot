@@ -40,9 +40,13 @@ class _Clock:
 
 @dataclass(slots=True)
 class _FakeSlack:
-    """Scripted history. `messages[channel]` is the full message list."""
+    """Scripted history. `messages[channel]` is the top-level message list;
+    `thread_replies[parent_ts]` holds reply messages (excluding the parent),
+    mirroring Slack where replies surface only via `conversations.replies`."""
 
     messages: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    thread_replies: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    replies_calls: list[str] = field(default_factory=list)
 
     async def history(
         self,
@@ -59,6 +63,18 @@ class _FakeSlack:
         fresh = [m for m in msgs if float(m["ts"]) > float(oldest)]
         fresh.sort(key=lambda m: float(m["ts"]), reverse=True)  # Slack: newest-first
         return HistoryPage(messages=fresh, next_cursor=None)
+
+    async def replies(
+        self, channel_id: str, *, thread_ts: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self.replies_calls.append(str(thread_ts))
+        parent = next(
+            (m for m in self.messages.get(channel_id, []) if str(m["ts"]) == str(thread_ts)),
+            None,
+        )
+        out: list[dict[str, Any]] = [parent] if parent is not None else []
+        out.extend(self.thread_replies.get(str(thread_ts), []))
+        return out
 
 
 def _msg(ts: str, *, candidate: bool = True) -> dict[str, Any]:
@@ -195,3 +211,83 @@ async def test_non_candidate_unknown_author_filtered(tmp_path: Path) -> None:
     out = await trig.poll_once()
     assert out.emitted == 0
     assert await _cursor_ts(db_path) == _ts(70)
+
+
+async def _latest_event_payload(db_path: Path) -> dict[str, Any]:
+    import json
+
+    async with storage.connection(db_path) as c:
+        async with c.execute(
+            "SELECT payload_json FROM events WHERE source = 'slack_ci_alert'"
+            " ORDER BY created_at DESC LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+    assert row is not None
+    return json.loads(row["payload_json"])
+
+
+async def test_thread_reply_run_link_makes_candidate(tmp_path: Path) -> None:
+    """A human 'premerge fail' parent with no link, but a reply carrying the run
+    URL, is a candidate. The event targets the PARENT thread and its raw_blob
+    carries the reply's run link so the handler can resolve the run."""
+    db_path = await _init_db(tmp_path)
+    slack = _FakeSlack(messages={_CH: [_msg(_ts(1))]})
+    trig = _trigger(slack, db_path, _Clock(_dt(100)))
+    await trig.poll_once()  # seed at _ts(1)
+
+    parent = {
+        "ts": _ts(50),
+        "user": "UHUMAN",
+        "text": "[TEST] CR03 premerge fail",
+        "reply_count": 1,
+    }
+    slack.messages[_CH].append(parent)
+    slack.thread_replies[_ts(50)] = [
+        {
+            "ts": _ts(51),
+            "user": "UHUMAN",
+            "text": "see https://github.com/rebellions-sw/ssw-bundle/actions/runs/27123448635/job/8?pr=3690",
+        }
+    ]
+
+    out = await trig.poll_once()
+    assert out.emitted == 1
+    assert await _count_events(db_path) == 1
+    payload = await _latest_event_payload(db_path)
+    assert payload["message_ts"] == _ts(50)  # reply in the parent's thread
+    assert "27123448635" in payload["raw_blob"]  # run link pulled from the reply
+    assert await _cursor_ts(db_path) == _ts(50)
+
+
+async def test_thread_without_run_link_is_not_candidate(tmp_path: Path) -> None:
+    """A threaded parent whose replies carry no run link stays non-candidate;
+    the cursor advances past it with no emit."""
+    db_path = await _init_db(tmp_path)
+    slack = _FakeSlack(messages={_CH: [_msg(_ts(1))]})
+    trig = _trigger(slack, db_path, _Clock(_dt(100)))
+    await trig.poll_once()  # seed
+
+    parent = {"ts": _ts(60), "user": "UHUMAN", "text": "도와주세요", "reply_count": 1}
+    slack.messages[_CH].append(parent)
+    slack.thread_replies[_ts(60)] = [{"ts": _ts(61), "user": "UHUMAN", "text": "확인 부탁요"}]
+
+    out = await trig.poll_once()
+    assert out.emitted == 0
+    assert await _count_events(db_path) == 0
+    assert await _cursor_ts(db_path) == _ts(60)
+
+
+async def test_no_replies_skips_thread_fetch(tmp_path: Path) -> None:
+    """A non-candidate message with reply_count 0 must NOT trigger a replies()
+    fetch (API-call minimization)."""
+    db_path = await _init_db(tmp_path)
+    slack = _FakeSlack(messages={_CH: [_msg(_ts(1))]})
+    trig = _trigger(slack, db_path, _Clock(_dt(100)))
+    await trig.poll_once()  # seed
+    slack.messages[_CH].append(
+        {"ts": _ts(70), "user": "UHUMAN", "text": "그냥 잡담"}
+    )  # no reply_count
+
+    out = await trig.poll_once()
+    assert out.emitted == 0
+    assert slack.replies_calls == []  # replies() never called for a reply-less message

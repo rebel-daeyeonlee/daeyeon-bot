@@ -13,9 +13,17 @@ from daeyeon_bot.app import ratelimit as ratelimit_mod
 from daeyeon_bot.app.config import Config, load
 from daeyeon_bot.app.registry import build_handler_registry
 from daeyeon_bot.app.supervisor import list_quarantined, unquarantine
+from daeyeon_bot.core.ci_triage.types import AuditRow as CiAuditRow
 from daeyeon_bot.core.jira_triage.audit import AuditRow as JiraAuditRow
 from daeyeon_bot.core.pr_review.audit import AuditRow
-from daeyeon_bot.infra import jira_triage_audit, pr_review_audit, queries, storage
+from daeyeon_bot.infra import (
+    ci_triage_audit,
+    jira_triage_audit,
+    pr_review_audit,
+    queries,
+    slack_ci_alert_state,
+    storage,
+)
 
 app = typer.Typer(help="Inspect runtime state and history.", no_args_is_help=True)
 
@@ -339,6 +347,65 @@ def _format_jira_audit_row(row: JiraAuditRow) -> str:
     return (
         f"{when}  {row.issue_key}  status={row.status}  domain={domain}  sev={sev}"
         f"  {comment}  persona={persona}{chain}{loki}{ssh}{missing}{err}"
+    )
+
+
+@app.command(
+    "ci-triage",
+    help=(
+        "Show ci_triage audit history + per-channel Slack cursors. With no flags:"
+        " cursors + most recent 20 rows. With --message-ts <ts>: rows for that alert."
+    ),
+)
+def ci_triage(
+    message_ts: str | None = typer.Option(
+        None, "--message-ts", help="Filter to one alert message ts."
+    ),
+    n: int = typer.Option(20, "--n", help="Number of audit rows (default 20)."),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+) -> None:
+    cursors, rows = asyncio.run(_ci_triage_state(limit=n, config_path=config))
+    if message_ts is None:
+        if cursors:
+            typer.echo("Channel cursors:")
+            for c in cursors:
+                typer.echo(
+                    f"  {c.channel_id}  last_seen_ts={c.last_seen_ts}"
+                    f"  seeded={c.seeded}  updated_at={c.updated_at}"
+                )
+        else:
+            typer.echo("Channel cursors: (none — trigger not seeded yet)")
+        typer.echo("Recent triage audit:")
+    selected = [r for r in rows if r.message_ts == message_ts] if message_ts else rows
+    if not selected:
+        typer.echo("  (no audit rows)")
+        return
+    for row in selected:
+        typer.echo("  " + _format_ci_audit_row(row))
+
+
+async def _ci_triage_state(
+    *, limit: int, config_path: str | None
+) -> tuple[list[slack_ci_alert_state.CursorRow], list[CiAuditRow]]:
+    cfg = load(config_path)
+    async with storage.connection(cfg.db_path) as conn:
+        await storage.apply_migrations(conn)
+        cursors = await slack_ci_alert_state.list_cursors(conn)
+        rows = await ci_triage_audit.list_recent(conn, limit=limit)
+    return cursors, rows
+
+
+def _format_ci_audit_row(row: CiAuditRow) -> str:
+    run = f"{row.repo}@{row.run_id}" if row.repo else "-"
+    posted = f" posted={row.posted_message_ts}" if row.posted_message_ts else ""
+    attr = row.attribution or "-"
+    conf = row.confidence or "-"
+    wiki = f" wiki={list(row.wiki_matches)}" if row.wiki_matches else ""
+    gh = f" gh_err={row.gh_error}" if row.gh_error else ""
+    err = f" err={row.error}" if row.error else ""
+    return (
+        f"{row.created_at.isoformat()}  {row.channel_id}#{row.message_ts}  status={row.status}"
+        f"  run={run}  attr={attr}  conf={conf}{posted}{wiki}{gh}{err}"
     )
 
 

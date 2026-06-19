@@ -114,15 +114,38 @@ def _persona_root() -> Path:
     return Path(__file__).resolve().parents[2] / ".claude" / "skills"
 
 
-def _make_handler(db: aiosqlite.Connection, *, slack: Any, gh: Any, wiki: Any) -> CiTriageHandler:
+def _make_handler(
+    db: aiosqlite.Connection,
+    *,
+    slack: Any,
+    gh: Any,
+    wiki: Any,
+    config: CiTriageHandlerEntry | None = None,
+) -> CiTriageHandler:
     return CiTriageHandler(
         manifest=MANIFEST,
         slack=slack,
         gh=gh,
         oncall_wiki=wiki,
         persona_loader=PersonaLoader(skills_root=_persona_root()),
-        config=CiTriageHandlerEntry(dry_run_channel="C_DRY", post_target="dry_run"),
+        config=config or CiTriageHandlerEntry(dry_run_channel="C_DRY", post_target="dry_run"),
         db=db,
+    )
+
+
+def _auto_event(channel: str, ts: str, run: str) -> Event:
+    raw = (
+        f"premerge / result failed — https://github.com/rebellions-sw/ssw-bundle/actions/runs/{run}"
+    )
+    return make_event(
+        type="slack.ci_alert",
+        payload={
+            "channel_id": channel,
+            "message_ts": ts,
+            "author_id": "U069J27G2G6",
+            "raw_blob": raw,
+        },
+        created_at=_NOW,
     )
 
 
@@ -266,6 +289,93 @@ async def test_no_run_link_skips(tmp_path: Path) -> None:
         )
         assert isinstance(result, Ack)
         assert slack.posts == []
+        audit = await find_latest_for_message(conn, channel_id="C1", message_ts="100.1")
+        assert audit is not None
+        assert audit.status == "skipped_no_run_link"
+    finally:
+        await conn.close()
+
+
+# ── P3: posting promotion ────────────────────────────────────────────────────
+
+
+async def test_post_target_thread_replies_in_alert_thread(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        ev = _auto_event("C_ALERTS", "100.1", "27758520154")
+        await _seed_event(conn, ev, "d1")
+        slack = _FakeSlack()
+        cfg = CiTriageHandlerEntry(dry_run_channel="C_DRY", post_target="thread")
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki(), config=cfg)
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        assert len(slack.posts) == 1
+        # Posts to the ORIGINAL alert channel, as a thread reply on the alert ts.
+        assert slack.posts[0]["channel"] == "C_ALERTS"
+        assert slack.posts[0]["thread_ts"] == "100.1"
+    finally:
+        await conn.close()
+
+
+async def test_force_supersede_prepends_header(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        # Prior posted triage for the same run.
+        ev0 = _manual_event("rebellions-sw/ssw-bundle", "555")
+        await _seed_event(conn, ev0, "d0")
+        await insert_audit(
+            conn,
+            event_id=ev0.id,
+            channel_id="manual:rebellions-sw/ssw-bundle",
+            message_ts="555",
+            status="posted",
+            created_at=_NOW,
+            repo="rebellions-sw/ssw-bundle",
+            run_id="555",
+        )
+        await conn.commit()
+
+        ev1 = _manual_event("rebellions-sw/ssw-bundle", "555", force=True)
+        await _seed_event(conn, ev1, "d1")
+        slack = _FakeSlack()
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki())
+        result = await handler.handle(
+            ev1, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        assert len(slack.posts) == 1  # force re-posts (does not skip)
+        assert slack.posts[0]["text"].startswith("_Updated triage (supersedes")
+    finally:
+        await conn.close()
+
+
+async def test_no_evidence_note_posted_when_enabled(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        ev = make_event(
+            type="slack.ci_alert",
+            payload={
+                "channel_id": "C1",
+                "message_ts": "100.1",
+                "raw_blob": "human chatter no link",
+            },
+            created_at=_NOW,
+        )
+        await _seed_event(conn, ev, "d1")
+        slack = _FakeSlack()
+        cfg = CiTriageHandlerEntry(
+            dry_run_channel="C_DRY", post_target="dry_run", post_no_evidence_note=True
+        )
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki(), config=cfg)
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        # A minimal note was posted (vs the default silent skip).
+        assert len(slack.posts) == 1
+        assert "수동 triage" in slack.posts[0]["text"]
         audit = await find_latest_for_message(conn, channel_id="C1", message_ts="100.1")
         assert audit is not None
         assert audit.status == "skipped_no_run_link"

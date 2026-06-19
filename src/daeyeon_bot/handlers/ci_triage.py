@@ -25,7 +25,13 @@ import structlog
 from pydantic import ValidationError as PydanticValidationError
 
 from daeyeon_bot.app.config import CiTriageHandlerEntry
-from daeyeon_bot.core.ci_triage.types import LokiWindow, ParsedAlert, RunRef, WikiMatch
+from daeyeon_bot.core.ci_triage.types import (
+    AuditRow,
+    LokiWindow,
+    ParsedAlert,
+    RunRef,
+    WikiMatch,
+)
 from daeyeon_bot.core.errors import PermanentError, RunLogUnavailableError, TransientError
 from daeyeon_bot.core.events import Event
 from daeyeon_bot.core.manifest import HandlerManifest
@@ -113,13 +119,18 @@ class CiTriageHandler:
         except TimeoutError as exc:
             raise TransientError(f"ci_triage exceeded {budget}s budget (asyncio.wait_for)") from exc
 
-    async def _handle_inner(self, event: Event, ctx: HandlerContext) -> HandlerResult:
+    async def _handle_inner(  # noqa: PLR0912, PLR0915 — multi-stage pipeline; each branch documented
+        self, event: Event, ctx: HandlerContext
+    ) -> HandlerResult:
         await self.pause_guard()
         now = ctx.clock.now() if hasattr(ctx, "clock") else datetime.now(tz=UTC)
         alert, force = _parse_event(event)
 
         # Gate: no machine-readable run link AND no Loki window → nothing to triage.
         if alert.run_ref is None and alert.loki_window is None:
+            await self._maybe_post_no_evidence_note(
+                alert, reason="machine-readable run/Loki 링크를 못 찾았습니다"
+            )
             await self._audit(event, alert, status="skipped_no_run_link", now=now)
             return Ack()
 
@@ -159,6 +170,9 @@ class CiTriageHandler:
                 # If a Loki window is present, the device-level path still has
                 # evidence; otherwise the run is unrecoverable → skip (not retry).
                 if alert.loki_window is None:
+                    await self._maybe_post_no_evidence_note(
+                        alert, reason="GitHub run 로그가 만료/삭제됐습니다"
+                    )
                     await self._audit(
                         event, alert, status="skipped_log_unavailable", now=now, gh_error=gh_error
                     )
@@ -207,8 +221,12 @@ class CiTriageHandler:
             triage, has_strong_anchor=has_strong_anchor, has_wiki_match=has_wiki
         )
 
-        # ── Render + redaction guard ──────────────────────────────────────────
+        # ── Render (+ force-supersede header) + redaction guard ───────────────
         body = _render_slack_body(alert, triage, wiki_matches)
+        if force:
+            prior = await self._prior_posted(alert)
+            if prior is not None:
+                body = _supersede_header(prior) + body
         _, spans = redact_with_provenance(body)
         if spans:
             await self._audit(
@@ -298,6 +316,43 @@ class CiTriageHandler:
         raise PermanentError("ci_triage: claude loop exited without result")
 
     # ── helpers ──────────────────────────────────────────────────────────────
+
+    async def _prior_posted(self, alert: ParsedAlert) -> AuditRow | None:
+        """The prior `posted` audit row for this run/message (for the
+        force-supersede header). Run-keyed first, then message-keyed."""
+        if alert.run_ref is not None:
+            hit = await find_posted_for_run(
+                self.db, repo=alert.run_ref.repo, run_id=alert.run_ref.run_id
+            )
+            if hit is not None:
+                return hit
+        return await find_posted_for_message(
+            self.db, channel_id=alert.channel_id, message_ts=alert.message_ts
+        )
+
+    async def _maybe_post_no_evidence_note(self, alert: ParsedAlert, *, reason: str) -> None:
+        """Post a minimal "bot saw it, no evidence" note when configured. Best-
+        effort — a note-post failure must not fail the (already-skipped) event.
+        Default off under dry_run; flipped on at the P3 thread promotion."""
+        if not self.config.post_no_evidence_note:
+            return
+        target, thread_ts = self._post_target(alert)
+        run_link = (
+            f"https://github.com/{alert.run_ref.repo}/actions/runs/{alert.run_ref.run_id}"
+            if alert.run_ref
+            else "(no run link)"
+        )
+        text = (
+            f"🤖 CI Triage: alert를 확인했지만 {reason} — 수동 triage가 필요합니다."
+            f"  {run_link}\n🤖 automated first-pass (daeyeon-bot)"
+        )
+        try:
+            await self.slack.post_message(
+                target, text, thread_ts=thread_ts, username="CI Triage", icon_emoji=":robot_face:"
+            )
+        except Exception as exc:
+            # best-effort note; a failure must never fail the already-skipped event.
+            _log.info("ci_triage.no_evidence_note_failed", error=repr(exc))
 
     def _post_target(self, alert: ParsedAlert) -> tuple[str, str | None]:
         """Return (channel_id, thread_ts). dry_run → test channel, no thread;
@@ -503,6 +558,13 @@ def _render_user_message(
         " Do not assert a wiki link without a matching log anchor. If evidence is"
         " insufficient, set attribution=unknown / confidence=low."
     )
+
+
+def _supersede_header(prior: AuditRow) -> str:
+    """Force-supersede header. The Slack adapter has no chat.update/delete, so a
+    force posts a NEW message and the prior one stays (documented in RUNBOOK)."""
+    when = prior.created_at.strftime("%H:%M:%S")
+    return f"_Updated triage (supersedes earlier comment posted at {when} UTC)_\n\n"
 
 
 def _render_slack_body(alert: ParsedAlert, t: TriageOutput, wiki_matches: list[WikiMatch]) -> str:

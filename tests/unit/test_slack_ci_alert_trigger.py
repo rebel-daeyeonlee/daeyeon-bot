@@ -291,3 +291,31 @@ async def test_no_replies_skips_thread_fetch(tmp_path: Path) -> None:
     out = await trig.poll_once()
     assert out.emitted == 0
     assert slack.replies_calls == []  # replies() never called for a reply-less message
+
+
+async def test_quiet_but_polled_channel_does_not_reseed(tmp_path: Path) -> None:
+    """A channel quiet for >staleness (so its last MESSAGE is old) must still emit
+    the next alert as long as the daemon kept polling (updated_at stays fresh).
+    Staleness is a daemon-outage guard, not a quiet-channel guard — regression for
+    the bug where an aged cursor ate the first alert after a lull."""
+    db_path = await _init_db(tmp_path)
+    slack = _FakeSlack(messages={_CH: [_msg(_ts(1))]})
+    clock = _Clock(_dt(100))
+    trig = _trigger(slack, db_path, clock)
+    await trig.poll_once()  # seed at _ts(1), updated_at=_dt(100)
+
+    # Keep polling every <staleness while the channel is silent — updated_at stays
+    # fresh even though _ts(1) ages well past 6h.
+    for t in (10_000, 20_000, 29_000):
+        clock.value = _dt(t)
+        out = await trig.poll_once()
+        assert out.reseeded == 0  # actively polled → never a "stale" gap
+
+    # A new alert arrives; only ~5s since the last poll → not an outage.
+    clock.value = _dt(29_005)
+    slack.messages[_CH].append(_msg(_ts(29_004)))
+    out = await trig.poll_once()
+    assert out.reseeded == 0
+    assert out.emitted == 1  # the alert is triaged, NOT eaten by a stale reseed
+    assert await _count_events(db_path) == 1
+    assert await _cursor_ts(db_path) == _ts(29_004)

@@ -28,6 +28,7 @@ import hashlib
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import aiosqlite
@@ -157,8 +158,13 @@ class SlackCiAlertTrigger:
                 await conn.commit()
                 return _PollOutcome(seeded=1)
 
-            # CASE 1b — staleness re-seed after a long gap.
-            if now.timestamp() - _ts_seconds(cursor.last_seen_ts) > self.staleness_seconds:
+            # CASE 1b — staleness re-seed only after a real polling gap (a daemon
+            # outage), measured from the LAST POLL (updated_at), NOT the last
+            # message ts. A quiet but actively-polled channel must not age into a
+            # reseed and silently eat its next alert. On an unparseable timestamp
+            # we fail safe (treat as fresh → process normally, never eat alerts).
+            last_poll = _iso_epoch(cursor.updated_at)
+            if last_poll is not None and now.timestamp() - last_poll > self.staleness_seconds:
                 latest = await self._latest_ts(channel_id)
                 if latest is not None:
                     await slack_ci_alert_state.advance_cursor(
@@ -306,6 +312,14 @@ def _ts_seconds(slack_ts: str) -> float:
         return float(slack_ts)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _iso_epoch(iso: str) -> float | None:
+    """ISO-8601 (`updated_at`) → epoch seconds, or None if unparseable."""
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 __all__ = [

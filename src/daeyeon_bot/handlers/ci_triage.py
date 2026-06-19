@@ -89,6 +89,8 @@ class _SlackClient(Protocol):
 @runtime_checkable
 class _GhClient(Protocol):
     async def run_failed_job_logs(self, repo: str, run_id: str) -> str: ...
+    async def run_failed_annotations(self, repo: str, run_id: str) -> str: ...
+    async def failed_jobs(self, repo: str, run_id: str) -> list[Any]: ...
 
 
 @runtime_checkable
@@ -160,17 +162,27 @@ class CiTriageHandler:
             min_chars=self.config.min_persona_chars,
         )
 
-        # ── EVIDENCE: run-log path (primary) ──────────────────────────────────
+        # ── EVIDENCE: run-log path (primary) + check-run annotations ──────────
         log_text = ""
+        annotations = ""
         gh_error: str | None = None
         if alert.run_ref is not None:
+            # Annotations carry the concise failure reason even when a job's log
+            # blob is gone (e.g. a self-hosted runner that lost communication
+            # mid-step never uploads its log). Best-effort.
+            try:
+                annotations = redact_text(
+                    await self.gh.run_failed_annotations(alert.run_ref.repo, alert.run_ref.run_id)
+                )
+            except Exception as exc:
+                _log.info("ci_triage.annotations_failed", error=repr(exc))
             try:
                 raw = await self.gh.run_failed_job_logs(alert.run_ref.repo, alert.run_ref.run_id)
             except RunLogUnavailableError as exc:
                 gh_error = f"log_unavailable:{str(exc)[:80]}"
-                # If a Loki window is present, the device-level path still has
-                # evidence; otherwise the run is unrecoverable → skip (not retry).
-                if alert.loki_window is None:
+                # Skip ONLY when no other evidence exists. Annotations (runner-death
+                # reason) or a Loki window can still ground a triage.
+                if not annotations and alert.loki_window is None:
                     await self._maybe_post_no_evidence_note(
                         alert, reason="GitHub run 로그가 만료/삭제됐습니다"
                     )
@@ -190,14 +202,20 @@ class CiTriageHandler:
                     anchored_chars=len(anchored),
                 )
 
-        # ── EVIDENCE: device-level Loki path (when the run log is absent) ─────
-        # Device-level alerts (CP/SMC FW fail, 0x... device-unreachable) carry no
-        # useful GitHub run log — the evidence is the host's fwlog/kernel streams.
+        # ── EVIDENCE: DUT/host Loki (3-tier host resolution) ──────────────────
+        # Prefer the device-under-test host over the runner: a premerge job runs on
+        # a controller runner (ssw-hp-01) but tests a separate DUT (ssw-host-04),
+        # where the device errors actually are. Order: (1) alert [host] tag
+        # (dev_syssw_test gives the DUT) → (2) DUT host grepped from the failed-job
+        # log → (3) runner_name fallback (atom-test: runner == DUT).
         loki_text = ""
-        if alert.loki_window is not None and not log_text:
-            loki_text, loki_err = await self._loki_evidence(alert.loki_window, now=now)
+        loki_window = alert.loki_window
+        if loki_window is None and alert.run_ref is not None:
+            loki_window = await self._resolve_dut_window(alert.run_ref, log_text, now=now)
+        if loki_window is not None:
+            loki_text, loki_err = await self._loki_evidence(loki_window, now=now)
             if loki_err:
-                _log.info("ci_triage.loki_degraded", host=alert.loki_window.host, error=loki_err)
+                _log.info("ci_triage.loki_degraded", host=loki_window.host, error=loki_err)
 
         # ── OnCall wiki ───────────────────────────────────────────────────────
         wiki_error: str | None = None
@@ -207,7 +225,7 @@ class CiTriageHandler:
             if refresh.error:
                 wiki_error = refresh.error
             if refresh.available:
-                signatures, phrases = _search_terms(alert, log_text)
+                signatures, phrases = _search_terms(alert, f"{annotations}\n{log_text}")
                 wiki_matches = await self.oncall_wiki.search(signatures=signatures, phrases=phrases)
         except Exception as exc:
             wiki_error = f"wiki_failed:{str(exc)[:80]}"
@@ -221,6 +239,7 @@ class CiTriageHandler:
             persona=persona,
             alert=alert,
             log_text=log_text,
+            annotations=annotations,
             loki_text=loki_text,
             wiki_matches=wiki_matches,
         )
@@ -287,13 +306,14 @@ class CiTriageHandler:
         persona: Persona,
         alert: ParsedAlert,
         log_text: str,
+        annotations: str,
         loki_text: str,
         wiki_matches: list[WikiMatch],
     ) -> TriageOutput:
         """Two in-call attempts. Second parse/validate failure → DeadLetter
         (PermanentError). This is an in-call loop, NOT a dispatcher retry."""
         system_prompt = persona.body + _SCHEMA_APPENDIX
-        user_message = _render_user_message(alert, log_text, loki_text, wiki_matches)
+        user_message = _render_user_message(alert, log_text, annotations, loki_text, wiki_matches)
         last_error: str | None = None
         for attempt in range(2):
             session = ctx.claude_session_factory()
@@ -360,6 +380,35 @@ class CiTriageHandler:
         except Exception as exc:
             # best-effort note; a failure must never fail the already-skipped event.
             _log.info("ci_triage.no_evidence_note_failed", error=repr(exc))
+
+    async def _resolve_dut_window(
+        self, run_ref: RunRef, log_text: str, *, now: datetime
+    ) -> LokiWindow | None:
+        """Resolve the Loki host + window for a run with no host in the alert.
+        Tier 2: the DUT host most-mentioned in the failed-job log. Tier 3: the
+        failed job's runner_name (runner == DUT, e.g. atom-test). Window from the
+        failed jobs' start/complete times (ms); None when no host is found."""
+        hosts = alert_parse.extract_dut_hosts(log_text)
+        host = hosts[0] if hosts else None
+        try:
+            jobs: list[Any] = await self.gh.failed_jobs(run_ref.repo, run_ref.run_id)
+        except Exception as exc:
+            _log.info("ci_triage.failed_jobs_lookup_failed", error=repr(exc))
+            jobs = []
+        if host is None:
+            runners = [j.runner_name for j in jobs if getattr(j, "runner_name", None)]
+            host = runners[0] if runners else None
+        if host is None:
+            return None
+        starts = [_iso_to_ms(getattr(j, "started_at", None)) for j in jobs]
+        ends = [_iso_to_ms(getattr(j, "completed_at", None)) for j in jobs]
+        start_vals = [int(s) for s in starts if s]
+        end_vals = [int(e) for e in ends if e]
+        return LokiWindow(
+            host=host,
+            start=str(min(start_vals)) if start_vals else None,
+            end=str(max(end_vals)) if end_vals else None,
+        )
 
     async def _loki_evidence(self, window: LokiWindow, *, now: datetime) -> tuple[str, str | None]:
         """Fetch error-class log lines for the alert's host+window from Loki.
@@ -555,6 +604,16 @@ def _logql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _iso_to_ms(iso: str | None) -> str | None:
+    """ISO8601 (e.g. a GitHub job `started_at`) → epoch-ms string, or None."""
+    if not iso:
+        return None
+    try:
+        return str(int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000))
+    except (TypeError, ValueError):
+        return None
+
+
 def _ms_to_dt(ms: str | None) -> datetime | None:
     """Grafana/Loki link epoch-ms string → aware datetime, or None."""
     if not ms:
@@ -578,6 +637,7 @@ def _loki_bounds(window: LokiWindow, *, now: datetime) -> tuple[datetime, dateti
 def _render_user_message(
     alert: ParsedAlert,
     log_text: str,
+    annotations: str,
     loki_text: str,
     wiki_matches: list[Any],
 ) -> str:
@@ -599,6 +659,11 @@ def _render_user_message(
     )
     return (
         "\n".join(meta)
+        + (
+            "\n\n## GitHub check-run annotations (failure reasons; high-signal)\n" + annotations
+            if annotations
+            else ""
+        )
         + "\n\n## Failed-job log (primary evidence; error-anchored, redacted)\n"
         + (log_text or "(no run log available)")
         + ("\n\n## Loki (device-level)\n" + loki_text if loki_text else "")

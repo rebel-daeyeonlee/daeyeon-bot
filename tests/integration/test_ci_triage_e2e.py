@@ -83,6 +83,12 @@ class _FakeGh:
             "##[error]Process completed with exit code 1."
         )
 
+    async def run_failed_annotations(self, repo: str, run_id: str) -> str:
+        return ""
+
+    async def failed_jobs(self, repo: str, run_id: str) -> list[Any]:
+        return []
+
 
 @dataclass(slots=True)
 class _FakeCtx:

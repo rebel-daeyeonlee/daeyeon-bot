@@ -82,6 +82,11 @@ def _is_http_5xx(message: str) -> bool:
     return match is not None and 500 <= int(match.group(1)) < 600
 
 
+def _opt_str(value: object) -> str | None:
+    """Return `value` if it's a non-empty str, else None."""
+    return value if isinstance(value, str) and value else None
+
+
 @dataclass(frozen=True, slots=True)
 class _GhResult:
     """Outcome of one `gh` subprocess invocation."""
@@ -89,6 +94,19 @@ class _GhResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class FailedJob:
+    """A failed job of a workflow run, with the data needed to resolve a Loki
+    host + window. `runner_name` is the runner (may be a controller distinct from
+    the DUT); `started_at`/`completed_at` are ISO8601 (or None)."""
+
+    id: str
+    name: str
+    runner_name: str | None
+    started_at: str | None
+    completed_at: str | None
 
 
 class GhCli:
@@ -207,25 +225,69 @@ class GhCli:
         if not failed:
             return await self.run_view_log_failed(repo, run_id)
         chunks: list[str] = []
-        for job_id, name in failed:
-            text = await self._job_logs(repo, job_id)
+        for job in failed:
+            text = await self._job_logs(repo, job.id)
             if text:
-                chunks.append(f"=== {name} (job {job_id}) ===\n{text}")
+                chunks.append(f"=== {job.name} (job {job.id}) ===\n{text}")
         if not chunks:
             raise RunLogUnavailableError(
                 f"gh: no retrievable logs for any failed job of run {run_id}"
             )
         return "\n\n".join(chunks)
 
-    async def _failed_jobs(self, repo: str, run_id: str) -> list[tuple[str, str]]:
-        """`(job_id, name)` for each failed/cancelled/timed-out job of the run."""
+    async def run_failed_annotations(self, repo: str, run_id: str) -> str:
+        """Concise failure reasons from each failed job's check-run annotations.
+
+        Crucial when a job's log blob is unavailable: a self-hosted runner that
+        lost communication mid-step never uploads its log (the per-job logs API
+        404s), but the check-run annotation still records the reason ("The
+        self-hosted runner lost communication with the server …"). Read-only;
+        returns "" when there are no failed jobs or no annotations."""
+        if not repo or not run_id:
+            return ""
+        failed = await self._failed_jobs(repo, run_id)
+        lines: list[str] = []
+        for job in failed:
+            for level, msg in await self._job_annotations(repo, job.id):
+                lines.append(f"[{level}] {job.name}: {msg}")
+        return "\n".join(lines)
+
+    async def _job_annotations(self, repo: str, job_id: str) -> list[tuple[str, str]]:
+        """`(level, message)` from a job's check-run annotations. The check-run id
+        equals the Actions job databaseId. Tolerant — returns [] on any failure."""
+        result = await self._run("api", f"/repos/{repo}/check-runs/{job_id}/annotations")
+        if result.returncode != 0:
+            return []
+        try:
+            data: object = json.loads(_safe_decode(result.stdout))
+        except (ValueError, TypeError):
+            return []
+        out: list[tuple[str, str]] = []
+        if isinstance(data, list):
+            for ann in cast("list[Any]", data):
+                if not isinstance(ann, dict):
+                    continue
+                ann_d = cast("dict[str, Any]", ann)
+                msg = str(ann_d.get("message") or "").strip()
+                if msg:
+                    out.append((str(ann_d.get("annotation_level") or "note"), msg))
+        return out
+
+    async def failed_jobs(self, repo: str, run_id: str) -> list[FailedJob]:
+        """Public: failed/cancelled/timed-out jobs of a run (id, name, runner,
+        window). Used by the handler to resolve a Loki host (runner fallback) +
+        time window. Returns [] on any failure."""
+        return await self._failed_jobs(repo, run_id)
+
+    async def _failed_jobs(self, repo: str, run_id: str) -> list[FailedJob]:
+        """Failed/cancelled/timed-out jobs of the run, with runner + window."""
         payload = await self._api(
             "GET",
             f"/repos/{repo}/actions/runs/{run_id}/jobs",
             extra=("-f", "per_page=100", "-f", "filter=latest"),
         )
         jobs_raw = payload.get("jobs") if isinstance(payload, dict) else None
-        out: list[tuple[str, str]] = []
+        out: list[FailedJob] = []
         if isinstance(jobs_raw, list):
             for job in cast("list[Any]", jobs_raw):
                 if not isinstance(job, dict):
@@ -234,7 +296,15 @@ class GhCli:
                 if job_d.get("conclusion") in ("failure", "cancelled", "timed_out"):
                     jid = job_d.get("id")
                     if jid is not None:
-                        out.append((str(jid), str(job_d.get("name") or jid)))
+                        out.append(
+                            FailedJob(
+                                id=str(jid),
+                                name=str(job_d.get("name") or jid),
+                                runner_name=_opt_str(job_d.get("runner_name")),
+                                started_at=_opt_str(job_d.get("started_at")),
+                                completed_at=_opt_str(job_d.get("completed_at")),
+                            )
+                        )
         return out
 
     async def _job_logs(self, repo: str, job_id: str) -> str | None:

@@ -12,6 +12,7 @@ import pytest
 
 from daeyeon_bot.core.errors import AuthError, RunLogUnavailableError, TransientError
 from daeyeon_bot.infra.gh_cli import (
+    FailedJob,
     GhCli,
     _GhResult,  # pyright: ignore[reportPrivateUsage]
 )
@@ -74,8 +75,11 @@ async def test_unknown_nonzero_maps_to_transient() -> None:
 async def test_failed_job_logs_tolerates_individual_404() -> None:
     gh = GhCli()
 
-    async def _failed_jobs(repo: str, run_id: str) -> list[tuple[str, str]]:
-        return [("111", "ci-test (matrix leaf)"), ("222", "result")]
+    async def _failed_jobs(repo: str, run_id: str) -> list[FailedJob]:
+        return [
+            FailedJob("111", "ci-test (matrix leaf)", "ssw-pc-21", None, None),
+            FailedJob("222", "result", "ssw-hp-01", None, None),
+        ]
 
     async def _job_logs(repo: str, job_id: str) -> str | None:
         return None if job_id == "111" else "Atom test failed\n##[error]exit 1"
@@ -91,8 +95,11 @@ async def test_failed_job_logs_tolerates_individual_404() -> None:
 async def test_failed_job_logs_all_404_raises() -> None:
     gh = GhCli()
 
-    async def _failed_jobs(repo: str, run_id: str) -> list[tuple[str, str]]:
-        return [("111", "a"), ("222", "b")]
+    async def _failed_jobs(repo: str, run_id: str) -> list[FailedJob]:
+        return [
+            FailedJob("111", "a", None, None, None),
+            FailedJob("222", "b", None, None, None),
+        ]
 
     async def _job_logs(repo: str, job_id: str) -> str | None:
         return None

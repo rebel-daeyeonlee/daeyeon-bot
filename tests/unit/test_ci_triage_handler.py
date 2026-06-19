@@ -18,6 +18,7 @@ from daeyeon_bot.core.results import Ack
 from daeyeon_bot.handlers.ci_triage import MANIFEST, CiTriageHandler
 from daeyeon_bot.infra.ci_triage_audit import find_latest_for_message, insert_audit
 from daeyeon_bot.infra.claude import FakeClaudeSession, FakeFactory
+from daeyeon_bot.infra.gh_cli import FailedJob
 from daeyeon_bot.infra.oncall_wiki import WikiRefresh
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 from daeyeon_bot.infra.slack import PostResult
@@ -90,11 +91,19 @@ class _FakeSlack:
 class _FakeGh:
     log: str = "premerge / result | rsync ... golden-base failed: No such file\n##[error]Process completed with exit code 1."
     raise_unavailable: bool = False
+    annotations: str = ""
+    jobs: list[Any] = field(default_factory=list)
 
     async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
         if self.raise_unavailable:
             raise RunLogUnavailableError("could not find any workflow run")
         return self.log
+
+    async def run_failed_annotations(self, repo: str, run_id: str) -> str:
+        return self.annotations
+
+    async def failed_jobs(self, repo: str, run_id: str) -> list[Any]:
+        return self.jobs
 
 
 @dataclass(slots=True)
@@ -428,5 +437,63 @@ async def test_no_evidence_note_posted_when_enabled(tmp_path: Path) -> None:
         audit = await find_latest_for_message(conn, channel_id="C1", message_ts="100.1")
         assert audit is not None
         assert audit.status == "skipped_no_run_link"
+    finally:
+        await conn.close()
+
+
+# ── DUT/host Loki 3-tier resolution (tier 2 log-host, tier 3 runner fallback) ─
+
+
+async def test_loki_host_tier2_dut_from_job_log(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        ev = _auto_event("C_ALERTS", "100.1", "27800853109")
+        await _seed_event(conn, ev, "d1")
+        gh = _FakeGh(
+            log="CR13-premerge-phase0 | SR-IOV VF on ssw-host-04 failed\nssw-host-04 -12 ENOMEM"
+        )
+        loki = FakeLokiClient()
+        loki.set_response("kernel", lines=("rebellions rbln0: VF BAR reassign -12",))
+        handler = _make_handler(conn, slack=_FakeSlack(), gh=gh, wiki=_FakeWiki(), loki=loki)
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        # Loki queried for the DUT host from the LOG (ssw-host-04), not a runner.
+        assert loki.calls
+        assert 'hostname="ssw-host-04"' in loki.calls[0][1]
+    finally:
+        await conn.close()
+
+
+async def test_loki_host_tier3_runner_fallback(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        ev = _auto_event("C_ALERTS", "100.1", "27800853109")
+        await _seed_event(conn, ev, "d1")
+        # logs gone (404) but annotations carry the runner-death reason → don't skip
+        gh = _FakeGh(
+            raise_unavailable=True,
+            annotations="[failure] atom-test: The self-hosted runner lost communication",
+            jobs=[
+                FailedJob(
+                    "82272806287",
+                    "ci-test",
+                    "ssw-pc-21",
+                    "2026-06-19T02:25:43Z",
+                    "2026-06-19T02:42:45Z",
+                )
+            ],
+        )
+        loki = FakeLokiClient()
+        loki.set_response("kernel", lines=("rebellions rbln0: reboot — uptime reset",))
+        handler = _make_handler(conn, slack=_FakeSlack(), gh=gh, wiki=_FakeWiki(), loki=loki)
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        # No DUT host in the (empty) log → fall back to the runner host ssw-pc-21.
+        assert loki.calls
+        assert 'hostname="ssw-pc-21"' in loki.calls[0][1]
     finally:
         await conn.close()

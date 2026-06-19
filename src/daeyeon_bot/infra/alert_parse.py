@@ -15,10 +15,16 @@ fallback + block text; extraction regexes run over the merged blob. No I/O.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any, cast
 from urllib.parse import unquote
 
 from daeyeon_bot.core.ci_triage.types import LokiWindow, ParsedAlert, RunRef
+
+# SSW DUT/runner hostnames as they appear in job logs (e.g. "ssw-host-04",
+# "ssw-smci-16"). Used to find the device-under-test host for a Loki query when
+# the runner is a controller (ssw-hp-01) distinct from the DUT (ssw-host-04).
+_DUT_HOST_RE = re.compile(r"\bssw-(?:host|smci|giga|pc|arm|rebel)-\d+\b", re.IGNORECASE)
 
 # github.com/<owner>/<repo>/actions/runs/<id>[/job/<job_id>]
 _RUN_RE = re.compile(
@@ -142,6 +148,14 @@ def extract_loki_window(merged: str) -> LokiWindow | None:
         start=start.group(1) if start else None,
         end=end.group(1) if end else None,
     )
+
+
+def extract_dut_hosts(text: str) -> tuple[str, ...]:
+    """Candidate DUT (device-under-test) hostnames found in `text` (a job log),
+    most-frequent first. The most-mentioned host is the test target — a premerge
+    job's log mentions the DUT (ssw-host-04) far more than incidental hosts."""
+    hits = [m.group(0).lower() for m in _DUT_HOST_RE.finditer(text)]
+    return tuple(host for host, _count in Counter(hits).most_common())
 
 
 def is_ci_failure_candidate(

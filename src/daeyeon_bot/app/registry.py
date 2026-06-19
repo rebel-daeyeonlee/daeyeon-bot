@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 from daeyeon_bot.app.config import (
+    CiTriageHandlerEntry,
     Config,
     GhReviewRequestedTriggerEntry,
     HandlerEntry,
@@ -22,6 +23,7 @@ from daeyeon_bot.app.config import (
 from daeyeon_bot.core.errors import ConfigError
 from daeyeon_bot.core.manifest import HandlerManifest, TriggerManifest
 from daeyeon_bot.core.time import Clock
+from daeyeon_bot.handlers import ci_triage as ci_triage_handler
 from daeyeon_bot.handlers import echo as echo_handler
 from daeyeon_bot.handlers import jira_triage as jira_triage_handler
 from daeyeon_bot.handlers import pr_review as pr_review_handler
@@ -59,6 +61,19 @@ class JiraTriageDeps:
     db: Any
     jira_identity: JiraIdentity
     field_discovery: FieldDiscovery
+    pause_guard: PauseGuard | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CiTriageDeps:
+    """Runtime deps for the `ci_triage` handler (feature 003). Inspection-only
+    callers omit these and the registry skips the handler (mirrors PrReviewDeps)."""
+
+    slack: Any
+    gh: Any
+    oncall_wiki: Any
+    persona_loader: PersonaLoader
+    db: Any
     pause_guard: PauseGuard | None = None
 
 
@@ -120,6 +135,7 @@ def build_handler_registry(
     *,
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
+    ci_triage_deps: CiTriageDeps | None = None,
 ) -> HandlerRegistry:
     """Instantiate enabled handlers from config, applying manifest overrides.
 
@@ -137,12 +153,15 @@ def build_handler_registry(
             continue
         if name == "jira_triage" and jira_triage_deps is None:
             continue
+        if name == "ci_triage" and ci_triage_deps is None:
+            continue
         record = instantiate_handler(
             name,
             entry,
             config=config,
             pr_review_deps=pr_review_deps,
             jira_triage_deps=jira_triage_deps,
+            ci_triage_deps=ci_triage_deps,
         )
         registry.register(record)
 
@@ -156,6 +175,7 @@ def instantiate_handler(
     config: Config | None = None,
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
+    ci_triage_deps: CiTriageDeps | None = None,
 ) -> HandlerRecord:
     if name == "echo":
         manifest = _override_manifest(echo_handler.MANIFEST, entry)
@@ -217,6 +237,30 @@ def instantiate_handler(
         if jira_triage_deps.pause_guard is not None:
             jt_kwargs["pause_guard"] = jira_triage_deps.pause_guard
         instance = jira_triage_handler.JiraTriageHandler(**jt_kwargs)
+        return HandlerRecord(name=name, manifest=manifest, instance=instance)
+    if name == "ci_triage":
+        if ci_triage_deps is None:
+            raise ConfigError(
+                "ci_triage handler requires CiTriageDeps; build via container.build()"
+            )
+        ci_entry = (
+            entry
+            if isinstance(entry, CiTriageHandlerEntry)
+            else CiTriageHandlerEntry.model_validate(entry.model_dump())
+        )
+        manifest = _override_manifest(ci_triage_handler.MANIFEST, ci_entry)
+        ct_kwargs: dict[str, Any] = {
+            "manifest": manifest,
+            "slack": ci_triage_deps.slack,
+            "gh": ci_triage_deps.gh,
+            "oncall_wiki": ci_triage_deps.oncall_wiki,
+            "persona_loader": ci_triage_deps.persona_loader,
+            "config": ci_entry,
+            "db": ci_triage_deps.db,
+        }
+        if ci_triage_deps.pause_guard is not None:
+            ct_kwargs["pause_guard"] = ci_triage_deps.pause_guard
+        instance = ci_triage_handler.CiTriageHandler(**ct_kwargs)
         return HandlerRecord(name=name, manifest=manifest, instance=instance)
     raise ConfigError(f"unknown handler in config: {name!r}")
 

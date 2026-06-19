@@ -14,7 +14,11 @@ import typer
 
 from daeyeon_bot.app.config import load
 from daeyeon_bot.app.registry import build_handler_registry
-from daeyeon_bot.cli._dev_payloads import build_jira_triage_payload, build_pr_review_payload
+from daeyeon_bot.cli._dev_payloads import (
+    build_ci_triage_payload,
+    build_jira_triage_payload,
+    build_pr_review_payload,
+)
 from daeyeon_bot.core.errors import AuthError, PermanentError
 from daeyeon_bot.core.events import Event, make_event
 from daeyeon_bot.core.results import Ack, DeadLetter, HandlerResult, Retry
@@ -329,6 +333,72 @@ async def _fire_jira_triage(
         await storage.apply_migrations(conn)
         ok = await outbox.insert_event(
             conn, event, source="jira_triage_manual", source_dedup_key=dedup_key
+        )
+        if not ok:
+            typer.echo("duplicate dedup key — an identical event is already queued", err=True)
+            raise typer.Exit(code=1)
+        for handler in routing:
+            await outbox.enqueue_handler(conn, event_id=event.id, handler=handler, now=now)
+        await conn.commit()
+    typer.echo(event.id)
+
+
+@app.command(
+    "fire-ci-triage",
+    help="Enqueue a manual ci_triage event for a GitHub Actions run (feature 003).",
+)
+def fire_ci_triage(
+    repo: str = typer.Option(..., "--repo", help="owner/repo (e.g. 'rebellions-sw/ssw-bundle')."),
+    run: str = typer.Option(..., "--run", help="GitHub Actions run id (numeric)."),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Re-triage even when a posted audit row exists."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the event JSON instead of writing it."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+) -> None:
+    asyncio.run(
+        _fire_ci_triage(repo=repo, run=run, force=force, dry_run=dry_run, config_path=config)
+    )
+
+
+async def _fire_ci_triage(
+    *, repo: str, run: str, force: bool, dry_run: bool, config_path: str | None
+) -> None:
+    """Build a `ci.triage.manual` event and enqueue it via the outbox."""
+    cfg = load(config_path)
+    cfg.state_dir_path.mkdir(parents=True, exist_ok=True)
+
+    routing = cfg.routing.get("ci.triage.manual", [])
+    if not routing:
+        raise typer.BadParameter(
+            "no handlers configured for 'ci.triage.manual'. Edit config.toml's [routing] section."
+        )
+
+    payload, dedup_key = build_ci_triage_payload(repo=repo, run_id=run, force=force)
+    now = datetime.now(tz=UTC)
+    event = make_event(type="ci.triage.manual", payload=payload, created_at=now)
+
+    if dry_run:
+        typer.echo(
+            json.dumps(
+                {
+                    "event_id": event.id,
+                    "type": event.type,
+                    "payload": payload,
+                    "source_dedup_key": dedup_key,
+                    "routes_to": routing,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    async with storage.connection(cfg.db_path) as conn:
+        await storage.apply_migrations(conn)
+        ok = await outbox.insert_event(
+            conn, event, source="ci_triage_manual", source_dedup_key=dedup_key
         )
         if not ok:
             typer.echo("duplicate dedup key — an identical event is already queued", err=True)

@@ -67,7 +67,28 @@ def build_jira_triage_payload(
     return payload, dedup_key
 
 
+def build_ci_triage_payload(
+    *,
+    repo: str,
+    run_id: str,
+    force: bool,
+) -> tuple[dict[str, object], str]:
+    """Build the `ci.triage.manual` payload + dedup key (feature 003).
+
+    Non-force fires dedup on `(repo, run_id)` so a re-fire of the same run
+    collides with the in-flight event; a force fire appends the unix ts so it
+    is treated as a distinct re-triage (a new audit row + supersede header).
+    """
+    payload: dict[str, object] = {"repo": repo, "run_id": run_id, "force": force}
+    dedup_seed = f"manual-ci-triage|{repo}|{run_id}"
+    if force:
+        dedup_seed = f"{dedup_seed}|{int(time.time())}"
+    dedup_key = hashlib.sha256(dedup_seed.encode("utf-8")).hexdigest()
+    return payload, dedup_key
+
+
 __all__ = [
+    "build_ci_triage_payload",
     "build_jira_triage_payload",
     "build_pr_review_payload",
 ]

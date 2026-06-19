@@ -21,6 +21,7 @@ import structlog
 from daeyeon_bot.app import pause as pause_mod
 from daeyeon_bot.app.config import Config
 from daeyeon_bot.app.registry import (
+    CiTriageDeps,
     GhReviewRequestedDeps,
     HandlerRegistry,
     JiraAssignedDeps,
@@ -31,7 +32,7 @@ from daeyeon_bot.app.registry import (
     build_trigger_registry,
 )
 from daeyeon_bot.app.supervisor import TriggerSupervisor
-from daeyeon_bot.core.errors import QuotaError
+from daeyeon_bot.core.errors import AuthError, ConfigError, QuotaError
 from daeyeon_bot.core.time import Clock, SystemClock
 from daeyeon_bot.handlers.pr_review import PauseGuard
 from daeyeon_bot.infra import storage
@@ -39,9 +40,12 @@ from daeyeon_bot.infra.claude import ClaudeSession, make_real_factory
 from daeyeon_bot.infra.gh_cli import GhCli
 from daeyeon_bot.infra.host_resolver import HostResolver
 from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraClient, JiraIdentity
+from daeyeon_bot.infra.logging import register_literal_secret
 from daeyeon_bot.infra.loki import LokiClient
+from daeyeon_bot.infra.oncall_wiki import OncallWiki
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 from daeyeon_bot.infra.secrets import SecretsProvider
+from daeyeon_bot.infra.slack import SlackClient
 from daeyeon_bot.infra.ssh_logs import SshLogClient
 from daeyeon_bot.infra.ssw_bundle import SswBundleClient
 
@@ -82,6 +86,9 @@ class ContainerOverrides:
     field_discovery: FieldDiscovery | None = None
     secrets_provider: SecretsProvider | None = None
     project_root: Any = None  # Path | None — project root for ssw_bundle path guard
+    # Feature 003 overrides.
+    slack: object | None = None  # SlackClient or a FakeSlack
+    oncall_wiki: object | None = None  # OncallWiki or a fake
 
 
 async def build(
@@ -149,6 +156,16 @@ async def build(
         secrets_provider=secrets_provider,
     )
 
+    # Feature 003: CI Monitor / OnCall triage handler.
+    ci_triage_deps = await _build_ci_triage_deps(
+        config=config,
+        db=db,
+        overrides=overrides,
+        gh=gh,
+        persona_loader=persona_loader,
+        secrets_provider=secrets_provider,
+    )
+
     triggers = build_trigger_registry(
         config,
         gh_review_requested_deps=gh_trigger_deps,
@@ -163,6 +180,7 @@ async def build(
             config,
             pr_review_deps=pr_deps,
             jira_triage_deps=jira_triage_deps,
+            ci_triage_deps=ci_triage_deps,
         ),
         triggers=tuple(triggers),
         claude_session_factory=factory,
@@ -180,6 +198,94 @@ def _jira_triage_enabled(config: Config) -> bool:
 def _jira_assigned_enabled(config: Config) -> bool:
     entry = config.triggers.get("jira_assigned")
     return entry is not None and entry.enabled
+
+
+def _ci_triage_enabled(config: Config) -> bool:
+    entry = config.handlers.get("ci_triage")
+    return entry is not None and entry.enabled
+
+
+async def _build_ci_triage_deps(
+    *,
+    config: Config,
+    db: aiosqlite.Connection,
+    overrides: ContainerOverrides,
+    gh: object | None,
+    persona_loader: PersonaLoader | None,
+    secrets_provider: SecretsProvider | None,
+) -> CiTriageDeps | None:
+    """Feature 003 deps, built only when `[handlers.ci_triage].enabled`. Runs the
+    boot probes (Slack `auth.test`, OnCall-wiki `ls_remote`) so a bad token /
+    unreachable remote fails loud at boot (exit 78), not on the first alert."""
+    if not _ci_triage_enabled(config):
+        return None
+
+    entry = config.ci_triage_handler_entry()
+    if not entry.dry_run_channel:
+        raise ConfigError("ci_triage enabled but [handlers.ci_triage].dry_run_channel is unset")
+
+    # Slack client: token from secrets; post allowlist = watched channels + dry_run.
+    slack_client: Any
+    if overrides.slack is not None:
+        slack_client = overrides.slack
+    else:
+        effective_secrets = overrides.secrets_provider or secrets_provider
+        if effective_secrets is None:
+            raise RuntimeError(
+                "container.build: ci_triage requires a secrets_provider (production)"
+                " OR a slack override (test path)"
+            )
+        try:
+            token = effective_secrets.load_secret("slack_bot_token")
+        except AuthError as exc:
+            # Distinguish "never configured" from "rejected" (doctor clarity).
+            raise ConfigError(
+                "slack_bot_token not configured; set it or disable [handlers.ci_triage]"
+            ) from exc
+        register_literal_secret(token)  # defense-in-depth redaction
+        channels = tuple(config.slack_ci_alert_trigger_entry().channels)
+        allowed = frozenset((*channels, entry.dry_run_channel))
+        slack_client = SlackClient(
+            token=token,
+            allowed_post_channels=allowed,
+            api_base=config.slack.api_base,
+            timeout_s=float(config.slack.timeout_seconds),
+        )
+        await slack_client.auth_test()  # boot probe — AuthError (rejected) → exit 78
+
+    # OnCall wiki clone.
+    wiki_client: Any
+    if overrides.oncall_wiki is not None:
+        wiki_client = overrides.oncall_wiki
+    else:
+        project_root: Path | None = overrides.project_root
+        clone_path = Path(config.oncall_wiki.clone_path).expanduser()  # noqa: ASYNC240
+        if not clone_path.is_absolute() and project_root is not None:
+            clone_path = project_root / clone_path
+        wiki_client = OncallWiki(
+            clone_path=clone_path,
+            known_hosts_path=config.state_dir_path / config.oncall_wiki.known_hosts_path,
+            remote_url=config.oncall_wiki.remote_url,
+            project_root=project_root,
+            allow_external=config.oncall_wiki.allow_external,
+        )
+        await wiki_client.ls_remote()  # boot probe — ConfigError/AuthError → exit 78
+
+    gh_client = overrides.gh or gh or GhCli(timeout_seconds=config.github.gh_call_timeout_seconds)
+    loader = (
+        overrides.persona_loader
+        or persona_loader
+        or PersonaLoader(skills_root=_resolve_skills_root(config))
+    )
+    pause_guard = overrides.pause_guard or _make_pause_guard(config)
+    return CiTriageDeps(
+        slack=slack_client,
+        gh=gh_client,
+        oncall_wiki=wiki_client,
+        persona_loader=loader,
+        db=db,
+        pause_guard=pause_guard,
+    )
 
 
 async def _build_jira_deps(  # noqa: PLR0912, PLR0915 — composition root branches by config knobs

@@ -27,6 +27,7 @@ from daeyeon_bot.core.errors import (
     AuthError,
     PermanentError,
     RateLimitError,
+    RunLogUnavailableError,
     TransientError,
 )
 
@@ -52,6 +53,24 @@ _AUTH_PHRASES = (
 _RATE_LIMIT_PHRASES = (
     "api rate limit exceeded",
     "x-ratelimit-remaining: 0",
+)
+# `gh run view --log-failed` stderr phrases that mean the log is GONE FOR GOOD
+# (not a transient blip): run deleted, never existed, or logs aged out of
+# GitHub's retention / overwritten by a re-run. Mapped to RunLogUnavailableError
+# → skip (Ack), NOT Retry — re-queueing can never recover the log. The existing
+# `gh api`-shaped `_raise_error` would mis-map these (no HTTP code) to
+# TransientError → infinite Retry. See specs/003-ci-monitor-bot/plan.md.
+_RUN_LOG_UNAVAILABLE_PHRASES = (
+    "could not find any workflow run",
+    "could not find any run",
+    "no logs found",
+    "could not find logs",
+    "log not found",
+    "logs expired",
+    "has expired",
+    "no longer available",
+    "could not find the run",
+    "run not found",
 )
 
 
@@ -150,6 +169,24 @@ class GhCli:
             if isinstance(items_raw, list):
                 return [item for item in items_raw if isinstance(item, dict)]
         return []
+
+    async def run_view_log_failed(self, repo: str, run_id: str) -> str:
+        """Return the failed-job logs of a GitHub Actions run (read-only).
+
+        `gh run view <run_id> --repo <repo> --log-failed`. This is NOT a
+        `gh api` call, so it does NOT use `_raise_error` (which is HTTP-code
+        shaped and would map a gone/expired log — emitted as human-readable
+        stderr with no HTTP code — to TransientError → infinite Retry). A
+        permanently-unavailable log raises `RunLogUnavailableError` (→ skip),
+        transient failures raise `TransientError` (→ Retry). See
+        specs/003-ci-monitor-bot/plan.md §gh_cli.py extension.
+        """
+        if not repo or not run_id:
+            raise PermanentError("run_view_log_failed requires repo and run_id")
+        result = await self._run("run", "view", run_id, "--repo", repo, "--log-failed")
+        if result.returncode != 0:
+            self._raise_run_log_error(repo, run_id, result)
+        return _safe_decode(result.stdout)
 
     async def pr_get(self, repo: str, pr_number: int) -> dict[str, Any]:
         """Fetch one PR's metadata via `GET /repos/{repo}/pulls/{n}`."""
@@ -400,6 +437,34 @@ class GhCli:
                 proc.kill()
             raise TransientError(f"gh {args[0]} timed out after {self._timeout}s") from exc
         return _GhResult(returncode=proc.returncode or 0, stdout=stdout, stderr=stderr)
+
+    def _raise_run_log_error(self, repo: str, run_id: str, result: _GhResult) -> None:
+        """Dedicated classifier for `gh run view --log-failed` (NOT gh-api shaped).
+
+        Order: auth → HTTP 401/403-rate/5xx → log-unavailable phrases → transient.
+        A gone/expired log (no HTTP code) → RunLogUnavailableError (skip, not retry).
+        """
+        stderr = _safe_decode(result.stderr)
+        lower = stderr.lower()
+        where = f"gh run view {run_id} --repo {repo} --log-failed"
+
+        if any(p in lower for p in _AUTH_PHRASES):
+            raise AuthError(f"{where}: auth failure: {stderr.strip()}")
+
+        match = _HTTP_CODE_RE.search(stderr)
+        code = int(match.group(1)) if match else None
+        if code == 401:
+            raise AuthError(f"{where}: HTTP 401: {stderr.strip()}")
+        if code == 403 and any(p in lower for p in _RATE_LIMIT_PHRASES):
+            raise RateLimitError(f"{where}: rate-limited: {stderr.strip()}")
+        if code is not None and 500 <= code < 600:
+            raise TransientError(f"{where}: HTTP {code}: {stderr.strip()}")
+
+        if any(p in lower for p in _RUN_LOG_UNAVAILABLE_PHRASES):
+            raise RunLogUnavailableError(f"{where}: log unavailable: {stderr.strip()}")
+
+        # Genuinely transient (network / timeout / unknown non-zero exit).
+        raise TransientError(f"{where}: exit {result.returncode}: {stderr.strip()}")
 
     def _raise_error(self, method: str, path: str, result: _GhResult) -> None:
         stderr = _safe_decode(result.stderr)

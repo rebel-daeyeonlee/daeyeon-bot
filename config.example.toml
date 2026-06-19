@@ -90,6 +90,21 @@ syslog_query_template = '{hostname="{host}", logtype="syslog"}'
 # widened by this many extra hours on each side to recover them.
 syslog_window_extra_hours = 12
 
+[slack]
+# Slack Web API. The bot token is a SECRET (key `slack_bot_token`, env
+# `SLACK_BOT_TOKEN`) — NOT here. Used by feature 003 (ci_triage / slack_ci_alert).
+api_base = "https://slack.com/api"
+timeout_seconds = 20
+
+[oncall_wiki]
+# Read-only clone of the OnCall LLM Wiki (feature 003). Never touches the
+# operator's working vault (~/ssw-devops-oncall) regardless of allow_external.
+remote_url = "git@github.com:rebellions-sw/ssw-devops-oncall.git"
+clone_path = "var/ssw-devops-oncall"
+allow_external = false
+# Managed 0600 known_hosts file (under state_dir); accept-new on first contact.
+known_hosts_path = "oncall_wiki_known_hosts"
+
 # ─── Triggers ──────────────────────────────────────────────────────────────────
 # A trigger is enabled if its section exists with `enabled = true`.
 
@@ -108,6 +123,19 @@ max_per_cycle = 200                      # safety cap per cycle
 # Also match tickets assigned to this Jira Atlassian Team. Empty string
 # disables team match (assignee-only mode).
 team_name = "DevOps"
+
+[triggers.slack_ci_alert]
+# CI Monitor polling trigger (feature 003 P2). Polls the two SSW DevOps
+# on-call Slack channels for CI-failure alerts. Default off.
+enabled = false
+# #ssw-devops-alerts, #ssw-devops-help.
+channels = ["C09SEN8MH5M", "C0A406KREHF"]
+poll_interval_seconds = 120
+# Per-channel per-cycle emit cap (bounds backlog fan-out after an outage).
+max_per_cycle = 20
+# Gap > this many seconds ⇒ re-seed the cursor instead of back-filling stale
+# runs after a long outage / laptop sleep / pause (6 h default).
+staleness_seconds = 21600
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
 # Manifest fields here override the handler's compile-time defaults.
@@ -212,6 +240,30 @@ branch_field_id = ""
 commit_field_id = ""
 team_field_id = ""
 
+[handlers.ci_triage]
+# CI Monitor / OnCall triage bot (feature 003). Default off — flip after
+# storing the SLACK_BOT_TOKEN secret + authoring/confirming the persona.
+# Requires [loki] present (device-level dual-evidence path) and a reachable
+# [oncall_wiki] remote. Both are validated at boot when enabled.
+enabled = false
+idempotent = true
+dedup_ttl_seconds = 86400
+concurrency = 1                          # load-bearing — see handler MANIFEST note
+accepts = ["slack.ci_alert", "ci.triage.manual"]
+persona_skill = "daeyeon-bot-ci-triage"
+min_persona_chars = 200
+timeout_seconds = 600
+# PoC test channel for one-way posting; part of the post allowlist. Set to a
+# real channel id before enabling. While post_target = "dry_run", triage posts
+# here only (never the real on-call channels).
+dry_run_channel = "C0XXXXXXXXX"
+# "dry_run" → post to dry_run_channel; "thread" → reply in the alert thread.
+# Promote to "thread" only after reviewing dry_run audit rows (see RUNBOOK P3).
+post_target = "dry_run"
+# Post a minimal "bot saw it; no machine-readable run/Loki link" note when there
+# is no evidence. Flipped to true together with post_target=thread at promotion.
+post_no_evidence_note = false
+
 # ─── Routing ───────────────────────────────────────────────────────────────────
 # event.type → list of handler names. A type with no entry is dropped (logged).
 
@@ -221,3 +273,5 @@ team_field_id = ""
 "pr.review.manual"    = ["pr_review"]
 "jira.assigned"       = ["jira_triage"]
 "jira.triage.manual"  = ["jira_triage"]
+"slack.ci_alert"      = ["ci_triage"]
+"ci.triage.manual"    = ["ci_triage"]

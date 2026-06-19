@@ -279,8 +279,14 @@ async def _build_ci_triage_deps(
         return None
 
     entry = config.ci_triage_handler_entry()
-    if not entry.dry_run_channel:
-        raise ConfigError("ci_triage enabled but [handlers.ci_triage].dry_run_channel is unset")
+    # dry_run_channel is required only for the one-way PoC mode (and as the target
+    # for manual `dev fire-ci-triage`, which has no alert thread to reply to). In
+    # production thread mode the bot replies in the original alert thread — the two
+    # on-call channels are already configured, so no separate channel is needed.
+    if entry.post_target == "dry_run" and not entry.dry_run_channel:
+        raise ConfigError(
+            'ci_triage post_target="dry_run" but [handlers.ci_triage].dry_run_channel is unset'
+        )
     if slack_client is None:
         raise RuntimeError("container.build: ci_triage enabled but no Slack client was built")
 

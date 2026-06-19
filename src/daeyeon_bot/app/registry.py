@@ -19,6 +19,7 @@ from daeyeon_bot.app.config import (
     JiraAssignedTriggerEntry,
     JiraTriageHandlerEntry,
     PrReviewHandlerEntry,
+    SlackCiAlertTriggerEntry,
 )
 from daeyeon_bot.core.errors import ConfigError
 from daeyeon_bot.core.manifest import HandlerManifest, TriggerManifest
@@ -32,6 +33,7 @@ from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraIdentity
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 from daeyeon_bot.triggers import gh_review_requested as gh_review_requested_trigger
 from daeyeon_bot.triggers import jira_assigned as jira_assigned_trigger
+from daeyeon_bot.triggers import slack_ci_alert as slack_ci_alert_trigger
 from daeyeon_bot.triggers.gh_review_requested import StorageFactory
 
 
@@ -316,11 +318,29 @@ class GhReviewRequestedDeps:
     permanent_failure_reporter: gh_review_requested_trigger.PermanentFailureReporter
 
 
+@dataclass(frozen=True, slots=True)
+class SlackCiAlertDeps:
+    """Runtime deps for the `slack_ci_alert` polling trigger (feature 003).
+
+    `slack` is a SlackClient (shared with the ci_triage handler) or a FakeSlack.
+    The trigger persists events directly via `storage_factory` (cursor advance +
+    events INSERT in one tx per candidate). `pause_check` skips the poll on PAUSE;
+    `permanent_failure_reporter` quarantines after the failure window trips.
+    """
+
+    slack: Any
+    storage_factory: slack_ci_alert_trigger.StorageFactory
+    clock: Clock
+    pause_check: Callable[[], bool]
+    permanent_failure_reporter: slack_ci_alert_trigger.PermanentFailureReporter
+
+
 def build_trigger_registry(
     config: Config,
     *,
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
+    slack_ci_alert_deps: SlackCiAlertDeps | None = None,
 ) -> list[TriggerRecord]:
     """Instantiate enabled live triggers from `config.triggers`."""
     out: list[TriggerRecord] = []
@@ -331,12 +351,15 @@ def build_trigger_registry(
             continue
         if name == "jira_assigned" and jira_assigned_deps is None:
             continue
+        if name == "slack_ci_alert" and slack_ci_alert_deps is None:
+            continue
         record = instantiate_trigger(
             name,
             entry,
             config=config,
             gh_review_requested_deps=gh_review_requested_deps,
             jira_assigned_deps=jira_assigned_deps,
+            slack_ci_alert_deps=slack_ci_alert_deps,
         )
         if record is not None:
             out.append(record)
@@ -350,6 +373,7 @@ def instantiate_trigger(
     config: Config,
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
+    slack_ci_alert_deps: SlackCiAlertDeps | None = None,
 ) -> TriggerRecord | None:
     if name == "manual":
         # `manual` has no live loop — events arrive via the CLI. Skip.
@@ -416,6 +440,32 @@ def instantiate_trigger(
         return TriggerRecord(
             name=name,
             manifest=jira_assigned_trigger.MANIFEST,
+            instance=instance,
+        )
+    if name == "slack_ci_alert":
+        if slack_ci_alert_deps is None:
+            raise ConfigError(
+                "slack_ci_alert trigger requires SlackCiAlertDeps; build via container.build()"
+            )
+        sca_entry = (
+            entry
+            if isinstance(entry, SlackCiAlertTriggerEntry)
+            else config.slack_ci_alert_trigger_entry()
+        )
+        instance = slack_ci_alert_trigger.SlackCiAlertTrigger(
+            slack=slack_ci_alert_deps.slack,
+            storage_factory=slack_ci_alert_deps.storage_factory,
+            channels=tuple(sca_entry.channels),
+            poll_interval_seconds=float(sca_entry.poll_interval_seconds),
+            max_per_cycle=sca_entry.max_per_cycle,
+            staleness_seconds=float(sca_entry.staleness_seconds),
+            clock=slack_ci_alert_deps.clock,
+            pause_check=slack_ci_alert_deps.pause_check,
+            permanent_failure_reporter=slack_ci_alert_deps.permanent_failure_reporter,
+        )
+        return TriggerRecord(
+            name=name,
+            manifest=slack_ci_alert_trigger.MANIFEST,
             instance=instance,
         )
     raise ConfigError(f"unknown trigger in config: {name!r}")

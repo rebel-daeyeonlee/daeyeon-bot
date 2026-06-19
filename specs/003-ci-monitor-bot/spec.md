@@ -99,7 +99,7 @@
 3. **Given** `#help`에 사람 잡담 메시지(봇 작성자 아님, run 링크 없음), **When** poll, **Then** CI-실패 후보가 아니므로 emit하지 않는다.
 4. **Given** 첫 부팅(cold-start), **When** 첫 poll, **Then** 각 채널 현재 최신 ts를 커서로 시드만 하고 과거 메시지를 triage하지 않는다.
 5. **Given** 같은 alert가 중첩 poll/재시작 replay로 dispatcher에 여러 번 도달, **When** 처리, **Then** dedup_token + audit가 정확히 1건 게시를 보장한다.
-6. **Given** 봇이 PAUSE 상태, **When** alert가 뜸, **Then** state 커서는 갱신되나 unpause까지 Claude 호출·게시는 없고, unpause 후 큐된 이벤트가 정확히 1회씩 처리된다.
+6. **Given** 봇이 PAUSE 상태, **When** alert가 뜸, **Then** trigger는 **Slack read 자체를 건너뛰어 커서가 갱신되지 않고**(API 호출·emit 없음), unpause 후 다음 poll에서 `last_seen_ts` 이후 메시지를 누락 없이 정확히 1회씩 처리한다. (shipped 선례 `gh_review_requested`/`jira_assigned`와 동일 — plan §Trigger state machine PAUSE contract로 정정됨.)
 7. **Given** 두 alert가 같은 `repo+run_id`를 가리킴, **When** 처리, **Then** 보조 dedupe로 run당 1회만 triage한다.
 
 ## Functional Requirements *(mandatory)*

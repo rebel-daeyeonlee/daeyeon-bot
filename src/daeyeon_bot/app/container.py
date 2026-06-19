@@ -27,6 +27,7 @@ from daeyeon_bot.app.registry import (
     JiraAssignedDeps,
     JiraTriageDeps,
     PrReviewDeps,
+    SlackCiAlertDeps,
     TriggerRecord,
     build_handler_registry,
     build_trigger_registry,
@@ -156,20 +157,28 @@ async def build(
         secrets_provider=secrets_provider,
     )
 
-    # Feature 003: CI Monitor / OnCall triage handler.
+    # Feature 003: CI Monitor / OnCall triage handler + slack_ci_alert trigger.
+    # One Slack client, shared (handler posts, trigger reads); one auth.test probe.
+    slack_client = await _build_slack_client(
+        config=config, overrides=overrides, secrets_provider=secrets_provider
+    )
     ci_triage_deps = await _build_ci_triage_deps(
         config=config,
         db=db,
         overrides=overrides,
         gh=gh,
         persona_loader=persona_loader,
-        secrets_provider=secrets_provider,
+        slack_client=slack_client,
+    )
+    slack_ci_alert_deps = _build_slack_ci_alert_deps(
+        config=config, slack_client=slack_client, clock=clock
     )
 
     triggers = build_trigger_registry(
         config,
         gh_review_requested_deps=gh_trigger_deps,
         jira_assigned_deps=jira_assigned_deps,
+        slack_ci_alert_deps=slack_ci_alert_deps,
     )
 
     return Container(
@@ -205,6 +214,55 @@ def _ci_triage_enabled(config: Config) -> bool:
     return entry is not None and entry.enabled
 
 
+def _slack_ci_alert_enabled(config: Config) -> bool:
+    entry = config.triggers.get("slack_ci_alert")
+    return entry is not None and entry.enabled
+
+
+async def _build_slack_client(
+    *,
+    config: Config,
+    overrides: ContainerOverrides,
+    secrets_provider: SecretsProvider | None,
+) -> object | None:
+    """Build the shared SlackClient when the ci_triage handler OR the
+    slack_ci_alert trigger is enabled (the handler posts, the trigger reads —
+    same bot token, one `auth.test` probe). Returns None when neither is enabled.
+    """
+    if not (_ci_triage_enabled(config) or _slack_ci_alert_enabled(config)):
+        return None
+    if overrides.slack is not None:
+        return overrides.slack
+    effective_secrets = overrides.secrets_provider or secrets_provider
+    if effective_secrets is None:
+        raise RuntimeError(
+            "container.build: ci_triage / slack_ci_alert require a secrets_provider"
+            " (production) OR a slack override (test path)"
+        )
+    try:
+        token = effective_secrets.load_secret("slack_bot_token")
+    except AuthError as exc:
+        # Distinguish "never configured" from "rejected" (doctor clarity).
+        raise ConfigError(
+            "slack_bot_token not configured; set it or disable"
+            " [handlers.ci_triage] / [triggers.slack_ci_alert]"
+        ) from exc
+    register_literal_secret(token)  # defense-in-depth redaction
+    # Post allowlist = watched channels + dry_run (empties dropped — the trigger
+    # only reads, so an empty dry_run when only the trigger is on is fine).
+    channels = tuple(config.slack_ci_alert_trigger_entry().channels)
+    dry_run = config.ci_triage_handler_entry().dry_run_channel
+    allowed = frozenset(c for c in (*channels, dry_run) if c)
+    client = SlackClient(
+        token=token,
+        allowed_post_channels=allowed,
+        api_base=config.slack.api_base,
+        timeout_s=float(config.slack.timeout_seconds),
+    )
+    await client.auth_test()  # boot probe — AuthError (rejected) → exit 78
+    return client
+
+
 async def _build_ci_triage_deps(
     *,
     config: Config,
@@ -212,46 +270,19 @@ async def _build_ci_triage_deps(
     overrides: ContainerOverrides,
     gh: object | None,
     persona_loader: PersonaLoader | None,
-    secrets_provider: SecretsProvider | None,
+    slack_client: object | None,
 ) -> CiTriageDeps | None:
-    """Feature 003 deps, built only when `[handlers.ci_triage].enabled`. Runs the
-    boot probes (Slack `auth.test`, OnCall-wiki `ls_remote`) so a bad token /
-    unreachable remote fails loud at boot (exit 78), not on the first alert."""
+    """Feature 003 handler deps, built only when `[handlers.ci_triage].enabled`.
+    The Slack client is built once by `_build_slack_client` and shared with the
+    trigger. Runs the OnCall-wiki `ls_remote` boot probe (fail loud at boot)."""
     if not _ci_triage_enabled(config):
         return None
 
     entry = config.ci_triage_handler_entry()
     if not entry.dry_run_channel:
         raise ConfigError("ci_triage enabled but [handlers.ci_triage].dry_run_channel is unset")
-
-    # Slack client: token from secrets; post allowlist = watched channels + dry_run.
-    slack_client: Any
-    if overrides.slack is not None:
-        slack_client = overrides.slack
-    else:
-        effective_secrets = overrides.secrets_provider or secrets_provider
-        if effective_secrets is None:
-            raise RuntimeError(
-                "container.build: ci_triage requires a secrets_provider (production)"
-                " OR a slack override (test path)"
-            )
-        try:
-            token = effective_secrets.load_secret("slack_bot_token")
-        except AuthError as exc:
-            # Distinguish "never configured" from "rejected" (doctor clarity).
-            raise ConfigError(
-                "slack_bot_token not configured; set it or disable [handlers.ci_triage]"
-            ) from exc
-        register_literal_secret(token)  # defense-in-depth redaction
-        channels = tuple(config.slack_ci_alert_trigger_entry().channels)
-        allowed = frozenset((*channels, entry.dry_run_channel))
-        slack_client = SlackClient(
-            token=token,
-            allowed_post_channels=allowed,
-            api_base=config.slack.api_base,
-            timeout_s=float(config.slack.timeout_seconds),
-        )
-        await slack_client.auth_test()  # boot probe — AuthError (rejected) → exit 78
+    if slack_client is None:
+        raise RuntimeError("container.build: ci_triage enabled but no Slack client was built")
 
     # OnCall wiki clone.
     wiki_client: Any
@@ -285,6 +316,46 @@ async def _build_ci_triage_deps(
         persona_loader=loader,
         db=db,
         pause_guard=pause_guard,
+    )
+
+
+def _build_slack_ci_alert_deps(
+    *,
+    config: Config,
+    slack_client: object | None,
+    clock: Clock,
+) -> SlackCiAlertDeps | None:
+    """Feature 003 trigger deps, built only when `[triggers.slack_ci_alert].enabled`.
+    Reuses the shared SlackClient (read side)."""
+    if not _slack_ci_alert_enabled(config):
+        return None
+    if slack_client is None:
+        raise RuntimeError("container.build: slack_ci_alert enabled but no Slack client was built")
+
+    db_path = config.db_path
+
+    def _storage_factory() -> Any:
+        return storage.connection(db_path)
+
+    pause_flag_path = config.pause_flag_path
+
+    def _pause_check() -> bool:
+        return pause_mod.is_paused(pause_flag_path)
+
+    supervisor = TriggerSupervisor()
+
+    async def _report_permanent_failure(reason: str) -> bool:
+        async with storage.connection(db_path) as conn:
+            return await supervisor.record_failure(
+                conn, trigger_name="slack_ci_alert", reason=reason, at=clock.now()
+            )
+
+    return SlackCiAlertDeps(
+        slack=slack_client,
+        storage_factory=_storage_factory,
+        clock=clock,
+        pause_check=_pause_check,
+        permanent_failure_reporter=_report_permanent_failure,
     )
 
 

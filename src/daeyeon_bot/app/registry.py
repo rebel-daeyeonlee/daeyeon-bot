@@ -12,16 +12,19 @@ from datetime import timedelta
 from typing import Any
 
 from daeyeon_bot.app.config import (
+    CiTriageHandlerEntry,
     Config,
     GhReviewRequestedTriggerEntry,
     HandlerEntry,
     JiraAssignedTriggerEntry,
     JiraTriageHandlerEntry,
     PrReviewHandlerEntry,
+    SlackCiAlertTriggerEntry,
 )
 from daeyeon_bot.core.errors import ConfigError
 from daeyeon_bot.core.manifest import HandlerManifest, TriggerManifest
 from daeyeon_bot.core.time import Clock
+from daeyeon_bot.handlers import ci_triage as ci_triage_handler
 from daeyeon_bot.handlers import echo as echo_handler
 from daeyeon_bot.handlers import jira_triage as jira_triage_handler
 from daeyeon_bot.handlers import pr_review as pr_review_handler
@@ -30,6 +33,7 @@ from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraIdentity
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 from daeyeon_bot.triggers import gh_review_requested as gh_review_requested_trigger
 from daeyeon_bot.triggers import jira_assigned as jira_assigned_trigger
+from daeyeon_bot.triggers import slack_ci_alert as slack_ci_alert_trigger
 from daeyeon_bot.triggers.gh_review_requested import StorageFactory
 
 
@@ -59,6 +63,20 @@ class JiraTriageDeps:
     db: Any
     jira_identity: JiraIdentity
     field_discovery: FieldDiscovery
+    pause_guard: PauseGuard | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CiTriageDeps:
+    """Runtime deps for the `ci_triage` handler (feature 003). Inspection-only
+    callers omit these and the registry skips the handler (mirrors PrReviewDeps)."""
+
+    slack: Any
+    gh: Any
+    oncall_wiki: Any
+    persona_loader: PersonaLoader
+    db: Any
+    loki: Any = None
     pause_guard: PauseGuard | None = None
 
 
@@ -120,6 +138,7 @@ def build_handler_registry(
     *,
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
+    ci_triage_deps: CiTriageDeps | None = None,
 ) -> HandlerRegistry:
     """Instantiate enabled handlers from config, applying manifest overrides.
 
@@ -137,12 +156,15 @@ def build_handler_registry(
             continue
         if name == "jira_triage" and jira_triage_deps is None:
             continue
+        if name == "ci_triage" and ci_triage_deps is None:
+            continue
         record = instantiate_handler(
             name,
             entry,
             config=config,
             pr_review_deps=pr_review_deps,
             jira_triage_deps=jira_triage_deps,
+            ci_triage_deps=ci_triage_deps,
         )
         registry.register(record)
 
@@ -156,6 +178,7 @@ def instantiate_handler(
     config: Config | None = None,
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
+    ci_triage_deps: CiTriageDeps | None = None,
 ) -> HandlerRecord:
     if name == "echo":
         manifest = _override_manifest(echo_handler.MANIFEST, entry)
@@ -218,6 +241,31 @@ def instantiate_handler(
             jt_kwargs["pause_guard"] = jira_triage_deps.pause_guard
         instance = jira_triage_handler.JiraTriageHandler(**jt_kwargs)
         return HandlerRecord(name=name, manifest=manifest, instance=instance)
+    if name == "ci_triage":
+        if ci_triage_deps is None:
+            raise ConfigError(
+                "ci_triage handler requires CiTriageDeps; build via container.build()"
+            )
+        ci_entry = (
+            entry
+            if isinstance(entry, CiTriageHandlerEntry)
+            else CiTriageHandlerEntry.model_validate(entry.model_dump())
+        )
+        manifest = _override_manifest(ci_triage_handler.MANIFEST, ci_entry)
+        ct_kwargs: dict[str, Any] = {
+            "manifest": manifest,
+            "slack": ci_triage_deps.slack,
+            "gh": ci_triage_deps.gh,
+            "oncall_wiki": ci_triage_deps.oncall_wiki,
+            "persona_loader": ci_triage_deps.persona_loader,
+            "config": ci_entry,
+            "db": ci_triage_deps.db,
+            "loki": ci_triage_deps.loki,
+        }
+        if ci_triage_deps.pause_guard is not None:
+            ct_kwargs["pause_guard"] = ci_triage_deps.pause_guard
+        instance = ci_triage_handler.CiTriageHandler(**ct_kwargs)
+        return HandlerRecord(name=name, manifest=manifest, instance=instance)
     raise ConfigError(f"unknown handler in config: {name!r}")
 
 
@@ -272,11 +320,29 @@ class GhReviewRequestedDeps:
     permanent_failure_reporter: gh_review_requested_trigger.PermanentFailureReporter
 
 
+@dataclass(frozen=True, slots=True)
+class SlackCiAlertDeps:
+    """Runtime deps for the `slack_ci_alert` polling trigger (feature 003).
+
+    `slack` is a SlackClient (shared with the ci_triage handler) or a FakeSlack.
+    The trigger persists events directly via `storage_factory` (cursor advance +
+    events INSERT in one tx per candidate). `pause_check` skips the poll on PAUSE;
+    `permanent_failure_reporter` quarantines after the failure window trips.
+    """
+
+    slack: Any
+    storage_factory: slack_ci_alert_trigger.StorageFactory
+    clock: Clock
+    pause_check: Callable[[], bool]
+    permanent_failure_reporter: slack_ci_alert_trigger.PermanentFailureReporter
+
+
 def build_trigger_registry(
     config: Config,
     *,
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
+    slack_ci_alert_deps: SlackCiAlertDeps | None = None,
 ) -> list[TriggerRecord]:
     """Instantiate enabled live triggers from `config.triggers`."""
     out: list[TriggerRecord] = []
@@ -287,12 +353,15 @@ def build_trigger_registry(
             continue
         if name == "jira_assigned" and jira_assigned_deps is None:
             continue
+        if name == "slack_ci_alert" and slack_ci_alert_deps is None:
+            continue
         record = instantiate_trigger(
             name,
             entry,
             config=config,
             gh_review_requested_deps=gh_review_requested_deps,
             jira_assigned_deps=jira_assigned_deps,
+            slack_ci_alert_deps=slack_ci_alert_deps,
         )
         if record is not None:
             out.append(record)
@@ -306,6 +375,7 @@ def instantiate_trigger(
     config: Config,
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
+    slack_ci_alert_deps: SlackCiAlertDeps | None = None,
 ) -> TriggerRecord | None:
     if name == "manual":
         # `manual` has no live loop — events arrive via the CLI. Skip.
@@ -372,6 +442,32 @@ def instantiate_trigger(
         return TriggerRecord(
             name=name,
             manifest=jira_assigned_trigger.MANIFEST,
+            instance=instance,
+        )
+    if name == "slack_ci_alert":
+        if slack_ci_alert_deps is None:
+            raise ConfigError(
+                "slack_ci_alert trigger requires SlackCiAlertDeps; build via container.build()"
+            )
+        sca_entry = (
+            entry
+            if isinstance(entry, SlackCiAlertTriggerEntry)
+            else config.slack_ci_alert_trigger_entry()
+        )
+        instance = slack_ci_alert_trigger.SlackCiAlertTrigger(
+            slack=slack_ci_alert_deps.slack,
+            storage_factory=slack_ci_alert_deps.storage_factory,
+            channels=tuple(sca_entry.channels),
+            poll_interval_seconds=float(sca_entry.poll_interval_seconds),
+            max_per_cycle=sca_entry.max_per_cycle,
+            staleness_seconds=float(sca_entry.staleness_seconds),
+            clock=slack_ci_alert_deps.clock,
+            pause_check=slack_ci_alert_deps.pause_check,
+            permanent_failure_reporter=slack_ci_alert_deps.permanent_failure_reporter,
+        )
+        return TriggerRecord(
+            name=name,
+            manifest=slack_ci_alert_trigger.MANIFEST,
             instance=instance,
         )
     raise ConfigError(f"unknown trigger in config: {name!r}")

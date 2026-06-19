@@ -30,6 +30,14 @@ class ConfigError(PermanentError):
     """Misconfiguration. Daemon-level when raised at boot, dead_letter at handler scope."""
 
 
+class RunLogUnavailableError(PermanentError):
+    """A GitHub Actions run log is gone for good (not found / deleted / expired by
+    retention / overwritten by a re-run). Distinct from a transient `gh` failure:
+    re-queueing will never recover the log, so the ci_triage handler maps this to
+    `Ack` + audit(`skipped_log_unavailable`) instead of `Retry`. See
+    specs/003-ci-monitor-bot/plan.md §gh_cli.py extension."""
+
+
 class AuthError(BotError):
     """Token expired/revoked. Daemon halts (exit 78). Operator must rotate."""
 

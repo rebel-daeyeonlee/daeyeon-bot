@@ -8,7 +8,7 @@ import pytest
 
 from daeyeon_bot.infra.storage import apply_migrations, open_db
 
-_LATEST_SCHEMA_VERSION = 5
+_LATEST_SCHEMA_VERSION = 6
 
 
 @pytest.mark.asyncio

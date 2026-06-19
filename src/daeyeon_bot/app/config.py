@@ -112,6 +112,27 @@ class LokiConfig(BaseModel):
     syslog_query_template: str = '{hostname="{host}", logtype="syslog"}'
 
 
+class SlackConfig(BaseModel):
+    """Slack Web API knobs. The bot token is a SECRET (`slack_bot_token`), not here."""
+
+    model_config = ConfigDict(extra="forbid")
+    api_base: str = "https://slack.com/api"
+    timeout_seconds: int = 20
+
+
+class OncallWikiConfig(BaseModel):
+    """OnCall LLM Wiki clone knobs (feature 003). Read-only clone of
+    `rebellions-sw/ssw-devops-oncall`."""
+
+    model_config = ConfigDict(extra="forbid")
+    remote_url: str = "git@github.com:rebellions-sw/ssw-devops-oncall.git"
+    # Project-root-relative path for the dedicated clone (gitignored, rebuildable).
+    clone_path: str = "var/ssw-devops-oncall"
+    allow_external: bool = False
+    # State-dir-relative filename for the managed 0600 known_hosts file.
+    known_hosts_path: str = "oncall_wiki_known_hosts"
+
+
 class TriggerEntry(BaseModel):
     """Runtime override for a trigger. Extra keys are passed to the trigger constructor."""
 
@@ -133,6 +154,19 @@ class JiraAssignedTriggerEntry(TriggerEntry):
     # Also match tickets assigned to this Atlassian Team. Empty string
     # disables team match (assignee-only mode).
     team_name: str = "DevOps"
+
+
+class SlackCiAlertTriggerEntry(TriggerEntry):
+    """Typed view of `[triggers.slack_ci_alert]`. Feature 003."""
+
+    poll_interval_seconds: int = 120
+    # The two SSW DevOps on-call channels to poll.
+    channels: list[str] = Field(default_factory=list)
+    # Per-channel per-cycle emit cap (mirrors jira_assigned.max_per_cycle).
+    max_per_cycle: int = 20
+    # Gap > this many seconds ⇒ re-seed the cursor instead of back-filling
+    # stale runs after an outage / laptop sleep / long pause (6 h default).
+    staleness_seconds: int = 21600
 
 
 class HandlerEntry(BaseModel):
@@ -221,6 +255,23 @@ class JiraTriageHandlerEntry(HandlerEntry):
     team_field_id: str = ""
 
 
+class CiTriageHandlerEntry(HandlerEntry):
+    """Typed view of `[handlers.ci_triage]`. Feature 003."""
+
+    persona_skill: str | None = "daeyeon-bot-ci-triage"
+    min_persona_chars: int = 200
+    skills_root: str | None = None
+    # Per-event wall-clock cap covering all stages.
+    timeout_seconds: int = 600
+    # PoC test channel for one-way posting; part of the post allowlist.
+    dry_run_channel: str = ""
+    # "dry_run" → post to dry_run_channel; "thread" → reply in the alert thread (P3).
+    post_target: str = "dry_run"
+    # If true, post a minimal "bot saw it; no machine-readable run/Loki link" note
+    # when there is no evidence (flipped to true as part of the P3 thread promotion).
+    post_no_evidence_note: bool = False
+
+
 class Config(BaseSettings):
     # `extra="forbid"` so a typo like `[handlrs.pr_review]` raises at boot
     # instead of silently dropping the section. The two leaf entries
@@ -241,6 +292,8 @@ class Config(BaseSettings):
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     jira: JiraConfig = Field(default_factory=JiraConfig)
     loki: LokiConfig = Field(default_factory=LokiConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
+    oncall_wiki: OncallWikiConfig = Field(default_factory=OncallWikiConfig)
 
     triggers: dict[str, TriggerEntry] = Field(default_factory=dict)
     handlers: dict[str, HandlerEntry] = Field(default_factory=dict)
@@ -275,6 +328,20 @@ class Config(BaseSettings):
         if raw is None:
             return JiraTriageHandlerEntry()
         return JiraTriageHandlerEntry.model_validate(raw.model_dump())
+
+    def slack_ci_alert_trigger_entry(self) -> SlackCiAlertTriggerEntry:
+        """Typed view of `[triggers.slack_ci_alert]` (with defaults). Feature 003."""
+        raw = self.triggers.get("slack_ci_alert")
+        if raw is None:
+            return SlackCiAlertTriggerEntry()
+        return SlackCiAlertTriggerEntry.model_validate(raw.model_dump())
+
+    def ci_triage_handler_entry(self) -> CiTriageHandlerEntry:
+        """Typed view of `[handlers.ci_triage]` (with defaults). Feature 003."""
+        raw = self.handlers.get("ci_triage")
+        if raw is None:
+            return CiTriageHandlerEntry()
+        return CiTriageHandlerEntry.model_validate(raw.model_dump())
 
     @property
     def state_dir_path(self) -> Path:

@@ -27,6 +27,7 @@ from daeyeon_bot.core.errors import (
     AuthError,
     PermanentError,
     RateLimitError,
+    RunLogUnavailableError,
     TransientError,
 )
 
@@ -53,12 +54,37 @@ _RATE_LIMIT_PHRASES = (
     "api rate limit exceeded",
     "x-ratelimit-remaining: 0",
 )
+# `gh run view --log-failed` stderr phrases that mean the log is GONE FOR GOOD
+# (not a transient blip): run deleted, never existed, or logs aged out of
+# GitHub's retention / overwritten by a re-run. Mapped to RunLogUnavailableError
+# → skip (Ack), NOT Retry — re-queueing can never recover the log. The existing
+# `gh api`-shaped `_raise_error` would mis-map these (no HTTP code) to
+# TransientError → infinite Retry. See specs/003-ci-monitor-bot/plan.md.
+_RUN_LOG_UNAVAILABLE_PHRASES = (
+    "could not find any workflow run",
+    "could not find any run",
+    "no logs found",
+    "could not find logs",
+    "log not found",
+    "logs expired",
+    "has expired",
+    "no longer available",
+    "could not find the run",
+    "run not found",
+    "blobnotfound",
+    "the specified blob does not exist",
+)
 
 
 def _is_http_5xx(message: str) -> bool:
     """True if `message` mentions an HTTP 5xx code (e.g. a TransientError text)."""
     match = _HTTP_CODE_RE.search(message)
     return match is not None and 500 <= int(match.group(1)) < 600
+
+
+def _opt_str(value: object) -> str | None:
+    """Return `value` if it's a non-empty str, else None."""
+    return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +94,19 @@ class _GhResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class FailedJob:
+    """A failed job of a workflow run, with the data needed to resolve a Loki
+    host + window. `runner_name` is the runner (may be a controller distinct from
+    the DUT); `started_at`/`completed_at` are ISO8601 (or None)."""
+
+    id: str
+    name: str
+    runner_name: str | None
+    started_at: str | None
+    completed_at: str | None
 
 
 class GhCli:
@@ -150,6 +189,136 @@ class GhCli:
             if isinstance(items_raw, list):
                 return [item for item in items_raw if isinstance(item, dict)]
         return []
+
+    async def run_view_log_failed(self, repo: str, run_id: str) -> str:
+        """Return the failed-job logs of a GitHub Actions run (read-only).
+
+        `gh run view <run_id> --repo <repo> --log-failed`. This is NOT a
+        `gh api` call, so it does NOT use `_raise_error` (which is HTTP-code
+        shaped and would map a gone/expired log — emitted as human-readable
+        stderr with no HTTP code — to TransientError → infinite Retry). A
+        permanently-unavailable log raises `RunLogUnavailableError` (→ skip),
+        transient failures raise `TransientError` (→ Retry). See
+        specs/003-ci-monitor-bot/plan.md §gh_cli.py extension.
+        """
+        if not repo or not run_id:
+            raise PermanentError("run_view_log_failed requires repo and run_id")
+        result = await self._run("run", "view", run_id, "--repo", repo, "--log-failed")
+        if result.returncode != 0:
+            self._raise_run_log_error(repo, run_id, result)
+        return _safe_decode(result.stdout)
+
+    async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
+        """Fetch logs for each FAILED job of a run via the per-job logs API,
+        tolerating individual missing blobs (404 / BlobNotFound).
+
+        More robust than `run_view_log_failed`: `gh run view --log-failed` bails
+        ENTIRELY when one nested/reusable/matrix job's log blob is absent (common
+        for healthcheck runs), whereas the per-job API (the same endpoint the web
+        UI's job page uses) serves every job whose blob still exists. Raises
+        `RunLogUnavailableError` only when NO failed job's log is retrievable.
+        Falls back to `run_view_log_failed` when the run reports no failed jobs.
+        """
+        if not repo or not run_id:
+            raise PermanentError("run_failed_job_logs requires repo and run_id")
+        failed = await self._failed_jobs(repo, run_id)
+        if not failed:
+            return await self.run_view_log_failed(repo, run_id)
+        chunks: list[str] = []
+        for job in failed:
+            text = await self._job_logs(repo, job.id)
+            if text:
+                chunks.append(f"=== {job.name} (job {job.id}) ===\n{text}")
+        if not chunks:
+            raise RunLogUnavailableError(
+                f"gh: no retrievable logs for any failed job of run {run_id}"
+            )
+        return "\n\n".join(chunks)
+
+    async def run_failed_annotations(self, repo: str, run_id: str) -> str:
+        """Concise failure reasons from each failed job's check-run annotations.
+
+        Crucial when a job's log blob is unavailable: a self-hosted runner that
+        lost communication mid-step never uploads its log (the per-job logs API
+        404s), but the check-run annotation still records the reason ("The
+        self-hosted runner lost communication with the server …"). Read-only;
+        returns "" when there are no failed jobs or no annotations."""
+        if not repo or not run_id:
+            return ""
+        failed = await self._failed_jobs(repo, run_id)
+        lines: list[str] = []
+        for job in failed:
+            for level, msg in await self._job_annotations(repo, job.id):
+                lines.append(f"[{level}] {job.name}: {msg}")
+        return "\n".join(lines)
+
+    async def _job_annotations(self, repo: str, job_id: str) -> list[tuple[str, str]]:
+        """`(level, message)` from a job's check-run annotations. The check-run id
+        equals the Actions job databaseId. Tolerant — returns [] on any failure."""
+        result = await self._run("api", f"/repos/{repo}/check-runs/{job_id}/annotations")
+        if result.returncode != 0:
+            return []
+        try:
+            data: object = json.loads(_safe_decode(result.stdout))
+        except (ValueError, TypeError):
+            return []
+        out: list[tuple[str, str]] = []
+        if isinstance(data, list):
+            for ann in cast("list[Any]", data):
+                if not isinstance(ann, dict):
+                    continue
+                ann_d = cast("dict[str, Any]", ann)
+                msg = str(ann_d.get("message") or "").strip()
+                if msg:
+                    out.append((str(ann_d.get("annotation_level") or "note"), msg))
+        return out
+
+    async def failed_jobs(self, repo: str, run_id: str) -> list[FailedJob]:
+        """Public: failed/cancelled/timed-out jobs of a run (id, name, runner,
+        window). Used by the handler to resolve a Loki host (runner fallback) +
+        time window. Returns [] on any failure."""
+        return await self._failed_jobs(repo, run_id)
+
+    async def _failed_jobs(self, repo: str, run_id: str) -> list[FailedJob]:
+        """Failed/cancelled/timed-out jobs of the run, with runner + window."""
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/actions/runs/{run_id}/jobs",
+            extra=("-f", "per_page=100", "-f", "filter=latest"),
+        )
+        jobs_raw = payload.get("jobs") if isinstance(payload, dict) else None
+        out: list[FailedJob] = []
+        if isinstance(jobs_raw, list):
+            for job in cast("list[Any]", jobs_raw):
+                if not isinstance(job, dict):
+                    continue
+                job_d = cast("dict[str, Any]", job)
+                if job_d.get("conclusion") in ("failure", "cancelled", "timed_out"):
+                    jid = job_d.get("id")
+                    if jid is not None:
+                        out.append(
+                            FailedJob(
+                                id=str(jid),
+                                name=str(job_d.get("name") or jid),
+                                runner_name=_opt_str(job_d.get("runner_name")),
+                                started_at=_opt_str(job_d.get("started_at")),
+                                completed_at=_opt_str(job_d.get("completed_at")),
+                            )
+                        )
+        return out
+
+    async def _job_logs(self, repo: str, job_id: str) -> str | None:
+        """Raw logs for one job via `gh api /repos/.../actions/jobs/<id>/logs`.
+        Returns None when the blob is gone (404 / BlobNotFound) so the caller can
+        skip just that job; raises (auth / rate / 5xx) for real failures."""
+        result = await self._run("api", f"/repos/{repo}/actions/jobs/{job_id}/logs")
+        if result.returncode == 0:
+            return _safe_decode(result.stdout)
+        blob = (_safe_decode(result.stderr) + _safe_decode(result.stdout)).lower()
+        if any(p in blob for p in _RUN_LOG_UNAVAILABLE_PHRASES) or "404" in blob:
+            return None
+        self._raise_run_log_error(repo, job_id, result)
+        return None  # unreachable — _raise_run_log_error always raises
 
     async def pr_get(self, repo: str, pr_number: int) -> dict[str, Any]:
         """Fetch one PR's metadata via `GET /repos/{repo}/pulls/{n}`."""
@@ -400,6 +569,34 @@ class GhCli:
                 proc.kill()
             raise TransientError(f"gh {args[0]} timed out after {self._timeout}s") from exc
         return _GhResult(returncode=proc.returncode or 0, stdout=stdout, stderr=stderr)
+
+    def _raise_run_log_error(self, repo: str, run_id: str, result: _GhResult) -> None:
+        """Dedicated classifier for `gh run view --log-failed` (NOT gh-api shaped).
+
+        Order: auth → HTTP 401/403-rate/5xx → log-unavailable phrases → transient.
+        A gone/expired log (no HTTP code) → RunLogUnavailableError (skip, not retry).
+        """
+        stderr = _safe_decode(result.stderr)
+        lower = stderr.lower()
+        where = f"gh run view {run_id} --repo {repo} --log-failed"
+
+        if any(p in lower for p in _AUTH_PHRASES):
+            raise AuthError(f"{where}: auth failure: {stderr.strip()}")
+
+        match = _HTTP_CODE_RE.search(stderr)
+        code = int(match.group(1)) if match else None
+        if code == 401:
+            raise AuthError(f"{where}: HTTP 401: {stderr.strip()}")
+        if code == 403 and any(p in lower for p in _RATE_LIMIT_PHRASES):
+            raise RateLimitError(f"{where}: rate-limited: {stderr.strip()}")
+        if code is not None and 500 <= code < 600:
+            raise TransientError(f"{where}: HTTP {code}: {stderr.strip()}")
+
+        if any(p in lower for p in _RUN_LOG_UNAVAILABLE_PHRASES):
+            raise RunLogUnavailableError(f"{where}: log unavailable: {stderr.strip()}")
+
+        # Genuinely transient (network / timeout / unknown non-zero exit).
+        raise TransientError(f"{where}: exit {result.returncode}: {stderr.strip()}")
 
     def _raise_error(self, method: str, path: str, result: _GhResult) -> None:
         stderr = _safe_decode(result.stderr)

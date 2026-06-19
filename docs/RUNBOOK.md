@@ -576,6 +576,85 @@ The audit row's `status` column tells you why a triage didn't post:
 | `skipped_already_triaged` | An audit row with `status='posted'` already exists for this issue. Use `--force` to supersede. |
 | `failed` | Persona unavailable, redaction would alter content, fabricated evidence quote, or any other DeadLetter condition. `audit.error` has details; events go to `dead_letter` for `daeyeon-bot ops replay`. |
 
+## 4c. CI Monitor / OnCall triage (feature 003)
+
+First-pass triage of CI failures. The `slack_ci_alert` trigger polls
+`#ssw-devops-alerts` + `#ssw-devops-help` for CI-failure alerts; the `ci_triage`
+handler pulls the failed run log (`gh --log-failed`, read-only), searches the
+OnCall LLM Wiki (`ssw-devops-oncall`, read-only clone), calls Claude, and posts a
+triage. Both land behind `enabled = false`.
+
+### Enable
+
+```bash
+# 1. Store the Slack bot token (xoxb-, the dev_syssw_test bot) via [secrets].provider.
+#    Key name is the literal `slack_bot_token` (env form SLACK_BOT_TOKEN).
+daeyeon-bot lifecycle setup-secret slack_bot_token
+
+# 2. Set [handlers.ci_triage].dry_run_channel to a REAL test channel id, then flip
+#    [handlers.ci_triage].enabled = true  (handler — manual fire works now)
+#    [triggers.slack_ci_alert].enabled = true  (trigger — auto polling)
+# 3. Restart. Boot probes (Slack auth.test, [loki] presence, oncall_wiki ls-remote,
+#    channel allowlist) fail loud at boot (exit 78) if misconfigured.
+```
+
+Requires `[loki]` present and the `[oncall_wiki]` remote reachable (deploy key or
+the operator's `gh`-backed HTTPS credential helper). The bot must be a **member**
+of both channels to READ history (posting via `chat:write.public` needs no join).
+
+### Operate
+
+```bash
+# Per-channel cursor state + recent audit summary:
+daeyeon-bot inspect ci-triage
+# One alert's audit row:
+daeyeon-bot inspect ci-triage --message-ts <ts>
+# Manual fire (de-risks the trigger; posts to dry_run channel under post_target=dry_run):
+daeyeon-bot dev fire-ci-triage --repo rebellions-sw/ssw-bundle --run <run_id>
+# Force re-triage (posts a NEW message with an "Updated triage (supersedes …)" header):
+daeyeon-bot dev fire-ci-triage --repo rebellions-sw/ssw-bundle --run <run_id> --force
+```
+
+### dry_run → thread promotion (P3 — evidence-based, not a date)
+
+`post_target = "dry_run"` posts one-way to the test channel. Before flipping to
+`post_target = "thread"` (reply in the original alert thread, the channel on-call
+lives in), **review the dry_run audit distribution**:
+
+```bash
+sqlite3 ~/.daeyeon-bot/state.db \
+  "SELECT attribution, confidence, COUNT(*) FROM ci_triage_audit \
+   WHERE status='posted' GROUP BY attribution, confidence"
+```
+
+If a non-trivial share are `unknown` / `low`, hold the flip and tune the persona
+first. At promotion, set **both** `post_target = "thread"` **and**
+`post_no_evidence_note = true` (silence in the on-call channel is ambiguous; a
+"bot saw it, log expired / no link" note is itself useful signal).
+
+### Gotchas
+
+- **Token revocation halts the WHOLE daemon.** Slack `invalid_auth` / `token_revoked`
+  → `AuthError` → exit 78 takes down pr_review + jira_triage too (centralized
+  AuthError→halt contract). Rotate `slack_bot_token` and restart. A missing token
+  at boot reports a distinct `ConfigError("…not configured…")`.
+- **Silence can mean "log expired", not "ignored".** `skipped_log_unavailable`
+  (GH retention aged out the run log) and `skipped_no_run_link` Ack with no post
+  by default. `post_no_evidence_note = true` opts into a minimal note.
+- **Force stacks replies.** The Slack adapter has no `chat.update`/`chat.delete`,
+  so each `--force` posts a NEW message and leaves the prior — repeated force on a
+  flapping run stacks bot replies in one thread.
+- **Rare double-post on crash.** Post-then-audit: if the process dies between
+  `chat.postMessage` and the audit commit, a re-claim re-posts (same residual as
+  feature 002; Slack has no idempotency key).
+- **Re-pin the domain vocabulary** in `contracts/oncall-wiki-surface.md` whenever
+  an incident file introduces a new `domain:` value — the `owner_area` drift-guard
+  test reads the pinned list, not the live vault, so a real drift mis-routes
+  attribution silently until re-pinned.
+- **The wiki clone (`var/ssw-devops-oncall/`) is rebuildable** and NOT in the DB
+  backup. `rm -rf var/ssw-devops-oncall/` is a safe recovery — `ensure_fresh()`
+  re-clones it.
+
 ## 5. When in doubt
 
 - `daeyeon-bot ops doctor` is the single best diagnostic.

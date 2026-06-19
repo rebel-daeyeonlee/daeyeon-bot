@@ -110,6 +110,7 @@ class CiTriageHandler:
     persona_loader: PersonaLoader
     config: CiTriageHandlerEntry
     db: Any  # aiosqlite.Connection
+    loki: Any = None  # LokiClient | FakeLoki | None — device-level dual-evidence path
     pause_guard: PauseGuard = _no_pause
 
     async def handle(self, event: Event, ctx: HandlerContext) -> HandlerResult:
@@ -189,8 +190,14 @@ class CiTriageHandler:
                     anchored_chars=len(anchored),
                 )
 
-        # ── EVIDENCE: device-level Loki path (best-effort) ────────────────────
-        loki_text = _loki_placeholder(alert.loki_window)
+        # ── EVIDENCE: device-level Loki path (when the run log is absent) ─────
+        # Device-level alerts (CP/SMC FW fail, 0x... device-unreachable) carry no
+        # useful GitHub run log — the evidence is the host's fwlog/kernel streams.
+        loki_text = ""
+        if alert.loki_window is not None and not log_text:
+            loki_text, loki_err = await self._loki_evidence(alert.loki_window, now=now)
+            if loki_err:
+                _log.info("ci_triage.loki_degraded", host=alert.loki_window.host, error=loki_err)
 
         # ── OnCall wiki ───────────────────────────────────────────────────────
         wiki_error: str | None = None
@@ -354,6 +361,33 @@ class CiTriageHandler:
             # best-effort note; a failure must never fail the already-skipped event.
             _log.info("ci_triage.no_evidence_note_failed", error=repr(exc))
 
+    async def _loki_evidence(self, window: LokiWindow, *, now: datetime) -> tuple[str, str | None]:
+        """Fetch error-class log lines for the alert's host+window from Loki.
+
+        Returns (text, error_label). Never raises — the LokiClient maps network
+        failures to an error label, and an absent client / empty result degrades
+        to an empty string (the prompt rule then yields confidence:low). LogQL
+        mirrors ssw-bundle's ai_triage fetcher: kernel + rebellions-* streams,
+        filtered by a device-error regex at query time. (fwlog/smclog streams are
+        IP-labelled, not short-hostname, so this hostname-scoped query covers the
+        kernel `[rbln-fwi]` pass-through, which is where device errors surface.)"""
+        if self.loki is None:
+            return ("", "loki_absent")
+        start, end = _loki_bounds(window, now=now)
+        logql = (
+            f'{{hostname="{_logql_escape(window.host)}",logtype=~"kernel|rebellions-.*"}}'
+            f' |~ "{_DEVICE_ERR_PATTERN}"'
+        )
+        result = await self.loki.query_range(
+            stream="kernel", logql=logql, start=start, end=end, limit=2000
+        )
+        if result.error is not None or result.slice is None:
+            return ("", f"loki:{result.error}")
+        if not result.slice.lines:
+            return ("", "loki_empty")
+        text = redact_text("\n".join(result.slice.lines))
+        return (text[:_LOKI_MAX_CHARS], None)
+
     def _post_target(self, alert: ParsedAlert) -> tuple[str, str | None]:
         """Return (channel_id, thread_ts). dry_run → test channel, no thread;
         thread → original channel, reply in the alert thread (P3)."""
@@ -510,19 +544,35 @@ def _search_terms(alert: ParsedAlert, log_text: str) -> tuple[tuple[str, ...], t
     return (tuple(dict.fromkeys(signatures)), tuple(dict.fromkeys(phrases)))
 
 
-def _loki_placeholder(window: LokiWindow | None) -> str:
-    """Device-level Loki evidence is wired in P1 only as a passthrough note; the
-    full LokiClient query path is exercised via the jira_triage adapter and will
-    be enabled here once a window-bearing alert is triaged. P1 manual-fire uses
-    the run-log path."""
-    if window is None:
-        return ""
-    parts = [f"host={window.host}"]
-    if window.start:
-        parts.append(f"from={window.start}")
-    if window.end:
-        parts.append(f"to={window.end}")
-    return "Loki window available (" + ", ".join(parts) + ")"
+# Device-error regex applied at Loki query time (mirrors ssw-bundle ai_triage).
+_DEVICE_ERR_PATTERN = r"(?i)(error|fail|abort|panic|timeout|unreachable|halt|0x[0-9a-f]{6})"
+_LOKI_FALLBACK_HOURS = 2
+_LOKI_MAX_CHARS = 8000
+
+
+def _logql_escape(value: str) -> str:
+    """Escape `\\` and `\"` for a LogQL string literal."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _ms_to_dt(ms: str | None) -> datetime | None:
+    """Grafana/Loki link epoch-ms string → aware datetime, or None."""
+    if not ms:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=UTC)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _loki_bounds(window: LokiWindow, *, now: datetime) -> tuple[datetime, datetime]:
+    """Resolve [start, end) for the Loki query from the alert window, falling back
+    to a fixed window ending at `now` when the alert carries no explicit range."""
+    end = _ms_to_dt(window.end) or now
+    start = _ms_to_dt(window.start) or (end - timedelta(hours=_LOKI_FALLBACK_HOURS))
+    if start >= end:
+        start = end - timedelta(hours=_LOKI_FALLBACK_HOURS)
+    return (start, end)
 
 
 def _render_user_message(

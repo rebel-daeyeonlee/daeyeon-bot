@@ -22,6 +22,7 @@ from daeyeon_bot.infra.oncall_wiki import WikiRefresh
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 from daeyeon_bot.infra.slack import PostResult
 from daeyeon_bot.infra.storage import apply_migrations, open_db
+from tests.fakes.loki import FakeLokiClient
 
 _NOW = datetime(2026, 6, 19, 7, 0, 0, tzinfo=UTC)
 
@@ -121,6 +122,7 @@ def _make_handler(
     gh: Any,
     wiki: Any,
     config: CiTriageHandlerEntry | None = None,
+    loki: Any = None,
 ) -> CiTriageHandler:
     return CiTriageHandler(
         manifest=MANIFEST,
@@ -130,6 +132,7 @@ def _make_handler(
         persona_loader=PersonaLoader(skills_root=_persona_root()),
         config=config or CiTriageHandlerEntry(dry_run_channel="C_DRY", post_target="dry_run"),
         db=db,
+        loki=loki,
     )
 
 
@@ -292,6 +295,52 @@ async def test_no_run_link_skips(tmp_path: Path) -> None:
         audit = await find_latest_for_message(conn, channel_id="C1", message_ts="100.1")
         assert audit is not None
         assert audit.status == "skipped_no_run_link"
+    finally:
+        await conn.close()
+
+
+# ── device-level Loki path (no run log → fwlog/kernel evidence) ──────────────
+
+
+async def test_device_level_loki_evidence(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        # SSW-Alert-Bot device alert: host in [..] tag, NO actions/runs link → the
+        # run-log path is skipped and the device-level Loki path supplies evidence.
+        raw = (
+            ":warning: *[ssw-smci-15] SMC FW update FAILED*\nresult 00000002, smc update has failed"
+        )
+        ev = make_event(
+            type="slack.ci_alert",
+            payload={
+                "channel_id": "C1",
+                "message_ts": "100.1",
+                "author_id": "U09RJGLLPLZ",
+                "raw_blob": raw,
+            },
+            created_at=_NOW,
+        )
+        await _seed_event(conn, ev, "d1")
+        loki = FakeLokiClient()
+        loki.set_response(
+            "kernel",
+            lines=(
+                "[rbln-fwi] SMC update has failed 0x__6a0000",
+                "device unreachable 0x50555746",
+            ),
+        )
+        slack = _FakeSlack()
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki(), loki=loki)
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        # Loki was queried for the alert host on the kernel stream.
+        assert loki.calls
+        stream, logql, _start, _end = loki.calls[0]
+        assert stream == "kernel"
+        assert 'hostname="ssw-smci-15"' in logql
+        assert len(slack.posts) == 1  # device-level triage still posts
     finally:
         await conn.close()
 

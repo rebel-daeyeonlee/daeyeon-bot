@@ -309,12 +309,20 @@ async def _build_ci_triage_deps(
         or PersonaLoader(skills_root=_resolve_skills_root(config))
     )
     pause_guard = overrides.pause_guard or _make_pause_guard(config)
+    # Device-level dual-evidence path. Build (or reuse) a LokiClient from [loki]
+    # independent of feature 002 — ci_triage can run with jira_triage disabled.
+    loki_client = overrides.loki or LokiClient(
+        base_url=config.loki.base_url,
+        timeout_s=float(config.loki.timeout_seconds),
+        per_stream_max_bytes=config.loki.per_stream_max_bytes,
+    )
     return CiTriageDeps(
         slack=slack_client,
         gh=gh_client,
         oncall_wiki=wiki_client,
         persona_loader=loader,
         db=db,
+        loki=loki_client,
         pause_guard=pause_guard,
     )
 

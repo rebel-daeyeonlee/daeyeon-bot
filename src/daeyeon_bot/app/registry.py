@@ -76,6 +76,7 @@ class CiTriageDeps:
     oncall_wiki: Any
     persona_loader: PersonaLoader
     db: Any
+    loki: Any = None
     pause_guard: PauseGuard | None = None
 
 
@@ -259,6 +260,7 @@ def instantiate_handler(
             "persona_loader": ci_triage_deps.persona_loader,
             "config": ci_entry,
             "db": ci_triage_deps.db,
+            "loki": ci_triage_deps.loki,
         }
         if ci_triage_deps.pause_guard is not None:
             ct_kwargs["pause_guard"] = ci_triage_deps.pause_guard

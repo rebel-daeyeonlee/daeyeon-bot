@@ -77,6 +77,12 @@ async def collect_feedback(
         try:
             reactions = await slack.reactions_get(row.channel_id, row.message_ts)
         except Exception as exc:
+            msg = str(exc)
+            # A token-wide failure (no reactions:read scope, bad auth) won't fix
+            # itself mid-pass — stop now instead of hammering Slack once per row.
+            if any(s in msg for s in ("missing_scope", "not_authed", "invalid_auth")):
+                _log.warning("ci_feedback.disabled", reason=msg)
+                break
             _log.info("ci_feedback.reactions_failed", audit_id=row.audit_id, error=repr(exc))
             continue
         verdict = classify_reactions(

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from daeyeon_bot.core.errors import PermanentError
 from daeyeon_bot.infra.ci_feedback import classify_reactions, collect_feedback
 from daeyeon_bot.infra.ci_triage_audit import feedback_stats, insert_audit
 from daeyeon_bot.infra.storage import apply_migrations, open_db
@@ -91,5 +92,29 @@ async def test_collect_feedback_records_verdicts(tmp_path: Path) -> None:
         again = await collect_feedback(conn, slack, now=_NOW)
         assert again == 0
         assert slack.calls == ["100.3"]
+    finally:
+        await conn.close()
+
+
+class _ScopelessSlack:
+    """reactions.get always fails with missing_scope (token lacks reactions:read)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
+        self.calls += 1
+        raise PermanentError("slack reactions.get: missing_scope")
+
+
+async def test_collect_feedback_short_circuits_on_missing_scope(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        await _seed_posted(conn, ev="e1", ts="100.1")
+        await _seed_posted(conn, ev="e2", ts="100.2")
+        slack = _ScopelessSlack()
+        updated = await collect_feedback(conn, slack, now=_NOW)
+        assert updated == 0
+        assert slack.calls == 1  # stopped after the first token-wide failure
     finally:
         await conn.close()

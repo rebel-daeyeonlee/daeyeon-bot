@@ -263,6 +263,30 @@ post_target = "dry_run"
 # Post a minimal "bot saw it; no machine-readable run/Loki link" note when there
 # is no evidence. Flipped to true together with post_target=thread at promotion.
 post_no_evidence_note = false
+# P1 cross-run comparison: list recent runs of the same workflow to evidence
+# infra_env vs product_regression ("다른 PR도 fail?"). Best-effort — a gh failure
+# degrades to "no comparison" and never fails the triage.
+cross_run_enabled = true
+cross_run_window = 30
+# Optional: absolute path to ssw-debugger (oh-my-debugger) `dmesg-timeline.py`.
+# When set + present, the device-log Loki slice is piped through it for a
+# domain-distribution signal that sharpens owner_area. Empty → disabled. e.g.
+# ".../ssw-debugger/.claude-plugin/plugin/skills/common/scripts/dmesg-timeline.py"
+dmesg_timeline_script = ""
+# P2 recurrence ("🔁 7일 N회") — audit-only, no secrets needed.
+recurrence_enabled = true
+recurrence_window_days = 7
+# P2/P4 ticket search — surfaces open SSWCI/SDOC (Jira) + DOLIN (Linear) issues
+# matching the host/signature. Opt-in: needs jira_user / jira_api_token and
+# linear_api_token secrets (a missing one just disables that source). Off by
+# default so boot never depends on them.
+ticket_search_enabled = false
+ticket_jira_projects = ["SSWCI", "SDOC"]
+# P3 log-only triage: triage a pasted failure log (fenced ``` + error signature)
+# when there's no run link / Loki window. P4 ticket-draft: suggest a SSWCI bug
+# stub for a confident infra_env failure with no matching open ticket.
+log_only_triage_enabled = true
+ticket_draft_enabled = true
 
 # ─── Routing ───────────────────────────────────────────────────────────────────
 # event.type → list of handler names. A type with no entry is dropped (logged).

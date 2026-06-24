@@ -109,6 +109,36 @@ class FailedJob:
     completed_at: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowRunMeta:
+    """Identity of one run, enough to find its sibling runs (feature 003 P1
+    cross-run comparison). `workflow_id` keys the per-workflow runs listing;
+    `head_sha`/`head_branch` distinguish this PR's attempts from other PRs'."""
+
+    run_id: str
+    workflow_id: str | None
+    head_sha: str | None
+    head_branch: str | None
+    event: str | None
+    run_attempt: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RunSummary:
+    """A completed run of a workflow (feature 003 P1). Run-level only — we do not
+    fetch per-job conclusions here (that would be N extra calls); the run
+    `conclusion` is the comparison signal, mirroring how on-call eyeballs
+    'are other PRs also failing this workflow?'."""
+
+    id: str
+    head_sha: str | None
+    head_branch: str | None
+    status: str | None  # queued | in_progress | completed
+    conclusion: str | None  # success | failure | cancelled | timed_out | ...
+    event: str | None
+    created_at: str | None
+
+
 class GhCli:
     """Thin async wrapper around `gh api` for the 5 GitHub endpoints we use."""
 
@@ -278,6 +308,67 @@ class GhCli:
         window). Used by the handler to resolve a Loki host (runner fallback) +
         time window. Returns [] on any failure."""
         return await self._failed_jobs(repo, run_id)
+
+    async def run_meta(self, repo: str, run_id: str) -> WorkflowRunMeta:
+        """Identity of one run (workflow_id, head_sha, branch) for cross-run
+        comparison. `GET /repos/{repo}/actions/runs/{run_id}` (feature 003 P1)."""
+        payload = await self._api("GET", f"/repos/{repo}/actions/runs/{run_id}")
+        if not isinstance(payload, dict):
+            raise PermanentError("gh run_meta returned non-object")
+        data = cast("dict[str, Any]", payload)
+        wf = data.get("workflow_id")
+        attempt = data.get("run_attempt")
+        return WorkflowRunMeta(
+            run_id=run_id,
+            workflow_id=str(wf) if wf is not None else None,
+            head_sha=_opt_str(data.get("head_sha")),
+            head_branch=_opt_str(data.get("head_branch")),
+            event=_opt_str(data.get("event")),
+            run_attempt=attempt if isinstance(attempt, int) else None,
+        )
+
+    async def list_workflow_runs(
+        self,
+        repo: str,
+        *,
+        workflow_id: str,
+        per_page: int = 30,
+        branch: str | None = None,
+    ) -> list[RunSummary]:
+        """Recent COMPLETED runs of a workflow, newest first (feature 003 P1).
+        `GET /repos/{repo}/actions/workflows/{workflow_id}/runs?status=completed`.
+        `branch` is omitted by default so the listing spans OTHER PRs (the whole
+        point of the comparison), not just this PR's reruns."""
+        extra = ["-f", f"per_page={per_page}", "-f", "status=completed"]
+        if branch:
+            extra += ["-f", f"branch={branch}"]
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/actions/workflows/{workflow_id}/runs",
+            extra=tuple(extra),
+        )
+        runs_raw = payload.get("workflow_runs") if isinstance(payload, dict) else None
+        out: list[RunSummary] = []
+        if isinstance(runs_raw, list):
+            for raw in cast("list[Any]", runs_raw):
+                if not isinstance(raw, dict):
+                    continue
+                rd = cast("dict[str, Any]", raw)
+                rid = rd.get("id")
+                if rid is None:
+                    continue
+                out.append(
+                    RunSummary(
+                        id=str(rid),
+                        head_sha=_opt_str(rd.get("head_sha")),
+                        head_branch=_opt_str(rd.get("head_branch")),
+                        status=_opt_str(rd.get("status")),
+                        conclusion=_opt_str(rd.get("conclusion")),
+                        event=_opt_str(rd.get("event")),
+                        created_at=_opt_str(rd.get("created_at")),
+                    )
+                )
+        return out
 
     async def _failed_jobs(self, repo: str, run_id: str) -> list[FailedJob]:
         """Failed/cancelled/timed-out jobs of the run, with runner + window."""
@@ -698,4 +789,4 @@ class _suppress:
         return True
 
 
-__all__ = ["GhCli"]
+__all__ = ["FailedJob", "GhCli", "RunSummary", "WorkflowRunMeta"]

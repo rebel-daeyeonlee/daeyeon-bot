@@ -270,6 +270,32 @@ class CiTriageHandlerEntry(HandlerEntry):
     # If true, post a minimal "bot saw it; no machine-readable run/Loki link" note
     # when there is no evidence (flipped to true as part of the P3 thread promotion).
     post_no_evidence_note: bool = False
+    # P1 cross-run comparison: list recent runs of the same workflow to evidence
+    # infra_env vs product_regression ("다른 PR도 fail?"). Best-effort — a failure
+    # degrades to no comparison, never fails the triage.
+    cross_run_enabled: bool = True
+    # How many recent completed runs of the workflow to inspect for the comparison.
+    cross_run_window: int = 30
+    # Optional path to ssw-debugger's `dmesg-timeline.py`. When set + present, the
+    # device-log Loki slice is piped through it for a domain-distribution signal
+    # that sharpens owner_area. Empty → disabled. Best-effort; never fails triage.
+    dmesg_timeline_script: str = ""
+    # P2 recurrence: count prior posted triages with the same host-agnostic
+    # signature in the window → "🔁 7일 N회". Audit-only, no secrets needed.
+    recurrence_enabled: bool = True
+    recurrence_window_days: int = 7
+    # P2/P4 ticket search: surface already-open Jira (SSWCI/SDOC) + Linear (DOLIN)
+    # issues matching the host/signature. Opt-in — needs jira_*/linear_api_token
+    # secrets; off by default so boot never depends on them. Best-effort.
+    ticket_search_enabled: bool = False
+    ticket_jira_projects: list[str] = Field(default_factory=lambda: ["SSWCI", "SDOC"])
+    # P3 log-only triage: when an alert has no run link / Loki window but carries a
+    # pasted failure log (fenced ``` block + error signature), triage from that
+    # blob alone (degraded — no gh fetch). Disable to skip such alerts.
+    log_only_triage_enabled: bool = True
+    # P4: when a confident infra_env triage finds no existing ticket, append a
+    # one-line SSWCI bug-stub suggestion (suggest-only; the bot never files it).
+    ticket_draft_enabled: bool = True
 
 
 class Config(BaseSettings):

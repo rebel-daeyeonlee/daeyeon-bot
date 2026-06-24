@@ -57,6 +57,9 @@ class TriageOutput(BaseModel):
     classification: Classification
     owner_area: OwnerArea
     confidence: Confidence
+    # One short line (host/component + error signature) — the Slack head line.
+    # Keep it terse: a phrase, not a sentence.
+    headline: str = Field(min_length=1, max_length=120)
     summary: str = Field(min_length=1)
     log_evidence: tuple[Evidence, ...] = ()
     wiki_matches: tuple[WikiRef, ...] = ()
@@ -82,16 +85,18 @@ def enforce_confidence_floor(
     *,
     has_strong_anchor: bool,
     has_wiki_match: bool,
+    has_cross_run_signal: bool = False,
 ) -> TriageOutput:
-    """Cap confidence by anchor strength (plan §Output schema rule 2).
+    """Cap confidence by evidence strength (plan §Output schema rule 2).
 
     With no wiki match AND only weak anchors, confidence cannot exceed `low`; a
-    single strong signature match permits `medium`. The handler computes anchor
-    strength (it knows whether a wiki `signature:` matched), so this lives here
+    single strong signature match — or a decisive cross-run comparison (P1: other
+    PRs also fail → infra, or only this PR fails → regression) — permits `medium`.
+    The handler computes these strengths and passes them in, so this lives here
     rather than in the model validator. Returns a copy with capped confidence."""
     if has_wiki_match and has_strong_anchor:
         return out  # full range allowed
-    if has_strong_anchor or has_wiki_match:
+    if has_strong_anchor or has_wiki_match or has_cross_run_signal:
         ceiling: Confidence = "medium"
     else:
         ceiling = "low"

@@ -33,6 +33,7 @@ _GOOD_TRIAGE = json.dumps(
         "classification": "environment",
         "owner_area": "DevOps",
         "confidence": "medium",
+        "headline": "QEMU golden-base 이미지 소실",
         "summary": "QEMU golden base 이미지 소실로 phase1 차단",
         "log_evidence": [
             {"quote": "rsync ... golden-base failed: No such file", "citation": "premerge / result"}
@@ -93,6 +94,10 @@ class _FakeGh:
     raise_unavailable: bool = False
     annotations: str = ""
     jobs: list[Any] = field(default_factory=list)
+    # P1 cross-run: `meta` None → run_meta yields workflow_id=None → no comparison
+    # (the default for tests that don't care). Set both to exercise the path.
+    meta: Any = None
+    workflow_runs: list[Any] = field(default_factory=list)
 
     async def run_failed_job_logs(self, repo: str, run_id: str) -> str:
         if self.raise_unavailable:
@@ -104,6 +109,25 @@ class _FakeGh:
 
     async def failed_jobs(self, repo: str, run_id: str) -> list[Any]:
         return self.jobs
+
+    async def run_meta(self, repo: str, run_id: str) -> Any:
+        from daeyeon_bot.infra.gh_cli import WorkflowRunMeta
+
+        if self.meta is not None:
+            return self.meta
+        return WorkflowRunMeta(
+            run_id=run_id,
+            workflow_id=None,
+            head_sha=None,
+            head_branch=None,
+            event=None,
+            run_attempt=None,
+        )
+
+    async def list_workflow_runs(
+        self, repo: str, *, workflow_id: str, per_page: int = 30, branch: str | None = None
+    ) -> list[Any]:
+        return self.workflow_runs
 
 
 @dataclass(slots=True)
@@ -132,6 +156,8 @@ def _make_handler(
     wiki: Any,
     config: CiTriageHandlerEntry | None = None,
     loki: Any = None,
+    jira: Any = None,
+    linear: Any = None,
 ) -> CiTriageHandler:
     return CiTriageHandler(
         manifest=MANIFEST,
@@ -142,6 +168,8 @@ def _make_handler(
         config=config or CiTriageHandlerEntry(dry_run_channel="C_DRY", post_target="dry_run"),
         db=db,
         loki=loki,
+        jira=jira,
+        linear=linear,
     )
 
 
@@ -220,6 +248,235 @@ async def test_manual_fire_happy_path_posts_dry_run(tmp_path: Path) -> None:
         assert audit.attribution == "infra_env"
     finally:
         await conn.close()
+
+
+async def test_cross_run_systemic_line_posted(tmp_path: Path) -> None:
+    """P1: when other recent PRs of the same workflow also fail, the posted body
+    carries the 🔬 systemic comparison line."""
+    from daeyeon_bot.infra.gh_cli import RunSummary, WorkflowRunMeta
+
+    def _run(sha: str, conclusion: str) -> RunSummary:
+        return RunSummary(
+            id=sha,
+            head_sha=sha,
+            head_branch="pr",
+            status="completed",
+            conclusion=conclusion,
+            event="pull_request",
+            created_at="2026-06-24T00:00:00Z",
+        )
+
+    conn = await _open(tmp_path)
+    try:
+        ev = _manual_event("rebellions-sw/ssw-bundle", "27758520154")
+        await _seed_event(conn, ev, "dx")
+        slack = _FakeSlack()
+        gh = _FakeGh(
+            meta=WorkflowRunMeta(
+                run_id="27758520154",
+                workflow_id="555",
+                head_sha="mine",
+                head_branch="pr-x",
+                event="pull_request",
+                run_attempt=1,
+            ),
+            workflow_runs=[
+                _run("mine", "failure"),
+                _run("o1", "failure"),
+                _run("o2", "failure"),
+                _run("o3", "failure"),
+                _run("o4", "success"),
+            ],
+        )
+        handler = _make_handler(conn, slack=slack, gh=gh, wiki=_FakeWiki())
+        result = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(result, Ack)
+        assert "🔬" in slack.posts[0]["text"]
+        assert "환경·인프라 유력" in slack.posts[0]["text"]
+    finally:
+        await conn.close()
+
+
+async def test_recurrence_line_when_signature_seen_before(tmp_path: Path) -> None:
+    """P2: a prior posted triage with the same signature → 🔁 N회 line."""
+    from daeyeon_bot.handlers.ci_triage import _failure_signature
+    from daeyeon_bot.infra.ci_triage_audit import insert_audit
+
+    conn = await _open(tmp_path)
+    try:
+        ev = _manual_event("rebellions-sw/ssw-bundle", "27758520154")
+        await _seed_event(conn, ev, "dr")
+        # a prior posted row carrying the signature this triage will compute.
+        sig = _failure_signature("QEMU golden-base 이미지 소실", "environment")
+        await conn.execute(
+            "INSERT INTO events(id, type, schema_version, source, source_dedup_key,"
+            " payload_json, trace_id, created_at) VALUES"
+            " ('prev', 'slack.ci_alert', 1, 'x', 'dprev', '{}', 'tr', '2026-06-18T00:00:00Z')"
+        )
+        await conn.commit()
+        await insert_audit(
+            conn,
+            event_id="prev",
+            channel_id="C9",
+            message_ts="111.1",
+            status="posted",
+            created_at=_NOW,
+            signature=sig,
+        )
+        await conn.commit()
+        slack = _FakeSlack()
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki())
+        await handler.handle(ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE]))))
+        text = slack.posts[0]["text"]
+        assert "🔁" in text and "2회" in text
+    finally:
+        await conn.close()
+
+
+class _FakeJiraIssue:
+    def __init__(self, key: str, status: str) -> None:
+        self.key = key
+        self.status_name = status
+
+
+class _FakeJiraPage:
+    def __init__(self, issues: list[_FakeJiraIssue]) -> None:
+        self.issues = tuple(issues)
+
+
+@dataclass(slots=True)
+class _FakeJira:
+    async def search_jql(self, *, jql: str, fields: list[str], max_results: int = 2) -> Any:
+        return _FakeJiraPage([_FakeJiraIssue("SSWCI-17228", "Triage")])
+
+
+@dataclass(slots=True)
+class _FakeLinear:
+    async def search_issues(self, term: str, *, limit: int = 3) -> list[Any]:
+        from daeyeon_bot.infra.linear_client import LinearIssue
+
+        return [LinearIssue("DOLIN-2207", "fix", "u", "In Progress", "started")]
+
+
+async def test_ticket_search_lines_posted(tmp_path: Path) -> None:
+    """P2/P4: open Jira + Linear matches render as the 🎫 line when enabled."""
+    conn = await _open(tmp_path)
+    try:
+        ev = _manual_event("rebellions-sw/ssw-bundle", "27758520154")
+        await _seed_event(conn, ev, "dt")
+        slack = _FakeSlack()
+        cfg = CiTriageHandlerEntry(
+            dry_run_channel="C_DRY", post_target="dry_run", ticket_search_enabled=True
+        )
+        handler = _make_handler(
+            conn,
+            slack=slack,
+            gh=_FakeGh(),
+            wiki=_FakeWiki(),
+            config=cfg,
+            jira=_FakeJira(),
+            linear=_FakeLinear(),
+        )
+        await handler.handle(ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE]))))
+        text = slack.posts[0]["text"]
+        assert "🎫" in text
+        assert "SSWCI-17228" in text and "DOLIN-2207" in text
+    finally:
+        await conn.close()
+
+
+def test_failure_signature_is_host_agnostic() -> None:
+    from daeyeon_bot.handlers.ci_triage import _failure_signature
+
+    a = _failure_signature("ssw-smci-16 IOMMU IOTLB_INV_TIMEOUT", "device_failure")
+    b = _failure_signature("ssw-host-04 IOMMU IOTLB_INV_TIMEOUT", "device_failure")
+    assert a == b  # hostnames masked → same signature across hosts
+    assert a.startswith("device_failure:") and "iommu" in a
+    # a different failure class is a different signature
+    assert _failure_signature("runfile install fail", "build_failure") != a
+
+
+async def test_log_only_triage_posts_without_run_link(tmp_path: Path) -> None:
+    """P3: a human post with a fenced failure log but no run link is triaged
+    from the pasted log (degraded), not skipped."""
+    raw = (
+        "runfile 설치시 error message 확인\n"
+        "```\n"
+        "[2026-06-24 08:41:02] Devices ready: 8/16, waiting... (115s/120s)\n"
+        "[2026-06-24 08:41:02] ERROR: Timeout: only 8/16 devices ready after 120s\n"
+        "[2026-06-24 08:41:02] ERROR: Not all devices are ready after module load\n"
+        "```"
+    )
+    ev = make_event(
+        type="slack.ci_alert",
+        payload={"channel_id": "C1", "message_ts": "5.5", "author_id": "UHUMAN", "raw_blob": raw},
+        created_at=_NOW,
+    )
+    conn = await _open(tmp_path)
+    try:
+        await _seed_event(conn, ev, "dlo")
+        slack = _FakeSlack()
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki())
+        res = await handler.handle(
+            ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
+        )
+        assert isinstance(res, Ack)
+        assert len(slack.posts) == 1  # degraded triage posted, not skipped
+        audit = await find_latest_for_message(conn, channel_id="C1", message_ts="5.5")
+        assert audit is not None and audit.status == "posted"
+    finally:
+        await conn.close()
+
+
+async def test_log_only_disabled_skips(tmp_path: Path) -> None:
+    raw = "fail\n```\nERROR: Timeout after 120s\nERROR: not ready\nexit code 1\n```"
+    ev = make_event(
+        type="slack.ci_alert",
+        payload={"channel_id": "C1", "message_ts": "6.6", "author_id": "UHUMAN", "raw_blob": raw},
+        created_at=_NOW,
+    )
+    conn = await _open(tmp_path)
+    try:
+        await _seed_event(conn, ev, "dlo2")
+        slack = _FakeSlack()
+        cfg = CiTriageHandlerEntry(
+            dry_run_channel="C_DRY", post_target="dry_run", log_only_triage_enabled=False
+        )
+        handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki(), config=cfg)
+        await handler.handle(ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE]))))
+        assert slack.posts == []  # skipped, no evidence
+        audit = await find_latest_for_message(conn, channel_id="C1", message_ts="6.6")
+        assert audit is not None and audit.status == "skipped_no_run_link"
+    finally:
+        await conn.close()
+
+
+def test_ticket_draft_only_for_confident_infra_without_tickets() -> None:
+    from daeyeon_bot.handlers.ci_triage import _ticket_draft
+
+    _, t, _ = _render_fixture()  # infra_env, medium
+    assert _ticket_draft(t, [], enabled=True) is not None
+    assert _ticket_draft(t, ["SSWCI-1 (open)"], enabled=True) is None  # has a match → no draft
+    assert _ticket_draft(t, [], enabled=False) is None
+    low = t.model_copy(update={"confidence": "low"})
+    assert _ticket_draft(low, [], enabled=True) is None  # not confident
+    reg = t.model_copy(update={"attribution": "product_regression"})
+    assert _ticket_draft(reg, [], enabled=True) is None  # not infra_env
+
+
+def test_render_shows_ticket_draft_when_no_tickets() -> None:
+    from daeyeon_bot.handlers.ci_triage import _render_slack_body
+
+    alert, t, wiki = _render_fixture()
+    out = _render_slack_body(
+        alert, t, wiki, ticket_draft='🆕 신규 SSWCI bug 제안: "x" (infra_env/SysFw)'
+    )
+    assert "🆕 신규 SSWCI bug 제안" in out
+    # tickets present → draft suppressed
+    out2 = _render_slack_body(alert, t, wiki, tickets=["SSWCI-9 (open)"], ticket_draft="🆕 nope")
+    assert "🆕" not in out2 and "🎫 SSWCI-9" in out2
 
 
 async def test_run_log_unavailable_skips(tmp_path: Path) -> None:
@@ -519,9 +776,8 @@ def test_action_items_falls_back_to_whole_string() -> None:
     assert _action_items("just one action, no enumerator") == ["just one action, no enumerator"]
 
 
-def test_render_slack_body_is_block_structured() -> None:
+def _render_fixture() -> tuple[Any, Any, list[Any]]:
     from daeyeon_bot.core.ci_triage.types import ParsedAlert, RunRef, WikiMatch
-    from daeyeon_bot.handlers.ci_triage import _render_slack_body
     from daeyeon_bot.handlers.ci_triage_schemas import Evidence, TriageOutput
 
     t = TriageOutput(
@@ -529,6 +785,7 @@ def test_render_slack_body_is_block_structured() -> None:
         classification="device_failure",
         owner_area="SysFw",
         confidence="medium",
+        headline="ssw-pc-21 heartbeat 0",
         summary="요약문.",
         likely_cause="원인.",
         known_remedy="복구법.",
@@ -543,18 +800,65 @@ def test_render_slack_body_is_block_structured() -> None:
         author_id=None,
         merged_text="",
         run_ref=RunRef(repo="rebellions-sw/ssw-bundle", run_id="42"),
+        pr_number=3539,
     )
     wiki = [
         WikiMatch(
             path="wiki/oncall/incidents/foo-bar.md", signature_matched=True, score=3, snippet=""
         )
     ]
+    return alert, t, wiki
+
+
+def test_render_slack_body_terse_when_confident() -> None:
+    """A medium/high-confidence call is terse: verdict head + decision + footer,
+    no 요약/추정원인/근거 block, single top action only."""
+    from daeyeon_bot.handlers.ci_triage import _render_slack_body
+
+    alert, t, wiki = _render_fixture()
     out = _render_slack_body(alert, t, wiki)
 
-    assert "*✅ 조치*" in out
-    assert "\n1. 단계 하나." in out and "\n2. 단계 둘." in out  # numbered, one per line
-    assert "↪️ *rerun*: needs_investigation" in out
-    assert "*🧾 근거*" in out and "> heartbeat: 0  — kernel/ssw-pc-21" in out
-    assert "• foo-bar.md" in out  # basename bullet, not full vault path
-    assert "wiki/oncall/incidents/foo-bar.md" not in out
+    assert out.startswith("🔧 *infra_env* (medium) · ssw-pc-21 heartbeat 0")
+    assert "↪️ *rerun 보류* — 단계 하나." in out  # rerun verdict + top action only
+    assert "단계 둘." not in out  # secondary action hidden when confident
+    assert "📋" not in out and "🧾" not in out  # no detail block
+    # one-line footer: run link as <url|repo #PR>, no separate jobs line
+    assert (
+        "🔗 <https://github.com/rebellions-sw/ssw-bundle/actions/runs/42|ssw-bundle #3539>" in out
+    )
     assert "🤖 daeyeon-bot" in out
+
+
+def test_render_slack_body_detailed_when_low_confidence() -> None:
+    """A low-confidence call appends the detail block (evidence + summary) and
+    lists secondary actions, because on-call must investigate by hand."""
+    from daeyeon_bot.handlers.ci_triage import _render_slack_body
+
+    alert, t, wiki = _render_fixture()
+    t = t.model_copy(update={"confidence": "low"})
+    out = _render_slack_body(alert, t, wiki)
+
+    assert "📋 요약문." in out
+    assert "🧾 `heartbeat: 0` — kernel/ssw-pc-21" in out
+    assert "• 단계 둘." in out  # secondary action shown in detail mode
+    assert "foo-bar.md" in out  # wiki basename, not full vault path
+    assert "wiki/oncall/incidents/foo-bar.md" not in out
+
+
+def test_render_slack_body_context_lines() -> None:
+    """Cross-run (P1) + recurrence/tickets (P2/P4) render as compact context
+    lines when supplied."""
+    from daeyeon_bot.handlers.ci_triage import _render_slack_body
+
+    alert, t, wiki = _render_fixture()
+    out = _render_slack_body(
+        alert,
+        t,
+        wiki,
+        cross_run="🔬 동일 host 최근 5 run 4 fail (PR 무관)",
+        recurrence="🔁 7일 3회",
+        tickets=["SSWCI-17228 (open)"],
+    )
+
+    assert "🔬 동일 host 최근 5 run 4 fail (PR 무관) · 🔁 7일 3회" in out
+    assert "🎫 SSWCI-17228 (open)" in out

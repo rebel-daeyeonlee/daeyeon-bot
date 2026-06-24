@@ -52,6 +52,8 @@ async def insert_audit(
     gh_error: str | None = None,
     wiki_error: str | None = None,
     error: str | None = None,
+    dut_host: str | None = None,
+    signature: str | None = None,
 ) -> int:
     """Insert one audit row; return the new `id`."""
     cursor = await conn.execute(
@@ -59,8 +61,8 @@ async def insert_audit(
         " event_id, channel_id, message_ts, repo, run_id, pr_number, failed_jobs,"
         " status, attribution, classification, owner_area, confidence, wiki_matches,"
         " posted_channel_id, posted_message_ts, summary_chars, persona_skill,"
-        " persona_mtime_ns, gh_error, wiki_error, error, created_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " persona_mtime_ns, gh_error, wiki_error, error, dut_host, signature, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             event_id,
             channel_id,
@@ -83,6 +85,8 @@ async def insert_audit(
             gh_error,
             wiki_error,
             error,
+            dut_host,
+            signature,
             created_at.isoformat(),
         ),
     )
@@ -148,6 +152,31 @@ async def find_latest_for_message(
     ) as cursor:
         row = await cursor.fetchone()
     return _row_to_audit(row) if row is not None else None
+
+
+async def count_recent_by_signature(
+    conn: aiosqlite.Connection,
+    *,
+    signature: str,
+    since_iso: str,
+    exclude_message_ts: str | None = None,
+) -> int:
+    """Count `posted` triages with this `signature` since `since_iso` (P2
+    recurrence). Excludes the current alert's message_ts so re-triage of the
+    same alert doesn't self-count. Empty signature → 0."""
+    if not signature:
+        return 0
+    sql = (
+        "SELECT COUNT(*) AS n FROM ci_triage_audit"
+        " WHERE signature = ? AND status = 'posted' AND created_at >= ?"
+    )
+    params: list[Any] = [signature, since_iso]
+    if exclude_message_ts is not None:
+        sql += " AND message_ts != ?"
+        params.append(exclude_message_ts)
+    async with conn.execute(sql, tuple(params)) as cursor:
+        row = await cursor.fetchone()
+    return int(row["n"]) if row is not None else 0
 
 
 async def list_recent(
@@ -221,6 +250,7 @@ def _row_to_audit(row: aiosqlite.Row) -> AuditRow:
 
 __all__ = [
     "AuditStatus",
+    "count_recent_by_signature",
     "find_latest_for_message",
     "find_posted_for_message",
     "find_posted_for_run",

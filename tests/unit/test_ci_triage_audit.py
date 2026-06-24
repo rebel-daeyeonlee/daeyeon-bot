@@ -8,6 +8,7 @@ from pathlib import Path
 import aiosqlite
 
 from daeyeon_bot.infra.ci_triage_audit import (
+    count_recent_by_signature,
     find_posted_for_message,
     find_posted_for_run,
     insert_audit,
@@ -33,6 +34,46 @@ async def _open(tmp_path: Path) -> aiosqlite.Connection:
     conn = await open_db(tmp_path / "state.db")
     await apply_migrations(conn)
     return conn
+
+
+async def test_count_recent_by_signature(tmp_path: Path) -> None:
+    conn = await _open(tmp_path)
+    try:
+        sig = "device_failure:iotlb_inv_timeout"
+        # two prior posted rows with the signature, one with a different sig,
+        # and one that's the current alert (excluded by message_ts).
+        for i, (mts, s, status) in enumerate(
+            [
+                ("10.1", sig, "posted"),
+                ("10.2", sig, "posted"),
+                ("10.3", "build_failure:foo", "posted"),
+                ("10.4", sig, "skipped_already_triaged"),  # non-posted, ignored
+                ("99.9", sig, "posted"),  # the current alert — excluded
+            ]
+        ):
+            await _seed_event(conn, f"e{i}", f"d{i}")
+            await insert_audit(
+                conn,
+                event_id=f"e{i}",
+                channel_id="C1",
+                message_ts=mts,
+                status=status,  # type: ignore[arg-type]
+                created_at=_NOW,
+                signature=s,
+            )
+        await conn.commit()
+        n = await count_recent_by_signature(
+            conn, signature=sig, since_iso="2026-06-01T00:00:00Z", exclude_message_ts="99.9"
+        )
+        assert n == 2  # two posted, same sig, not the excluded current alert
+        # window excludes everything before since
+        assert (
+            await count_recent_by_signature(conn, signature=sig, since_iso="2026-07-01T00:00:00Z")
+            == 0
+        )
+        assert await count_recent_by_signature(conn, signature="", since_iso="2026-01-01") == 0
+    finally:
+        await conn.close()
 
 
 async def test_posted_row_round_trips(tmp_path: Path) -> None:

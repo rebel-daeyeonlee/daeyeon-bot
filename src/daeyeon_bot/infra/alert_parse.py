@@ -158,14 +158,43 @@ def extract_dut_hosts(text: str) -> tuple[str, ...]:
     return tuple(host for host, _count in Counter(hits).most_common())
 
 
+# Fenced ``` code block contents (P3 log-only triage). Slack message text keeps
+# the literal ``` markers, so this runs over the merged blob.
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9]*\n?(.*?)```", re.DOTALL)
+# CI/test/device-failure signatures — what makes a pasted log worth triaging.
+_ERR_SIG_RE = re.compile(
+    r"(?i)(\bERROR\b|\bFAIL(?:ED|URE)?\b|Traceback|\bpanic\b|\babort\b|"
+    r"exit code\s*[1-9]|\btimed?\s*out\b|\btimeout\b|Unable to|No such file|"
+    r"not ready|RETURN_STATUS|\brc\s*[-=]?\s*-?\d|0x[0-9a-fA-F]{6,})"
+)
+_MIN_LOG_BLOCK_LINES = 3
+
+
+def extract_log_block(merged: str) -> str:
+    """Concatenated contents of fenced ``` code blocks in the message (P3).
+    Humans paste failing logs this way ("runfile install fail" + a ``` block);
+    this is the evidence when there is no run link."""
+    blocks = [m.group(1).strip() for m in _FENCE_RE.finditer(merged)]
+    return "\n\n".join(b for b in blocks if b)
+
+
+def has_error_signature(text: str) -> bool:
+    """True when `text` looks like a CI/test/device failure (≥3 lines + an error
+    signature) — the bar for triaging a pasted log with no run link."""
+    if text.count("\n") + 1 < _MIN_LOG_BLOCK_LINES:
+        return False
+    return _ERR_SIG_RE.search(text) is not None
+
+
 def is_ci_failure_candidate(
     msg: dict[str, Any],
     *,
     known_bot_ids: frozenset[str],
 ) -> bool:
-    """A message is a CI-failure candidate if it is authored by a known alert bot
-    OR contains a `github.com/.../actions/runs/<id>` link. Everything else
-    (human chatter, Jira unfurls) is ignored."""
+    """A message is a CI-failure candidate if it is authored by a known alert bot,
+    contains a `github.com/.../actions/runs/<id>` link, OR (P3) carries a fenced
+    code block that looks like a failure log. Human chatter / Jira unfurls without
+    any of these are ignored."""
     author = msg.get("user")
     if isinstance(author, str) and author in known_bot_ids:
         return True
@@ -173,7 +202,9 @@ def is_ci_failure_candidate(
     if isinstance(bot_id, str) and bot_id in known_bot_ids:
         return True
     merged = merge_message_text(msg)
-    return _RUN_RE.search(merged) is not None
+    if _RUN_RE.search(merged) is not None:
+        return True
+    return has_error_signature(extract_log_block(merged))
 
 
 def parse_alert(msg: dict[str, Any], *, channel_id: str) -> ParsedAlert:
@@ -198,11 +229,14 @@ def parse_alert(msg: dict[str, Any], *, channel_id: str) -> ParsedAlert:
 
 __all__ = [
     "extract_consecutive_fail_count",
+    "extract_dut_hosts",
     "extract_failed_jobs",
     "extract_head_sha",
+    "extract_log_block",
     "extract_loki_window",
     "extract_pr_number",
     "extract_run_ref",
+    "has_error_signature",
     "is_ci_failure_candidate",
     "merge_message_text",
     "parse_alert",

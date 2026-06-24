@@ -19,7 +19,7 @@ import aiosqlite
 import structlog
 
 from daeyeon_bot.app import pause as pause_mod
-from daeyeon_bot.app.config import Config
+from daeyeon_bot.app.config import CiTriageHandlerEntry, Config
 from daeyeon_bot.app.registry import (
     CiTriageDeps,
     GhReviewRequestedDeps,
@@ -41,6 +41,7 @@ from daeyeon_bot.infra.claude import ClaudeSession, make_real_factory
 from daeyeon_bot.infra.gh_cli import GhCli
 from daeyeon_bot.infra.host_resolver import HostResolver
 from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraClient, JiraIdentity
+from daeyeon_bot.infra.linear_client import LinearClient
 from daeyeon_bot.infra.logging import register_literal_secret
 from daeyeon_bot.infra.loki import LokiClient
 from daeyeon_bot.infra.oncall_wiki import OncallWiki
@@ -80,6 +81,7 @@ class ContainerOverrides:
     pause_guard: PauseGuard | None = None
     # Feature 002 overrides.
     jira: object | None = None  # JiraClient or a FakeJira
+    linear: object | None = None  # LinearClient or a fake (feature 003 P2 ticket search)
     loki: object | None = None  # LokiClient or a FakeLoki
     ssh: object | None = None  # SshLogClient or a FakeSshLogs
     ssw_bundle: object | None = None  # SswBundleClient or a fake
@@ -169,6 +171,7 @@ async def build(
         gh=gh,
         persona_loader=persona_loader,
         slack_client=slack_client,
+        secrets_provider=secrets_provider,
     )
     slack_ci_alert_deps = _build_slack_ci_alert_deps(
         config=config, slack_client=slack_client, clock=clock
@@ -271,6 +274,7 @@ async def _build_ci_triage_deps(
     gh: object | None,
     persona_loader: PersonaLoader | None,
     slack_client: object | None,
+    secrets_provider: SecretsProvider | None = None,
 ) -> CiTriageDeps | None:
     """Feature 003 handler deps, built only when `[handlers.ci_triage].enabled`.
     The Slack client is built once by `_build_slack_client` and shared with the
@@ -322,6 +326,13 @@ async def _build_ci_triage_deps(
         timeout_s=float(config.loki.timeout_seconds),
         per_stream_max_bytes=config.loki.per_stream_max_bytes,
     )
+    # P2/P4 ticket search clients — opt-in + best-effort. Built only when
+    # ticket_search_enabled AND the secrets are present; a missing secret or no
+    # provider leaves them None (search silently skipped), so boot never depends
+    # on Jira/Linear creds. No auth probe here — search calls are best-effort.
+    jira_search, linear_search = await _build_ci_ticket_clients(
+        config=config, entry=entry, overrides=overrides, secrets_provider=secrets_provider
+    )
     return CiTriageDeps(
         slack=slack_client,
         gh=gh_client,
@@ -329,8 +340,49 @@ async def _build_ci_triage_deps(
         persona_loader=loader,
         db=db,
         loki=loki_client,
+        jira=jira_search,
+        linear=linear_search,
         pause_guard=pause_guard,
     )
+
+
+async def _build_ci_ticket_clients(
+    *,
+    config: Config,
+    entry: CiTriageHandlerEntry,
+    overrides: ContainerOverrides,
+    secrets_provider: SecretsProvider | None,
+) -> tuple[object | None, object | None]:
+    """Build the optional (Jira, Linear) search clients for ci_triage P2/P4.
+
+    Honors overrides first (tests inject fakes). Otherwise, when
+    `ticket_search_enabled`, reads secrets and constructs real clients; a missing
+    secret degrades that one client to None rather than raising."""
+    jira_client = overrides.jira
+    linear_client = overrides.linear
+    if not entry.ticket_search_enabled:
+        return jira_client, linear_client
+    effective_secrets = overrides.secrets_provider or secrets_provider
+    if effective_secrets is None:
+        return jira_client, linear_client
+    if jira_client is None:
+        try:
+            jira_client = JiraClient(
+                base_url=config.jira.base_url,
+                user=effective_secrets.load_secret("jira_user"),
+                token=effective_secrets.load_secret("jira_api_token"),
+                timeout_s=float(config.jira.timeout_seconds),
+            )
+        except Exception:
+            jira_client = None
+    if linear_client is None:
+        try:
+            linear_client = LinearClient(
+                api_token=effective_secrets.load_secret("linear_api_token")
+            )
+        except Exception:
+            linear_client = None
+    return jira_client, linear_client
 
 
 def _build_slack_ci_alert_deps(

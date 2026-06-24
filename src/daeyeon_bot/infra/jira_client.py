@@ -132,6 +132,12 @@ class JiraClient:
         self._timeout = timeout_s
         self._http = http  # caller-injected (for testing); else built per-request
 
+    @property
+    def base_url(self) -> str:
+        """Normalized instance base URL (no trailing slash) — used to build
+        `…/browse/<KEY>` deep links."""
+        return self._base_url
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     async def myself(self) -> JiraIdentity:

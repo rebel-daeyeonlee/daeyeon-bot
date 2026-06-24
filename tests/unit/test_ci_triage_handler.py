@@ -348,6 +348,8 @@ class _FakeJiraPage:
 
 @dataclass(slots=True)
 class _FakeJira:
+    base_url: str = "https://rbln.atlassian.net"
+
     async def search_jql(self, *, jql: str, fields: list[str], max_results: int = 2) -> Any:
         return _FakeJiraPage([_FakeJiraIssue("SSWCI-17228", "Triage")])
 
@@ -382,7 +384,9 @@ async def test_ticket_search_lines_posted(tmp_path: Path) -> None:
         await handler.handle(ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE]))))
         text = slack.posts[0]["text"]
         assert "🎫" in text
-        assert "SSWCI-17228" in text and "DOLIN-2207" in text
+        # clickable Slack links: <url|KEY (status)>
+        assert "<https://rbln.atlassian.net/browse/SSWCI-17228|SSWCI-17228 (Triage)>" in text
+        assert "<u|DOLIN-2207 (In Progress)>" in text
     finally:
         await conn.close()
 

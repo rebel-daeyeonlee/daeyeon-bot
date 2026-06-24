@@ -556,7 +556,12 @@ class CiTriageHandler:
         except Exception as exc:
             _log.info("ci_triage.jira_search_failed", error=repr(exc))
             return []
-        return [f"{i.key} ({i.status_name or 'open'})" for i in page.issues[:2]]
+        base = str(getattr(self.jira, "base_url", "") or "").rstrip("/")
+        out: list[str] = []
+        for i in page.issues[:2]:
+            label = f"{i.key} ({i.status_name or 'open'})"
+            out.append(f"<{base}/browse/{i.key}|{label}>" if base else label)
+        return out
 
     async def _linear_tickets(self, term: str) -> list[str]:
         if self.linear is None:
@@ -566,7 +571,13 @@ class CiTriageHandler:
         except Exception as exc:
             _log.info("ci_triage.linear_search_failed", error=repr(exc))
             return []
-        return [f"{i.identifier} ({i.state_name or 'open'})" for i in issues if i.is_open][:2]
+        out: list[str] = []
+        for i in issues:
+            if not i.is_open:
+                continue
+            label = f"{i.identifier} ({i.state_name or 'open'})"
+            out.append(f"<{i.url}|{label}>" if i.url else label)
+        return out[:2]
 
     async def _loki_evidence(self, window: LokiWindow, *, now: datetime) -> tuple[str, str | None]:
         """Fetch error-class log lines for the alert's host+window from Loki.

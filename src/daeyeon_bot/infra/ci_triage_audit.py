@@ -10,12 +10,15 @@ shape, adapted to the ci_triage column set.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, cast
 
 import aiosqlite
 
 from daeyeon_bot.core.ci_triage.types import AuditRow
+
+Feedback = Literal["correct", "incorrect", "unsure"]
 
 AuditStatus = Literal[
     "posted",
@@ -179,6 +182,113 @@ async def count_recent_by_signature(
     return int(row["n"]) if row is not None else 0
 
 
+@dataclass(frozen=True, slots=True)
+class AwaitingFeedback:
+    """A posted triage whose Slack reactions haven't been reconciled yet."""
+
+    audit_id: int
+    channel_id: str
+    message_ts: str
+
+
+async def list_posted_awaiting_feedback(
+    conn: aiosqlite.Connection,
+    *,
+    since_iso: str,
+    limit: int = 100,
+) -> list[AwaitingFeedback]:
+    """Posted triages with a Slack message but no feedback yet, within the window
+    (feature 003 D). Newest first."""
+    async with conn.execute(
+        "SELECT id, posted_channel_id, posted_message_ts FROM ci_triage_audit"
+        " WHERE status = 'posted' AND posted_message_ts IS NOT NULL AND feedback IS NULL"
+        " AND created_at >= ? ORDER BY created_at DESC LIMIT ?",
+        (since_iso, limit),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    out: list[AwaitingFeedback] = []
+    for r in rows:
+        ch = r["posted_channel_id"]
+        ts = r["posted_message_ts"]
+        if ch is not None and ts is not None:
+            out.append(
+                AwaitingFeedback(audit_id=int(r["id"]), channel_id=str(ch), message_ts=str(ts))
+            )
+    return out
+
+
+async def set_feedback(
+    conn: aiosqlite.Connection,
+    *,
+    audit_id: int,
+    feedback: Feedback,
+    emoji: str,
+    at_iso: str,
+) -> None:
+    """Record the reaction-derived verdict on one audit row (feature 003 D)."""
+    await conn.execute(
+        "UPDATE ci_triage_audit SET feedback = ?, feedback_emoji = ?, feedback_at = ? WHERE id = ?",
+        (feedback, emoji, at_iso, audit_id),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackStats:
+    """Accuracy rollup over a window (feature 003 D)."""
+
+    posted: int
+    rated: int
+    correct: int
+    incorrect: int
+    unsure: int
+    # attribution -> (rated, correct)
+    by_attribution: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    @property
+    def accuracy(self) -> float | None:
+        decided = self.correct + self.incorrect
+        return (self.correct / decided) if decided else None
+
+
+async def feedback_stats(conn: aiosqlite.Connection, *, since_iso: str) -> FeedbackStats:
+    """Aggregate posted/rated/correct counts since `since_iso` (feature 003 D)."""
+    async with conn.execute(
+        "SELECT"
+        "  COUNT(*) AS posted,"
+        "  SUM(CASE WHEN feedback IS NOT NULL THEN 1 ELSE 0 END) AS rated,"
+        "  SUM(CASE WHEN feedback = 'correct' THEN 1 ELSE 0 END) AS correct,"
+        "  SUM(CASE WHEN feedback = 'incorrect' THEN 1 ELSE 0 END) AS incorrect,"
+        "  SUM(CASE WHEN feedback = 'unsure' THEN 1 ELSE 0 END) AS unsure"
+        " FROM ci_triage_audit WHERE status = 'posted' AND created_at >= ?",
+        (since_iso,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    by_attr: dict[str, tuple[int, int]] = {}
+    async with conn.execute(
+        "SELECT attribution,"
+        "  SUM(CASE WHEN feedback IS NOT NULL THEN 1 ELSE 0 END) AS rated,"
+        "  SUM(CASE WHEN feedback = 'correct' THEN 1 ELSE 0 END) AS correct"
+        " FROM ci_triage_audit WHERE status = 'posted' AND created_at >= ?"
+        " GROUP BY attribution",
+        (since_iso,),
+    ) as cursor:
+        for r in await cursor.fetchall():
+            attr = str(r["attribution"]) if r["attribution"] is not None else "(none)"
+            by_attr[attr] = (int(r["rated"] or 0), int(r["correct"] or 0))
+
+    def _n(key: str) -> int:
+        return int(row[key] or 0) if row is not None else 0
+
+    return FeedbackStats(
+        posted=_n("posted"),
+        rated=_n("rated"),
+        correct=_n("correct"),
+        incorrect=_n("incorrect"),
+        unsure=_n("unsure"),
+        by_attribution=by_attr,
+    )
+
+
 async def list_recent(
     conn: aiosqlite.Connection,
     *,
@@ -250,10 +360,16 @@ def _row_to_audit(row: aiosqlite.Row) -> AuditRow:
 
 __all__ = [
     "AuditStatus",
+    "AwaitingFeedback",
+    "Feedback",
+    "FeedbackStats",
     "count_recent_by_signature",
+    "feedback_stats",
     "find_latest_for_message",
     "find_posted_for_message",
     "find_posted_for_run",
     "insert_audit",
+    "list_posted_awaiting_feedback",
     "list_recent",
+    "set_feedback",
 ]

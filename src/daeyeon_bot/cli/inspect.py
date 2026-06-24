@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -407,6 +408,39 @@ def _format_ci_audit_row(row: CiAuditRow) -> str:
         f"{row.created_at.isoformat()}  {row.channel_id}#{row.message_ts}  status={row.status}"
         f"  run={run}  attr={attr}  conf={conf}{posted}{wiki}{gh}{err}"
     )
+
+
+@app.command(
+    "ci-triage-stats",
+    help="Accuracy of ci_triage from reaction feedback (✅/❌) over the window.",
+)
+def ci_triage_stats(
+    days: int = typer.Option(30, "--days", help="Window in days."),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+) -> None:
+    stats = asyncio.run(_ci_triage_stats(days=days, config_path=config))
+    acc = f"{stats.accuracy * 100:.0f}%" if stats.accuracy is not None else "n/a"
+    typer.echo(f"window: last {days}d")
+    typer.echo(
+        f"posted={stats.posted}  rated={stats.rated}"
+        f"  (correct={stats.correct} incorrect={stats.incorrect} unsure={stats.unsure})"
+    )
+    typer.echo(f"accuracy (correct / decided): {acc}")
+    if stats.rated == 0:
+        typer.echo("  (no feedback yet — react ✅/❌ on the bot's triage messages)")
+        return
+    typer.echo("by attribution (rated / correct):")
+    for attr, (rated, correct) in sorted(stats.by_attribution.items()):
+        if rated:
+            typer.echo(f"  {attr:18s} {correct}/{rated}")
+
+
+async def _ci_triage_stats(*, days: int, config_path: str | None) -> ci_triage_audit.FeedbackStats:
+    cfg = load(config_path)
+    since_iso = (datetime.now(tz=UTC) - timedelta(days=days)).isoformat()
+    async with storage.connection(cfg.db_path) as conn:
+        await storage.apply_migrations(conn)
+        return await ci_triage_audit.feedback_stats(conn, since_iso=since_iso)
 
 
 @app.command("ratelimit", help="Show token-bucket state for each rate-limit bucket.")

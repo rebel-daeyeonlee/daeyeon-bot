@@ -151,6 +151,25 @@ class SlackClient:
             ts=_opt_str(data.get("ts")) or "",
         )
 
+    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
+        """Reactions on one message as (emoji_name, count) — feature 003 D
+        feedback loop. Read-only `reactions.get`. Empty list when the message has
+        no reactions."""
+        data = await self._call("reactions.get", {"channel": channel_id, "timestamp": timestamp})
+        message = data.get("message")
+        reactions = message.get("reactions") if isinstance(message, dict) else None
+        out: list[tuple[str, int]] = []
+        if isinstance(reactions, list):
+            for r in cast("list[Any]", reactions):
+                if not isinstance(r, dict):
+                    continue
+                rd = cast("dict[str, Any]", r)
+                name = rd.get("name")
+                if isinstance(name, str) and name:
+                    count = rd.get("count")
+                    out.append((name, int(count) if isinstance(count, int) else 1))
+        return out
+
     # ── plumbing ────────────────────────────────────────────────────────────────
 
     async def _call(self, method: str, params: dict[str, str]) -> dict[str, Any]:

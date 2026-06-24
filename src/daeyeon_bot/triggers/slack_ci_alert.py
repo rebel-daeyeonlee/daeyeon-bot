@@ -46,6 +46,7 @@ from daeyeon_bot.core.protocols import EmitFn, TriggerContext
 from daeyeon_bot.core.time import Clock
 from daeyeon_bot.infra import outbox, slack_ci_alert_state
 from daeyeon_bot.infra.alert_parse import is_ci_failure_candidate, merge_message_text
+from daeyeon_bot.infra.ci_feedback import collect_feedback
 
 _log = structlog.get_logger(__name__)
 
@@ -78,6 +79,7 @@ class _PollOutcome:
     emitted: int = 0
     seeded: int = 0
     reseeded: int = 0
+    feedback: int = 0
 
 
 @dataclass(slots=True)
@@ -126,18 +128,31 @@ class SlackCiAlertTrigger:
                     emitted=outcome.emitted,
                     seeded=outcome.seeded,
                     reseeded=outcome.reseeded,
+                    feedback=outcome.feedback,
                 )
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def poll_once(self) -> _PollOutcome:
-        """One observe-and-emit pass across all channels."""
+        """One observe-and-emit pass across all channels, then a feedback pass
+        (feature 003 D) reconciling reactions on recently-posted triages."""
         emitted = seeded = reseeded = 0
         for channel_id in self.channels:
             result = await self._poll_channel(channel_id)
             emitted += result.emitted
             seeded += result.seeded
             reseeded += result.reseeded
-        return _PollOutcome(emitted=emitted, seeded=seeded, reseeded=reseeded)
+        feedback = await self._collect_feedback()
+        return _PollOutcome(emitted=emitted, seeded=seeded, reseeded=reseeded, feedback=feedback)
+
+    async def _collect_feedback(self) -> int:
+        """Reconcile ✅/❌ reactions on posted triages into accuracy data. Best-
+        effort — any failure is logged and the poll continues."""
+        try:
+            async with self.storage_factory() as conn:
+                return await collect_feedback(conn, self.slack, now=self.clock.now())
+        except Exception as exc:
+            _log.info("slack_ci_alert.feedback_failed", error=repr(exc))
+            return 0
 
     async def _poll_channel(self, channel_id: str) -> _PollOutcome:
         now = self.clock.now()
@@ -232,9 +247,7 @@ class SlackCiAlertTrigger:
                 await conn.commit()
             return _PollOutcome(emitted=emitted)
 
-    async def _thread_candidacy(
-        self, channel_id: str, msg: dict[str, Any]
-    ) -> tuple[str, bool]:
+    async def _thread_candidacy(self, channel_id: str, msg: dict[str, Any]) -> tuple[str, bool]:
         """Return (raw_blob, is_candidate) for a top-level message, looking into
         its thread replies when the message itself isn't an alert. The run link is
         often in a reply ("premerge fail" parent + run URL reply); we merge the

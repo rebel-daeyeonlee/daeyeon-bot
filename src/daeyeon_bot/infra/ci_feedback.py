@@ -33,7 +33,7 @@ INCORRECT_EMOJIS = frozenset({"x", "no_entry", "no_entry_sign", "-1", "thumbsdow
 
 
 class _ReactionSource(Protocol):
-    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]: ...
+    async def message_reactions(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]: ...
 
 
 def classify_reactions(
@@ -75,11 +75,11 @@ async def collect_feedback(
     updated = 0
     for row in awaiting:
         try:
-            reactions = await slack.reactions_get(row.channel_id, row.message_ts)
+            reactions = await slack.message_reactions(row.channel_id, row.message_ts)
         except Exception as exc:
             msg = str(exc)
-            # A token-wide failure (no reactions:read scope, bad auth) won't fix
-            # itself mid-pass — stop now instead of hammering Slack once per row.
+            # A token-wide failure (missing scope, bad auth) won't fix itself
+            # mid-pass — stop now instead of hammering Slack once per row.
             if any(s in msg for s in ("missing_scope", "not_authed", "invalid_auth")):
                 _log.warning("ci_feedback.disabled", reason=msg)
                 break

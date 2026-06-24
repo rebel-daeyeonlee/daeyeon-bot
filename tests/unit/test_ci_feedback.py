@@ -30,7 +30,7 @@ class _FakeReactions:
         self.mapping = mapping
         self.calls: list[str] = []
 
-    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
+    async def message_reactions(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
         self.calls.append(timestamp)
         return self.mapping.get(timestamp, [])
 
@@ -102,7 +102,7 @@ class _ScopelessSlack:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
+    async def message_reactions(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
         self.calls += 1
         raise PermanentError("slack reactions.get: missing_scope")
 

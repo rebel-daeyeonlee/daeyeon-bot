@@ -151,13 +151,26 @@ class SlackClient:
             ts=_opt_str(data.get("ts")) or "",
         )
 
-    async def reactions_get(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
+    async def message_reactions(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
         """Reactions on one message as (emoji_name, count) — feature 003 D
-        feedback loop. Read-only `reactions.get`. Empty list when the message has
-        no reactions."""
-        data = await self._call("reactions.get", {"channel": channel_id, "timestamp": timestamp})
-        message = data.get("message")
-        reactions = message.get("reactions") if isinstance(message, dict) else None
+        feedback loop. Reads the `reactions` field off the message via
+        `conversations.history` (scope `channels:history`/`groups:history`, which
+        we already hold) rather than `reactions.get` (which needs the separate
+        `reactions:read` scope). Empty list when the message has no reactions."""
+        data = await self._call(
+            "conversations.history",
+            {
+                "channel": channel_id,
+                "latest": timestamp,
+                "oldest": timestamp,
+                "inclusive": "true",
+                "limit": "1",
+            },
+        )
+        messages = _messages(data)
+        if not messages:
+            return []
+        reactions = messages[0].get("reactions")
         out: list[tuple[str, int]] = []
         if isinstance(reactions, list):
             for r in cast("list[Any]", reactions):

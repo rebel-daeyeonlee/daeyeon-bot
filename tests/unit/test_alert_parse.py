@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from daeyeon_bot.infra.alert_parse import (
+    extract_log_block,
     extract_run_ref,
+    has_error_signature,
     is_ci_failure_candidate,
     merge_message_text,
     parse_alert,
@@ -111,3 +113,33 @@ def test_candidate_filter() -> None:
 
 def test_no_run_link_returns_none() -> None:
     assert extract_run_ref("just some text with a https://github.com/foo/bar link") is None
+
+
+_LOG_ONLY = {
+    "user": "UHUMAN",
+    "text": (
+        "runfile 설치시 error message 확인\n"
+        "```\n"
+        "[2026-06-24 08:41:02] Devices ready: 8/16, waiting... (115s/120s)\n"
+        "[2026-06-24 08:41:02] ERROR: Timeout: only 8/16 devices ready after 120s\n"
+        "[2026-06-24 08:41:02] ERROR: Not all devices are ready after module load\n"
+        "```"
+    ),
+}
+
+
+def test_extract_log_block_and_signature() -> None:
+    block = extract_log_block(_LOG_ONLY["text"])
+    assert "Devices ready" in block and "```" not in block
+    assert has_error_signature(block) is True
+    # a one-liner without an error word is not a failure log
+    assert has_error_signature("just a note") is False
+    assert has_error_signature("line1\nline2\nline3 all good") is False
+
+
+def test_log_only_message_is_candidate() -> None:
+    # P3: human post, no run link, but a fenced failure log → candidate.
+    assert is_ci_failure_candidate(_LOG_ONLY, known_bot_ids=_KNOWN_BOTS)
+    # a fenced block with no error signature is NOT a candidate.
+    benign = {"user": "UHUMAN", "text": "참고:\n```\nsome config\nkey = value\nfoo = bar\n```"}
+    assert not is_ci_failure_candidate(benign, known_bot_ids=_KNOWN_BOTS)

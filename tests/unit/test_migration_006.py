@@ -15,13 +15,14 @@ async def _open(tmp_path: Path) -> aiosqlite.Connection:
     return conn
 
 
-async def test_schema_version_is_6(tmp_path: Path) -> None:
+async def test_schema_version_at_least_6(tmp_path: Path) -> None:
+    # 006 brought the schema to >= 6; later migrations (007+) bump it further.
     conn = await _open(tmp_path)
     try:
         async with conn.execute("SELECT value FROM meta WHERE key = 'schema_version'") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert int(row["value"]) == 6
+        assert int(row["value"]) >= 6
     finally:
         await conn.close()
 

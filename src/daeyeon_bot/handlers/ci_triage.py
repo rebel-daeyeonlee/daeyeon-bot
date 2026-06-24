@@ -38,10 +38,12 @@ from daeyeon_bot.core.manifest import HandlerManifest
 from daeyeon_bot.core.persona import Persona
 from daeyeon_bot.core.protocols import HandlerContext
 from daeyeon_bot.core.results import Ack, DeadLetter, HandlerResult
+from daeyeon_bot.handlers.ci_triage_cross_run import CrossRunResult, analyze_cross_run
 from daeyeon_bot.handlers.ci_triage_parsing import error_anchored_windows
 from daeyeon_bot.handlers.ci_triage_schemas import TriageOutput, enforce_confidence_floor
-from daeyeon_bot.infra import alert_parse
+from daeyeon_bot.infra import alert_parse, dmesg_timeline
 from daeyeon_bot.infra.ci_triage_audit import (
+    count_recent_by_signature,
     find_posted_for_message,
     find_posted_for_run,
     insert_audit,
@@ -91,6 +93,10 @@ class _GhClient(Protocol):
     async def run_failed_job_logs(self, repo: str, run_id: str) -> str: ...
     async def run_failed_annotations(self, repo: str, run_id: str) -> str: ...
     async def failed_jobs(self, repo: str, run_id: str) -> list[Any]: ...
+    async def run_meta(self, repo: str, run_id: str) -> Any: ...
+    async def list_workflow_runs(
+        self, repo: str, *, workflow_id: str, per_page: int = ..., branch: str | None = ...
+    ) -> list[Any]: ...
 
 
 @runtime_checkable
@@ -113,6 +119,8 @@ class CiTriageHandler:
     config: CiTriageHandlerEntry
     db: Any  # aiosqlite.Connection
     loki: Any = None  # LokiClient | FakeLoki | None — device-level dual-evidence path
+    jira: Any = None  # JiraClient | None — P2/P4 ticket search (best-effort)
+    linear: Any = None  # LinearClient | None — P2/P4 ticket search (best-effort)
     pause_guard: PauseGuard = _no_pause
 
     async def handle(self, event: Event, ctx: HandlerContext) -> HandlerResult:
@@ -129,8 +137,20 @@ class CiTriageHandler:
         now = ctx.clock.now() if hasattr(ctx, "clock") else datetime.now(tz=UTC)
         alert, force = _parse_event(event)
 
-        # Gate: no machine-readable run link AND no Loki window → nothing to triage.
-        if alert.run_ref is None and alert.loki_window is None:
+        # P3: with no run link / Loki window, a pasted failure log (fenced ``` +
+        # error signature) is still triageable evidence (degraded — no gh fetch).
+        pasted_log = ""
+        if (
+            alert.run_ref is None
+            and alert.loki_window is None
+            and self.config.log_only_triage_enabled
+        ):
+            block = alert_parse.extract_log_block(alert.merged_text)
+            if alert_parse.has_error_signature(block):
+                pasted_log = block
+
+        # Gate: nothing machine-readable AND no pasted log → nothing to triage.
+        if alert.run_ref is None and alert.loki_window is None and not pasted_log:
             await self._maybe_post_no_evidence_note(
                 alert, reason="machine-readable run/Loki 링크를 못 찾았습니다"
             )
@@ -202,6 +222,11 @@ class CiTriageHandler:
                     anchored_chars=len(anchored),
                 )
 
+        # P3 degraded path: no run log, but a pasted failure log is the evidence.
+        if not log_text and pasted_log:
+            log_text = error_anchored_windows(redact_text(pasted_log))
+            _log.info("ci_triage.log_only", anchored_chars=len(log_text))
+
         # ── EVIDENCE: DUT/host Loki (3-tier host resolution) ──────────────────
         # Prefer the device-under-test host over the runner: a premerge job runs on
         # a controller runner (ssw-hp-01) but tests a separate DUT (ssw-host-04),
@@ -212,10 +237,30 @@ class CiTriageHandler:
         loki_window = alert.loki_window
         if loki_window is None and alert.run_ref is not None:
             loki_window = await self._resolve_dut_window(alert.run_ref, log_text, now=now)
+        elif loki_window is None and pasted_log:
+            # log-only: grep a DUT host straight from the pasted log.
+            hosts = alert_parse.extract_dut_hosts(pasted_log)
+            if hosts:
+                loki_window = LokiWindow(host=hosts[0], start=None, end=None)
         if loki_window is not None:
             loki_text, loki_err = await self._loki_evidence(loki_window, now=now)
             if loki_err:
                 _log.info("ci_triage.loki_degraded", host=loki_window.host, error=loki_err)
+
+        # ── EVIDENCE: cross-run comparison (P1) — "다른 PR도 fail?" ─────────────
+        cross_run: CrossRunResult | None = None
+        if self.config.cross_run_enabled and alert.run_ref is not None:
+            cross_run = await self._cross_run_evidence(alert.run_ref)
+
+        # ── EVIDENCE: ssw-debugger dmesg-timeline domain tagging (best-effort) ─
+        timeline_text = ""
+        if loki_text and self.config.dmesg_timeline_script:
+            summary = await dmesg_timeline.classify(
+                loki_text, script_path=self.config.dmesg_timeline_script
+            )
+            if summary is not None:
+                timeline_text = redact_text(summary.as_prompt())
+                _log.info("ci_triage.dmesg_timeline", by_domain=summary.by_domain)
 
         # ── OnCall wiki ───────────────────────────────────────────────────────
         wiki_error: str | None = None
@@ -242,13 +287,35 @@ class CiTriageHandler:
             annotations=annotations,
             loki_text=loki_text,
             wiki_matches=wiki_matches,
+            cross_run=cross_run,
+            timeline_text=timeline_text,
         )
         triage = enforce_confidence_floor(
-            triage, has_strong_anchor=has_strong_anchor, has_wiki_match=has_wiki
+            triage,
+            has_strong_anchor=has_strong_anchor,
+            has_wiki_match=has_wiki,
+            has_cross_run_signal=bool(cross_run and cross_run.signal),
         )
 
+        # ── P2: recurrence (audit DB) + ticket search (Jira/Linear) ───────────
+        dut_host = loki_window.host if loki_window is not None else None
+        signature = _failure_signature(triage.headline, triage.classification)
+        recurrence_line = await self._recurrence_line(
+            signature=signature, message_ts=alert.message_ts, now=now
+        )
+        tickets = await self._ticket_search(dut_host=dut_host, triage=triage)
+        ticket_draft = _ticket_draft(triage, tickets, enabled=self.config.ticket_draft_enabled)
+
         # ── Render (+ force-supersede header) + redaction guard ───────────────
-        body = _render_slack_body(alert, triage, wiki_matches)
+        body = _render_slack_body(
+            alert,
+            triage,
+            wiki_matches,
+            cross_run=cross_run.summary_ko() if cross_run else None,
+            recurrence=recurrence_line,
+            tickets=tickets,
+            ticket_draft=ticket_draft,
+        )
         if force:
             prior = await self._prior_posted(alert)
             if prior is not None:
@@ -287,6 +354,8 @@ class CiTriageHandler:
             persona_mtime_ns=persona.mtime_ns,
             gh_error=gh_error,
             wiki_error=wiki_error,
+            dut_host=dut_host,
+            signature=signature,
         )
         _log.info(
             "ci_triage.posted",
@@ -309,11 +378,15 @@ class CiTriageHandler:
         annotations: str,
         loki_text: str,
         wiki_matches: list[WikiMatch],
+        cross_run: CrossRunResult | None = None,
+        timeline_text: str = "",
     ) -> TriageOutput:
         """Two in-call attempts. Second parse/validate failure → DeadLetter
         (PermanentError). This is an in-call loop, NOT a dispatcher retry."""
         system_prompt = persona.body + _SCHEMA_APPENDIX
-        user_message = _render_user_message(alert, log_text, annotations, loki_text, wiki_matches)
+        user_message = _render_user_message(
+            alert, log_text, annotations, loki_text, wiki_matches, cross_run, timeline_text
+        )
         last_error: str | None = None
         for attempt in range(2):
             session = ctx.claude_session_factory()
@@ -409,6 +482,91 @@ class CiTriageHandler:
             start=str(min(start_vals)) if start_vals else None,
             end=str(max(end_vals)) if end_vals else None,
         )
+
+    async def _cross_run_evidence(self, run_ref: RunRef) -> CrossRunResult | None:
+        """Compare this run against recent sibling runs of the same workflow
+        (P1). Best-effort: any failure (no workflow_id, gh error) → None, which
+        the caller renders as "no comparison" and never lets confidence rise on.
+        Two gh calls: run_meta → list_workflow_runs."""
+        try:
+            meta = await self.gh.run_meta(run_ref.repo, run_ref.run_id)
+            workflow_id = getattr(meta, "workflow_id", None)
+            if not workflow_id:
+                return None
+            runs = await self.gh.list_workflow_runs(
+                run_ref.repo,
+                workflow_id=str(workflow_id),
+                per_page=self.config.cross_run_window,
+            )
+        except Exception as exc:
+            _log.info("ci_triage.cross_run_failed", error=repr(exc))
+            return None
+        result = analyze_cross_run(head_sha=getattr(meta, "head_sha", None), runs=runs)
+        _log.info(
+            "ci_triage.cross_run",
+            verdict=result.verdict,
+            others_failed=result.others_failed,
+            others_total=result.others_total,
+        )
+        return result
+
+    async def _recurrence_line(
+        self, *, signature: str, message_ts: str, now: datetime
+    ) -> str | None:
+        """P2: "🔁 동일 시그니처 7일 N회" when prior posted triages share the
+        signature. Audit-only (no secrets); best-effort."""
+        if not self.config.recurrence_enabled or not signature:
+            return None
+        since = (now - timedelta(days=self.config.recurrence_window_days)).isoformat()
+        try:
+            prior = await count_recent_by_signature(
+                self.db, signature=signature, since_iso=since, exclude_message_ts=message_ts
+            )
+        except Exception as exc:
+            _log.info("ci_triage.recurrence_failed", error=repr(exc))
+            return None
+        if prior < 1:
+            return None
+        return f"🔁 동일 시그니처 {self.config.recurrence_window_days}일 {prior + 1}회"
+
+    async def _ticket_search(self, *, dut_host: str | None, triage: TriageOutput) -> list[str]:
+        """P2/P4: open Jira (SSWCI/SDOC) + Linear (DOLIN) issues matching the
+        host/signature, as compact labels. Opt-in + best-effort — no client or
+        any error → []."""
+        if not self.config.ticket_search_enabled:
+            return []
+        term = dut_host or _top_token(triage.headline)
+        if not term:
+            return []
+        labels = await self._jira_tickets(term)
+        labels += await self._linear_tickets(term)
+        return labels[:3]
+
+    async def _jira_tickets(self, term: str) -> list[str]:
+        if self.jira is None:
+            return []
+        projects = ", ".join(f'"{p}"' for p in self.config.ticket_jira_projects)
+        safe = term.replace('"', " ").replace("\\", " ")
+        jql = (
+            f"project in ({projects}) AND statusCategory != Done"
+            f' AND text ~ "{safe}" ORDER BY created DESC'
+        )
+        try:
+            page = await self.jira.search_jql(jql=jql, fields=["summary", "status"], max_results=2)
+        except Exception as exc:
+            _log.info("ci_triage.jira_search_failed", error=repr(exc))
+            return []
+        return [f"{i.key} ({i.status_name or 'open'})" for i in page.issues[:2]]
+
+    async def _linear_tickets(self, term: str) -> list[str]:
+        if self.linear is None:
+            return []
+        try:
+            issues = await self.linear.search_issues(term, limit=3)
+        except Exception as exc:
+            _log.info("ci_triage.linear_search_failed", error=repr(exc))
+            return []
+        return [f"{i.identifier} ({i.state_name or 'open'})" for i in issues if i.is_open][:2]
 
     async def _loki_evidence(self, window: LokiWindow, *, now: datetime) -> tuple[str, str | None]:
         """Fetch error-class log lines for the alert's host+window from Loki.
@@ -645,6 +803,8 @@ def _render_user_message(
     annotations: str,
     loki_text: str,
     wiki_matches: list[Any],
+    cross_run: CrossRunResult | None = None,
+    timeline_text: str = "",
 ) -> str:
     meta = [
         "## GitHub / alert metadata",
@@ -672,6 +832,8 @@ def _render_user_message(
         + "\n\n## Failed-job log (primary evidence; error-anchored, redacted)\n"
         + (log_text or "(no run log available)")
         + ("\n\n## Loki (device-level)\n" + loki_text if loki_text else "")
+        + ("\n\n" + timeline_text if timeline_text else "")
+        + ("\n\n" + cross_run.prompt_block() if cross_run is not None else "")
         + "\n\n## OnCall wiki runbook matches (supporting evidence only)\n"
         + wiki_block
         + "\n\nTriage this CI failure. Log is primary evidence; wiki is supporting."
@@ -685,6 +847,43 @@ def _supersede_header(prior: AuditRow) -> str:
     force posts a NEW message and the prior one stays (documented in RUNBOOK)."""
     when = prior.created_at.strftime("%H:%M:%S")
     return f"_Updated triage (supersedes earlier comment posted at {when} UTC)_\n\n"
+
+
+# Signature derivation (P2 recurrence): mask host-/instance-specific tokens so
+# the SAME kind of failure on different hosts collapses to one signature.
+_SIG_HOST_RE = re.compile(r"\b(?:ssw-\S+|[a-z]+-\d+|0x[0-9a-f]+|\d+)\b", re.IGNORECASE)
+_SIG_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_SIG_STOPWORDS = frozenset({"fail", "failed", "error", "the", "with", "and", "for"})
+
+
+def _failure_signature(headline: str, classification: str) -> str:
+    """Host-agnostic normalized failure key for recurrence matching.
+
+    Masks hostnames / instance numbers / hex from the headline, keeps the
+    distinctive lowercased tokens (order-independent), and prefixes the
+    classification. Same KIND of failure on different hosts → same signature.
+    Empty when no distinctive token survives (→ no recurrence claim)."""
+    masked = _SIG_HOST_RE.sub(" ", headline.lower())
+    tokens = sorted({t for t in _SIG_TOKEN_RE.findall(masked) if t not in _SIG_STOPWORDS})
+    key = "-".join(tokens[:6])
+    return f"{classification}:{key}" if key else ""
+
+
+def _top_token(headline: str) -> str:
+    """Longest distinctive (non-host) token of the headline — a ticket-search
+    fallback term when no DUT host is known."""
+    masked = _SIG_HOST_RE.sub(" ", headline)
+    cands = [t for t in _SIG_TOKEN_RE.findall(masked) if t.lower() not in _SIG_STOPWORDS]
+    return max(cands, key=len) if cands else ""
+
+
+def _ticket_draft(t: TriageOutput, tickets: list[str], *, enabled: bool) -> str | None:
+    """P4: suggest a SSWCI bug stub for a confident infra_env failure that has no
+    matching open ticket. Suggest-only — the bot never files it; the operator
+    one-clicks "create from message". None when not applicable."""
+    if not enabled or tickets or t.attribution != "infra_env" or t.confidence == "low":
+        return None
+    return f'🆕 신규 SSWCI bug 제안: "{t.headline}" (infra_env/{t.owner_area})'
 
 
 _CIRCLED_RE = re.compile(r"[①-⑳]")  # ① .. ⑳
@@ -714,46 +913,75 @@ def _action_items(text: str) -> list[str]:
     return items or [text]
 
 
-def _render_slack_body(alert: ParsedAlert, t: TriageOutput, wiki_matches: list[WikiMatch]) -> str:
-    """Block-structured mrkdwn. The verdict + action items (the actionable head)
-    and the run footer are never truncated; only the descriptive middle block is
-    budget-trimmed."""
+_RERUN_KR = {
+    "safe_to_rerun": "rerun 가능",
+    "do_not_rerun": "rerun 금지",
+    "needs_investigation": "rerun 보류",
+    "unknown": "rerun 판단불가",
+}
+
+
+def _render_slack_body(
+    alert: ParsedAlert,
+    t: TriageOutput,
+    wiki_matches: list[WikiMatch],
+    *,
+    cross_run: str | None = None,
+    recurrence: str | None = None,
+    tickets: list[str] | None = None,
+    ticket_draft: str | None = None,
+) -> str:
+    """Adaptive mrkdwn — terse by default, detailed only when a human must dig.
+
+    A confident call renders ~5 lines (verdict · context · decision · run). A
+    low-confidence or `unknown` call appends a short detail block (top evidence
+    line + summary) because on-call has to investigate it by hand.
+
+    `cross_run` (P1), `recurrence`/`tickets`/`ticket_draft` (P2/P4) are optional
+    high-signal context lines populated by later evidence stages; absent →
+    omitted."""
     emoji = _ATTR_EMOJI.get(t.attribution, "•")
-    run_link = (
-        f"https://github.com/{alert.run_ref.repo}/actions/runs/{alert.run_ref.run_id}"
-        if alert.run_ref
-        else "(no run link)"
-    )
+    actions = _action_items(t.recommended_action)
+    detailed = t.confidence == "low" or t.attribution == "unknown"
 
-    head = [
-        f"{emoji} *{t.attribution}* · {t.classification} · {t.owner_area}"
-        f" · confidence *{t.confidence}*",
-        "",
-        "*✅ 조치*",
-    ]
-    head += [f"{i}. {step}" for i, step in enumerate(_action_items(t.recommended_action), 1)]
-    head.append(f"↪️ *rerun*: {t.rerun_advice}")
+    lines = [f"{emoji} *{t.attribution}* ({t.confidence}) · {t.headline}"]
 
-    middle: list[str] = ["", "*📋 요약*", t.summary, "", "*🔍 추정 원인*", t.likely_cause]
-    if t.known_remedy:
-        middle += ["", "*🩹 복구법*", t.known_remedy]
-    evidence = [f"> {_truncate(e.quote.strip(), 160)}  — {e.citation}" for e in t.log_evidence[:2]]
-    if evidence:
-        middle += ["", "*🧾 근거*", *evidence]
-    wiki_lines = [f"• {m.path.rsplit('/', 1)[-1]}" for m in wiki_matches[:3]]
-    if wiki_lines:
-        middle += ["", "*📚 참고 wiki*", *wiki_lines]
-    middle_block = _truncate("\n".join(middle), 2200)
+    ctx = " · ".join(p for p in (cross_run, recurrence) if p)
+    if ctx:
+        lines.append(ctx)
+    if tickets:
+        lines.append("🎫 " + " · ".join(tickets))
+    elif ticket_draft:
+        lines.append(ticket_draft)
 
-    footer = [
-        "",
-        f"*🔗 run*  {alert.run_ref.repo if alert.run_ref else '?'}"
-        f" · PR {alert.pr_number if alert.pr_number is not None else '-'}"
-        f" · jobs: {', '.join(alert.failed_jobs) or '-'}",
-        f"<{run_link}>",
-        "🤖 daeyeon-bot",
-    ]
-    return "\n".join(head) + "\n" + middle_block + "\n" + "\n".join(footer)
+    rerun_kr = _RERUN_KR.get(t.rerun_advice, t.rerun_advice)
+    decision = f"↪️ *{rerun_kr}*"
+    if actions:
+        decision += f" — {_truncate(actions[0], 120)}"
+    lines.append(decision)
+
+    if detailed:
+        lines += [f"   • {_truncate(step, 120)}" for step in actions[1:]]
+        if t.log_evidence:
+            e = t.log_evidence[0]
+            lines.append(f"🧾 `{_truncate(e.quote.strip(), 140)}` — {e.citation}")
+        lines.append(f"📋 {_truncate(t.summary, 240)}")
+        wiki_lines = [m.path.rsplit("/", 1)[-1] for m in wiki_matches[:2]]
+        if wiki_lines:
+            lines.append("📚 " + " · ".join(wiki_lines))
+
+    lines.append(_footer_line(alert))
+    return "\n".join(lines)
+
+
+def _footer_line(alert: ParsedAlert) -> str:
+    """One-line footer: run link (repo #PR) + bot signature."""
+    if alert.run_ref is None:
+        return "🤖 daeyeon-bot"
+    run_link = f"https://github.com/{alert.run_ref.repo}/actions/runs/{alert.run_ref.run_id}"
+    repo_short = alert.run_ref.repo.rsplit("/", 1)[-1]
+    pr = f" #{alert.pr_number}" if alert.pr_number is not None else ""
+    return f"🔗 <{run_link}|{repo_short}{pr}> · 🤖 daeyeon-bot"
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -777,8 +1005,13 @@ Required keys:
   - `owner_area`      : "DevOps" | "SysFw" | "SysSol" | "Connectivity" | "Driver"
                         | "HW" | "Unknown"
   - `confidence`      : "low" | "medium" | "high"
+  - `headline`        : str — ONE terse line (<= 80 chars), the crux: host /
+                        component + the error signature (e.g.
+                        "ssw-smci-16 IOMMU IOTLB_INV_TIMEOUT"). A phrase, NOT a
+                        sentence. This is the Slack head line; keep it scannable.
   - `summary`         : str — one or two sentences (Korean prose OK; keep English
-                        technical terms / log lines verbatim).
+                        technical terms / log lines verbatim). Shown only on
+                        low-confidence / unknown calls, so be concise.
   - `log_evidence`    : list[{quote, citation}] — REQUIRED when attribution is not
                         "unknown". `quote` MUST be a real line from the log above.
   - `wiki_matches`    : list[{path, why}] — incident/playbook references you used;

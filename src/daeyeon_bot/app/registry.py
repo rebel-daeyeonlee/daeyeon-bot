@@ -77,6 +77,8 @@ class CiTriageDeps:
     persona_loader: PersonaLoader
     db: Any
     loki: Any = None
+    jira: Any = None  # JiraClient | None — P2/P4 ticket search (best-effort)
+    linear: Any = None  # LinearClient | None — P2/P4 ticket search (best-effort)
     pause_guard: PauseGuard | None = None
 
 
@@ -261,6 +263,8 @@ def instantiate_handler(
             "config": ci_entry,
             "db": ci_triage_deps.db,
             "loki": ci_triage_deps.loki,
+            "jira": ci_triage_deps.jira,
+            "linear": ci_triage_deps.linear,
         }
         if ci_triage_deps.pause_guard is not None:
             ct_kwargs["pause_guard"] = ci_triage_deps.pause_guard

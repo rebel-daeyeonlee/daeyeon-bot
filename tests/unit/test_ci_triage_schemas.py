@@ -18,6 +18,7 @@ from daeyeon_bot.handlers.ci_triage_schemas import (
 _BASE = {
     "classification": "environment",
     "owner_area": "DevOps",
+    "headline": "QEMU golden-base missing",
     "summary": "golden base image missing",
     "likely_cause": "qemu golden base image deleted from NFS",
     "recommended_action": "rebuild golden base image",
@@ -76,6 +77,21 @@ def test_confidence_floor_allows_medium_with_strong_anchor() -> None:
         **_BASE,  # type: ignore[arg-type]
     )
     capped = enforce_confidence_floor(out, has_strong_anchor=True, has_wiki_match=False)
+    assert capped.confidence == "medium"
+
+
+def test_confidence_floor_allows_medium_with_cross_run_signal() -> None:
+    """P1: a decisive cross-run comparison alone (no wiki, no strong anchor) lifts
+    the ceiling to medium."""
+    out = TriageOutput(
+        attribution="infra_env",
+        confidence="medium",
+        log_evidence=(Evidence(quote="other PRs also fail", citation="cross-run"),),
+        **_BASE,  # type: ignore[arg-type]
+    )
+    capped = enforce_confidence_floor(
+        out, has_strong_anchor=False, has_wiki_match=False, has_cross_run_signal=True
+    )
     assert capped.confidence == "medium"
 
 

@@ -153,24 +153,20 @@ class SlackClient:
 
     async def message_reactions(self, channel_id: str, timestamp: str) -> list[tuple[str, int]]:
         """Reactions on one message as (emoji_name, count) — feature 003 D
-        feedback loop. Reads the `reactions` field off the message via
-        `conversations.history` (scope `channels:history`/`groups:history`, which
-        we already hold) rather than `reactions.get` (which needs the separate
-        `reactions:read` scope). Empty list when the message has no reactions."""
+        feedback loop. The bot's triage is a THREAD REPLY, which
+        `conversations.history` does not return; `conversations.replies` with the
+        message's own ts does (and works for a top-level message too). Reads the
+        `reactions` field off it — scope `channels:history`/`groups:history`
+        (held), not the separate `reactions:read`. Empty when none."""
         data = await self._call(
-            "conversations.history",
-            {
-                "channel": channel_id,
-                "latest": timestamp,
-                "oldest": timestamp,
-                "inclusive": "true",
-                "limit": "1",
-            },
+            "conversations.replies",
+            {"channel": channel_id, "ts": timestamp, "limit": "1"},
         )
         messages = _messages(data)
-        if not messages:
+        target = next((m for m in messages if str(m.get("ts")) == timestamp), None)
+        if target is None:
             return []
-        reactions = messages[0].get("reactions")
+        reactions = target.get("reactions")
         out: list[tuple[str, int]] = []
         if isinstance(reactions, list):
             for r in cast("list[Any]", reactions):

@@ -465,6 +465,7 @@ def instantiate_trigger(
             poll_interval_seconds=float(sca_entry.poll_interval_seconds),
             max_per_cycle=sca_entry.max_per_cycle,
             staleness_seconds=float(sca_entry.staleness_seconds),
+            thread_lookback_seconds=float(sca_entry.thread_lookback_seconds),
             clock=slack_ci_alert_deps.clock,
             pause_check=slack_ci_alert_deps.pause_check,
             permanent_failure_reporter=slack_ci_alert_deps.permanent_failure_reporter,

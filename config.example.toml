@@ -136,6 +136,10 @@ max_per_cycle = 20
 # Gap > this many seconds ⇒ re-seed the cursor instead of back-filling stale
 # runs after a long outage / laptop sleep / pause (6 h default).
 staleness_seconds = 21600
+# Late-thread-reply recovery: re-scan threaded parents up to this many seconds
+# old whose newest reply is past the cursor. Catches "premerge fail" posts whose
+# run URL lands in a reply after the parent scrolled past. 0 disables (1 h).
+thread_lookback_seconds = 3600
 
 # ─── Handlers ──────────────────────────────────────────────────────────────────
 # Manifest fields here override the handler's compile-time defaults.

@@ -167,6 +167,11 @@ class SlackCiAlertTriggerEntry(TriggerEntry):
     # Gap > this many seconds ⇒ re-seed the cursor instead of back-filling
     # stale runs after an outage / laptop sleep / long pause (6 h default).
     staleness_seconds: int = 21600
+    # #1 late-thread-reply recovery: re-scan threaded parents up to this many
+    # seconds old whose newest reply is past the cursor (humans post "premerge
+    # fail" then drop the run URL in a reply minutes later). 0 disables. 1 h
+    # default comfortably covers a reply landing after its parent scrolled past.
+    thread_lookback_seconds: int = 3600
 
 
 class HandlerEntry(BaseModel):
@@ -281,7 +286,7 @@ class CiTriageHandlerEntry(HandlerEntry):
     # that sharpens owner_area. Empty → disabled. Best-effort; never fails triage.
     dmesg_timeline_script: str = ""
     # P2 recurrence: count prior posted triages with the same host-agnostic
-    # signature in the window → "🔁 7일 N회". Audit-only, no secrets needed.
+    # signature in the window → "재발 7일 N회". Audit-only, no secrets needed.
     recurrence_enabled: bool = True
     recurrence_window_days: int = 7
     # P2/P4 ticket search: surface already-open Jira (SSWCI/SDOC) + Linear (DOLIN)

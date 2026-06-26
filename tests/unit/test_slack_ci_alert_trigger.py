@@ -83,7 +83,12 @@ def _msg(ts: str, *, candidate: bool = True) -> dict[str, Any]:
 
 
 def _trigger(
-    slack: _FakeSlack, db_path: Path, clock: _Clock, *, max_per_cycle: int = 20
+    slack: _FakeSlack,
+    db_path: Path,
+    clock: _Clock,
+    *,
+    max_per_cycle: int = 20,
+    thread_lookback_seconds: float = 0.0,
 ) -> SlackCiAlertTrigger:
     def _sf() -> Any:
         return storage.connection(db_path)
@@ -95,6 +100,7 @@ def _trigger(
         poll_interval_seconds=120.0,
         max_per_cycle=max_per_cycle,
         staleness_seconds=21600.0,
+        thread_lookback_seconds=thread_lookback_seconds,
         clock=clock,
     )
 
@@ -167,6 +173,52 @@ async def test_advance_past_chatter(tmp_path: Path) -> None:
     assert out.emitted == 0
     assert await _count_events(db_path) == 0
     assert await _cursor_ts(db_path) == _ts(60)  # advanced past chatter
+
+
+async def test_late_reply_to_passed_parent_recovered(tmp_path: Path) -> None:
+    """#1: a human posts 'premerge fail' (no link) → it passes the cursor as
+    chatter; the run-URL reply lands later. `conversations.history` never returns
+    that reply nor resurfaces the parent, so without the late-reply re-check the
+    alert is lost. With thread_lookback set, the next poll recovers it — once."""
+    db_path = await _init_db(tmp_path)
+    parent = _msg(_ts(100), candidate=False)  # 'premerge fail', no link yet
+    slack = _FakeSlack(messages={_CH: [parent]})
+    trig = _trigger(slack, db_path, _Clock(_dt(200)), thread_lookback_seconds=3600.0)
+
+    await trig.poll_once()  # cold-start seed at _ts(100); parent now ≤ cursor
+    assert await _count_events(db_path) == 0
+
+    # The run-URL reply arrives in the parent's thread (not a top-level message).
+    slack.thread_replies[_ts(100)] = [_msg(_ts(150))]
+    parent["reply_count"] = 1
+    parent["latest_reply"] = _ts(150)
+
+    out = await trig.poll_once()
+    assert out.late == 1 and out.emitted == 0  # recovered by the late pass
+    assert await _count_events(db_path) == 1
+    assert await _cursor_ts(db_path) == _ts(100)  # cursor NOT moved by the late pass
+
+    out2 = await trig.poll_once()  # idempotent — dedup blocks a second emit
+    assert out2.late == 0
+    assert await _count_events(db_path) == 1
+
+
+async def test_late_reply_disabled_when_lookback_zero(tmp_path: Path) -> None:
+    """thread_lookback_seconds=0 (default) → late-reply recovery is off; a reply to
+    an already-passed parent stays lost (documents the opt-in boundary)."""
+    db_path = await _init_db(tmp_path)
+    parent = _msg(_ts(100), candidate=False)
+    slack = _FakeSlack(messages={_CH: [parent]})
+    trig = _trigger(slack, db_path, _Clock(_dt(200)))  # lookback defaults to 0
+
+    await trig.poll_once()  # seed at _ts(100)
+    slack.thread_replies[_ts(100)] = [_msg(_ts(150))]
+    parent["reply_count"] = 1
+    parent["latest_reply"] = _ts(150)
+
+    out = await trig.poll_once()
+    assert out.late == 0
+    assert await _count_events(db_path) == 0
 
 
 async def test_max_per_cycle_cap(tmp_path: Path) -> None:

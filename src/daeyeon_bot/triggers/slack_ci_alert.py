@@ -17,6 +17,12 @@ channel, applies the 5-case state machine (plan §Trigger state machine):
   CASE 5   PAUSE active                → skip the read entirely (no API call, no
                                           cursor move, no emit).
 
+After the cursor scan, a LATE-REPLY re-check (#1) re-scans threaded parents up to
+`thread_lookback_seconds` old whose `latest_reply` is newer than the cursor: a
+human "premerge fail" parent can pass the cursor as chatter before its run-URL
+reply lands, and `conversations.history` neither returns replies nor resurfaces
+the parent. This pass recovers those without moving the cursor (dedup-idempotent).
+
 Errors: AuthError → re-raise (halts daemon); RateLimit/Transient/Permanent →
 log + continue (Permanent also reported to the supervisor for quarantine).
 """
@@ -80,6 +86,7 @@ class _PollOutcome:
     seeded: int = 0
     reseeded: int = 0
     feedback: int = 0
+    late: int = 0  # emits recovered by the late-thread-reply re-check (#1)
 
 
 @dataclass(slots=True)
@@ -93,6 +100,9 @@ class SlackCiAlertTrigger:
     max_per_cycle: int
     staleness_seconds: float
     clock: Clock
+    # #1 late-thread-reply recovery: re-scan threaded parents up to this many
+    # seconds old whose `latest_reply` is newer than the cursor. 0 disables.
+    thread_lookback_seconds: float = 0.0
     manifest: TriggerManifest = MANIFEST
     pause_check: Callable[[], bool] = _never_paused
     permanent_failure_reporter: PermanentFailureReporter | None = None
@@ -129,20 +139,24 @@ class SlackCiAlertTrigger:
                     seeded=outcome.seeded,
                     reseeded=outcome.reseeded,
                     feedback=outcome.feedback,
+                    late=outcome.late,
                 )
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def poll_once(self) -> _PollOutcome:
         """One observe-and-emit pass across all channels, then a feedback pass
         (feature 003 D) reconciling reactions on recently-posted triages."""
-        emitted = seeded = reseeded = 0
+        emitted = seeded = reseeded = late = 0
         for channel_id in self.channels:
             result = await self._poll_channel(channel_id)
             emitted += result.emitted
             seeded += result.seeded
             reseeded += result.reseeded
+            late += result.late
         feedback = await self._collect_feedback()
-        return _PollOutcome(emitted=emitted, seeded=seeded, reseeded=reseeded, feedback=feedback)
+        return _PollOutcome(
+            emitted=emitted, seeded=seeded, reseeded=reseeded, feedback=feedback, late=late
+        )
 
     async def _collect_feedback(self) -> int:
         """Reconcile ✅/❌ reactions on posted triages into accuracy data. Best-
@@ -189,63 +203,134 @@ class SlackCiAlertTrigger:
                     _log.warning("slack_ci_alert.stale_cursor_reseed", channel=channel_id)
                     return _PollOutcome(reseeded=1)
 
-            # Fetch everything newer than the cursor (oldest→newest).
-            messages = await self._fetch_since(channel_id, cursor.last_seen_ts)
-            if not messages:
-                await slack_ci_alert_state.touch(conn, channel_id=channel_id, now_iso=now_iso)
-                await conn.commit()
-                return _PollOutcome()
+            # Normal operation: scan new messages (advances the cursor), then a
+            # late-reply re-check for older threaded parents (does NOT touch the
+            # cursor — dedup keeps it idempotent). #1.
+            emitted = await self._scan_new_messages(conn, channel_id, cursor, now, now_iso)
+            late = await self._recheck_late_threads(
+                conn, channel_id=channel_id, cursor_ts=cursor.last_seen_ts, now=now
+            )
+            return _PollOutcome(emitted=emitted, late=late)
 
-            newest_ts = messages[-1]["ts"]
-            # Thread-aware candidacy: a candidate is a top-level message that is
-            # itself a CI-failure alert, OR one whose thread replies carry the run
-            # link (humans post "premerge fail" then drop the run URL in a reply).
-            # Each candidate keeps the raw_blob that actually carries the evidence.
-            candidates: list[tuple[dict[str, Any], str]] = []
-            for msg in messages:
-                raw_blob, is_candidate = await self._thread_candidacy(channel_id, msg)
-                if is_candidate:
-                    candidates.append((msg, raw_blob))
+    async def _scan_new_messages(
+        self,
+        conn: aiosqlite.Connection,
+        channel_id: str,
+        cursor: slack_ci_alert_state.CursorRow,
+        now: Any,
+        now_iso: str,
+    ) -> int:
+        """CASE 2/3/4 — fetch everything newer than the cursor and emit candidates,
+        advancing the high-water cursor. Returns the emit count."""
+        # Fetch everything newer than the cursor (oldest→newest).
+        messages = await self._fetch_since(channel_id, cursor.last_seen_ts)
+        if not messages:
+            await slack_ci_alert_state.touch(conn, channel_id=channel_id, now_iso=now_iso)
+            await conn.commit()
+            return 0
 
-            # CASE 3 — new messages but no candidates: advance past the chatter.
-            if not candidates:
-                await slack_ci_alert_state.advance_cursor(
-                    conn, channel_id=channel_id, last_seen_ts=newest_ts, now_iso=now_iso
-                )
-                await conn.commit()
-                return _PollOutcome()
+        newest_ts = messages[-1]["ts"]
+        # Thread-aware candidacy: a candidate is a top-level message that is
+        # itself a CI-failure alert, OR one whose thread replies carry the run
+        # link (humans post "premerge fail" then drop the run URL in a reply).
+        # Each candidate keeps the raw_blob that actually carries the evidence.
+        candidates: list[tuple[dict[str, Any], str]] = []
+        for msg in messages:
+            raw_blob, is_candidate = await self._thread_candidacy(channel_id, msg)
+            if is_candidate:
+                candidates.append((msg, raw_blob))
 
-            # CASE 2 — emit per candidate (capped), advancing the cursor per
-            # candidate in its own transaction so a mid-cycle crash leaves the
-            # unemitted remainder re-readable with no skip / no double-emit.
-            emit_list = candidates[: self.max_per_cycle]
-            capped = len(candidates) > self.max_per_cycle
-            emitted = 0
-            for msg, raw_blob in emit_list:
-                if await self._emit_event(
-                    conn, channel_id=channel_id, msg=msg, raw_blob=raw_blob, now=now
-                ):
-                    emitted += 1
-                await slack_ci_alert_state.advance_cursor(
-                    conn, channel_id=channel_id, last_seen_ts=msg["ts"], now_iso=now_iso
-                )
-                await conn.commit()
+        # CASE 3 — new messages but no candidates: advance past the chatter.
+        if not candidates:
+            await slack_ci_alert_state.advance_cursor(
+                conn, channel_id=channel_id, last_seen_ts=newest_ts, now_iso=now_iso
+            )
+            await conn.commit()
+            return 0
 
-            if capped:
-                _log.warning(
-                    "slack_ci_alert.max_per_cycle_hit",
-                    channel=channel_id,
-                    cap=self.max_per_cycle,
-                    collected=len(candidates),
-                )
-                # cursor stopped at the last EMITTED candidate; remainder next cycle.
-            else:
-                # All candidates emitted — consume trailing chatter up to newest.
-                await slack_ci_alert_state.advance_cursor(
-                    conn, channel_id=channel_id, last_seen_ts=newest_ts, now_iso=now_iso
-                )
+        # CASE 2 — emit per candidate (capped), advancing the cursor per
+        # candidate in its own transaction so a mid-cycle crash leaves the
+        # unemitted remainder re-readable with no skip / no double-emit.
+        emit_list = candidates[: self.max_per_cycle]
+        capped = len(candidates) > self.max_per_cycle
+        emitted = 0
+        for msg, raw_blob in emit_list:
+            if await self._emit_event(
+                conn, channel_id=channel_id, msg=msg, raw_blob=raw_blob, now=now
+            ):
+                emitted += 1
+            await slack_ci_alert_state.advance_cursor(
+                conn, channel_id=channel_id, last_seen_ts=msg["ts"], now_iso=now_iso
+            )
+            await conn.commit()
+
+        if capped:
+            _log.warning(
+                "slack_ci_alert.max_per_cycle_hit",
+                channel=channel_id,
+                cap=self.max_per_cycle,
+                collected=len(candidates),
+            )
+            # cursor stopped at the last EMITTED candidate; remainder next cycle.
+        else:
+            # All candidates emitted — consume trailing chatter up to newest.
+            await slack_ci_alert_state.advance_cursor(
+                conn, channel_id=channel_id, last_seen_ts=newest_ts, now_iso=now_iso
+            )
+            await conn.commit()
+        return emitted
+
+    async def _recheck_late_threads(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        channel_id: str,
+        cursor_ts: str,
+        now: Any,
+    ) -> int:
+        """#1 — recover a CI-failure reply added to a thread whose PARENT already
+        passed the cursor as chatter.
+
+        `conversations.history` neither returns thread replies nor resurfaces an
+        old parent when a new reply lands, so a human "premerge fail" parent that
+        was consumed as chatter (run URL not posted yet) is lost once its reply
+        arrives. We re-scan a `thread_lookback_seconds` window for threaded parents
+        OLDER than the cursor whose `latest_reply` is newer than it, re-run
+        candidacy, and emit. The cursor is NOT moved — the dedup constraint
+        (`UNIQUE(source, source_dedup_key)` on the parent ts) makes a re-emit a
+        no-op, so re-checking the same thread each cycle is safe. Bounded by the
+        lookback window (own-ts based, so a parent older than the window is not
+        recoverable) and `max_per_cycle` thread fetches."""
+        if self.thread_lookback_seconds <= 0:
+            return 0
+        cursor_secs = _ts_seconds(cursor_ts)
+        oldest = now.timestamp() - self.thread_lookback_seconds
+        page = await self.slack.history(channel_id, oldest=f"{oldest:.6f}", limit=100)
+        emitted = checked = 0
+        for msg in page.messages:
+            if checked >= self.max_per_cycle:
+                break
+            own_ts = _ts_seconds(str(msg.get("ts", "")))
+            # Parents newer than the cursor are handled by _scan_new_messages.
+            if own_ts > cursor_secs:
+                continue
+            if int(msg.get("reply_count", 0) or 0) <= 0:
+                continue
+            # Only threads with a reply newer than the cursor have anything new.
+            if _ts_seconds(str(msg.get("latest_reply", ""))) <= cursor_secs:
+                continue
+            checked += 1
+            raw_blob, is_candidate = await self._thread_candidacy(channel_id, msg)
+            if not is_candidate:
+                continue
+            if await self._emit_event(
+                conn, channel_id=channel_id, msg=msg, raw_blob=raw_blob, now=now
+            ):
                 await conn.commit()
-            return _PollOutcome(emitted=emitted)
+                emitted += 1
+        if emitted:
+            _log.info("slack_ci_alert.late_reply_recovered", channel=channel_id, emitted=emitted)
+        return emitted
 
     async def _thread_candidacy(self, channel_id: str, msg: dict[str, Any]) -> tuple[str, bool]:
         """Return (raw_blob, is_candidate) for a top-level message, looking into

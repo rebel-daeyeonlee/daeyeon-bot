@@ -442,10 +442,7 @@ class CiTriageHandler:
             if alert.run_ref
             else "(no run link)"
         )
-        text = (
-            f"🤖 CI Triage: alert를 확인했지만 {reason} — 수동 triage가 필요합니다."
-            f"  {run_link}\n🤖 daeyeon-bot"
-        )
+        text = f"CI Triage: alert를 확인했지만 {reason} — 수동 triage가 필요합니다.\n🔗 {run_link}"
         try:
             await self.slack.post_message(
                 target, text, thread_ts=thread_ts, username="CI Triage", icon_emoji=":robot_face:"
@@ -513,8 +510,8 @@ class CiTriageHandler:
     async def _recurrence_line(
         self, *, signature: str, message_ts: str, now: datetime
     ) -> str | None:
-        """P2: "🔁 동일 시그니처 7일 N회" when prior posted triages share the
-        signature. Audit-only (no secrets); best-effort."""
+        """P2: "재발 7일 N회" when prior posted triages share the signature.
+        Audit-only (no secrets); best-effort."""
         if not self.config.recurrence_enabled or not signature:
             return None
         since = (now - timedelta(days=self.config.recurrence_window_days)).isoformat()
@@ -527,7 +524,7 @@ class CiTriageHandler:
             return None
         if prior < 1:
             return None
-        return f"🔁 동일 시그니처 {self.config.recurrence_window_days}일 {prior + 1}회"
+        return f"재발 {self.config.recurrence_window_days}일 {prior + 1}회"
 
     async def _ticket_search(self, *, dut_host: str | None, triage: TriageOutput) -> list[str]:
         """P2/P4: open Jira (SSWCI/SDOC) + Linear (DOLIN) issues matching the
@@ -894,17 +891,26 @@ def _ticket_draft(t: TriageOutput, tickets: list[str], *, enabled: bool) -> str 
     one-clicks "create from message". None when not applicable."""
     if not enabled or tickets or t.attribution != "infra_env" or t.confidence == "low":
         return None
-    return f'🆕 신규 SSWCI bug 제안: "{t.headline}" (infra_env/{t.owner_area})'
+    return f'신규 SSWCI bug 제안: "{t.headline}" (infra_env/{t.owner_area})'
 
 
 _CIRCLED_RE = re.compile(r"[①-⑳]")  # ① .. ⑳
 
+# Functional (not decorative) icons — the attribution glyph and the rerun verdict
+# are the two signals on-call scans first. Everything else is a text label.
 _ATTR_EMOJI = {
     "infra_env": "🔧",
     "product_regression": "🐛",
     "flaky": "🎲",
     "unknown": "❓",
 }
+_ATTR_KO = {
+    "infra_env": "인프라/환경",
+    "product_regression": "제품 회귀",
+    "flaky": "flaky (불안정)",
+    "unknown": "분류 불가",
+}
+_CONF_KO = {"low": "낮음", "medium": "보통", "high": "높음"}
 
 
 def _action_items(text: str) -> list[str]:
@@ -925,11 +931,26 @@ def _action_items(text: str) -> list[str]:
 
 
 _RERUN_KR = {
-    "safe_to_rerun": "rerun 가능",
-    "do_not_rerun": "rerun 금지",
-    "needs_investigation": "rerun 보류",
-    "unknown": "rerun 판단불가",
+    "safe_to_rerun": "✅ rerun 가능",
+    "do_not_rerun": "🛑 rerun 금지",
+    "needs_investigation": "🔍 조사 필요 · rerun 보류",
+    "unknown": "❔ rerun 판단 불가",
 }
+
+
+def _evidence_box(evidence: tuple[Any, ...], *, limit: int) -> list[str]:
+    """The log-grounded evidence as a Slack code box — each entry is a `# citation`
+    comment line followed by the real log quote. This is the trust anchor: on-call
+    verifies the bot's classification against the actual lines, not its word."""
+    if not evidence:
+        return []
+    body: list[str] = []
+    for e in evidence[:limit]:
+        citation = e.citation.strip()
+        if citation:
+            body.append(f"# {citation}")
+        body.append(_truncate(e.quote.strip(), 200))
+    return ["*근거*", "```", *body, "```"]
 
 
 def _render_slack_body(
@@ -942,21 +963,44 @@ def _render_slack_body(
     tickets: list[str] | None = None,
     ticket_draft: str | None = None,
 ) -> str:
-    """Adaptive mrkdwn — terse by default, detailed only when a human must dig.
+    """Decision-first mrkdwn built around the on-call reading order:
+    *내 문제야?* (head: attribution + owner) → *rerun 돼?* (판단) → *왜?* (원인) →
+    *진짜 뭐가 터졌나?* (근거 code box) → *전에 본 거?* (맥락) → *어디 파나?* (run).
 
-    A confident call renders ~5 lines (verdict · context · decision · run). A
-    low-confidence or `unknown` call appends a short detail block (top evidence
-    line + summary) because on-call has to investigate it by hand.
+    `likely_cause` / `log_evidence` are surfaced on EVERY call (the model produces
+    them each time; hiding them threw away the analysis). Confidence only controls
+    DEPTH — a low-confidence / `unknown` call adds secondary action items, the full
+    summary, wiki refs, and a "사람이 검증" prompt that feeds the reaction loop.
 
     `cross_run` (P1), `recurrence`/`tickets`/`ticket_draft` (P2/P4) are optional
     high-signal context lines populated by later evidence stages; absent →
     omitted."""
     emoji = _ATTR_EMOJI.get(t.attribution, "•")
+    attr_ko = _ATTR_KO.get(t.attribution, t.attribution)
+    conf_ko = _CONF_KO.get(t.confidence, t.confidence)
     actions = _action_items(t.recommended_action)
     detailed = t.confidence == "low" or t.attribution == "unknown"
 
-    lines = [f"{emoji} *{t.attribution}* ({t.confidence}) · {t.headline}"]
+    # ① 내 문제야? — verdict meta + bold headline.
+    owner = f" · 담당 {t.owner_area}" if t.owner_area not in ("Unknown", "") else ""
+    lines = [f"{emoji} {attr_ko} · 신뢰도 {conf_ko}{owner}", f"*{t.headline}*"]
 
+    # ② rerun 돼? — the decision, with the top action inline.
+    rerun_kr = _RERUN_KR.get(t.rerun_advice, t.rerun_advice)
+    decision = f"*판단:* {rerun_kr}"
+    if actions:
+        decision += f" — {_truncate(actions[0], 120)}"
+    lines.append(decision)
+
+    # ③ 왜? — cause (and known remedy when the playbook gives one). Always shown.
+    lines.append(f"*원인:* {_truncate(t.likely_cause.strip(), 240)}")
+    if t.known_remedy and t.known_remedy.strip():
+        lines.append(f"*해법:* {_truncate(t.known_remedy.strip(), 240)}")
+
+    # ④ 진짜 뭐가 터졌나? — real log lines in a code box (trust anchor).
+    lines += _evidence_box(t.log_evidence, limit=3 if detailed else 2)
+
+    # ⑤ 전에 본 거? — cross-run / recurrence / tickets context.
     ctx = " · ".join(p for p in (cross_run, recurrence) if p)
     if ctx:
         lines.append(ctx)
@@ -965,34 +1009,31 @@ def _render_slack_body(
     elif ticket_draft:
         lines.append(ticket_draft)
 
-    rerun_kr = _RERUN_KR.get(t.rerun_advice, t.rerun_advice)
-    decision = f"↪️ *{rerun_kr}*"
-    if actions:
-        decision += f" — {_truncate(actions[0], 120)}"
-    lines.append(decision)
-
+    # Detail block — only when on-call must investigate by hand.
     if detailed:
-        lines += [f"   • {_truncate(step, 120)}" for step in actions[1:]]
-        if t.log_evidence:
-            e = t.log_evidence[0]
-            lines.append(f"🧾 `{_truncate(e.quote.strip(), 140)}` — {e.citation}")
-        lines.append(f"📋 {_truncate(t.summary, 240)}")
+        if actions[1:]:
+            lines.append("*다음 확인:*")
+            lines += [f"• {_truncate(step, 120)}" for step in actions[1:]]
         wiki_lines = [m.path.rsplit("/", 1)[-1] for m in wiki_matches[:2]]
         if wiki_lines:
-            lines.append("📚 " + " · ".join(wiki_lines))
+            lines.append("참고: " + " · ".join(wiki_lines))
+        lines.append(f"요약: {_truncate(t.summary, 240)}")
+        if t.confidence == "low" or t.needs_human:
+            lines.append("⚠️ 신뢰도 낮음 — 사람이 검증 필요 (맞으면 ✅ / 틀리면 ❌)")
 
+    # ⑥ 어디 파나? — run link.
     lines.append(_footer_line(alert))
     return "\n".join(lines)
 
 
 def _footer_line(alert: ParsedAlert) -> str:
-    """One-line footer: run link (repo #PR) + bot signature."""
+    """One-line footer: run link (repo #PR), or a plain signature when no run."""
     if alert.run_ref is None:
-        return "🤖 daeyeon-bot"
+        return "daeyeon-bot"
     run_link = f"https://github.com/{alert.run_ref.repo}/actions/runs/{alert.run_ref.run_id}"
     repo_short = alert.run_ref.repo.rsplit("/", 1)[-1]
     pr = f" #{alert.pr_number}" if alert.pr_number is not None else ""
-    return f"🔗 <{run_link}|{repo_short}{pr}> · 🤖 daeyeon-bot"
+    return f"🔗 <{run_link}|{repo_short}{pr}>"
 
 
 def _truncate(text: str, limit: int) -> str:

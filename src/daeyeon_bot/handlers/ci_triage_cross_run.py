@@ -53,17 +53,19 @@ class CrossRunResult:
         return self.verdict in ("systemic", "isolated")
 
     def summary_ko(self) -> str | None:
-        """The one-line `🔬` Slack/prompt context, or None when inconclusive with
-        no usable comparison (nothing worth a line)."""
+        """The one-line cross-run Slack/prompt context (`교차:` label), or None when
+        inconclusive with no usable comparison (nothing worth a line)."""
         if self.verdict == "systemic":
             return (
-                f"🔬 동일 workflow 최근 다른 PR {self.others_total}건 중 "
+                f"교차: 동일 workflow 최근 다른 PR {self.others_total}건 중 "
                 f"{self.others_failed}건 fail → 환경·인프라 유력"
             )
         if self.verdict == "isolated":
-            return f"🔬 최근 다른 PR {self.others_total}건 모두 통과, 이 PR만 fail → 코드 회귀 유력"
+            return (
+                f"교차: 최근 다른 PR {self.others_total}건 모두 통과, 이 PR만 fail → 코드 회귀 유력"
+            )
         if self.verdict == "mixed":
-            return f"🔬 동일 workflow 최근 다른 PR {self.others_failed}/{self.others_total} fail (혼재)"
+            return f"교차: 동일 workflow 최근 다른 PR {self.others_failed}/{self.others_total} fail (혼재)"
         return None
 
     def prompt_block(self) -> str:

@@ -237,8 +237,11 @@ async def test_manual_fire_happy_path_posts_dry_run(tmp_path: Path) -> None:
         assert len(slack.posts) == 1
         assert slack.posts[0]["channel"] == "C_DRY"
         assert slack.posts[0]["thread_ts"] is None
-        assert "infra_env" in slack.posts[0]["text"]
-        assert "🤖 daeyeon-bot" in slack.posts[0]["text"]
+        assert "🔧 인프라/환경" in slack.posts[0]["text"]
+        assert (
+            "🔗 <https://github.com/rebellions-sw/ssw-bundle/actions/runs/"
+            in slack.posts[0]["text"]
+        )
 
         audit = await find_latest_for_message(
             conn, channel_id="manual:rebellions-sw/ssw-bundle", message_ts="27758520154"
@@ -293,14 +296,14 @@ async def test_cross_run_systemic_line_posted(tmp_path: Path) -> None:
             ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE])))
         )
         assert isinstance(result, Ack)
-        assert "🔬" in slack.posts[0]["text"]
+        assert "교차:" in slack.posts[0]["text"]
         assert "환경·인프라 유력" in slack.posts[0]["text"]
     finally:
         await conn.close()
 
 
 async def test_recurrence_line_when_signature_seen_before(tmp_path: Path) -> None:
-    """P2: a prior posted triage with the same signature → 🔁 N회 line."""
+    """P2: a prior posted triage with the same signature → 재발 N회 line."""
     from daeyeon_bot.handlers.ci_triage import _failure_signature
     from daeyeon_bot.infra.ci_triage_audit import insert_audit
 
@@ -330,7 +333,7 @@ async def test_recurrence_line_when_signature_seen_before(tmp_path: Path) -> Non
         handler = _make_handler(conn, slack=slack, gh=_FakeGh(), wiki=_FakeWiki())
         await handler.handle(ev, _FakeCtx(FakeFactory(FakeClaudeSession(responses=[_GOOD_TRIAGE]))))
         text = slack.posts[0]["text"]
-        assert "🔁" in text and "2회" in text
+        assert "재발" in text and "2회" in text
     finally:
         await conn.close()
 
@@ -475,12 +478,12 @@ def test_render_shows_ticket_draft_when_no_tickets() -> None:
 
     alert, t, wiki = _render_fixture()
     out = _render_slack_body(
-        alert, t, wiki, ticket_draft='🆕 신규 SSWCI bug 제안: "x" (infra_env/SysFw)'
+        alert, t, wiki, ticket_draft='신규 SSWCI bug 제안: "x" (infra_env/SysFw)'
     )
-    assert "🆕 신규 SSWCI bug 제안" in out
+    assert "신규 SSWCI bug 제안" in out
     # tickets present → draft suppressed
-    out2 = _render_slack_body(alert, t, wiki, tickets=["SSWCI-9 (open)"], ticket_draft="🆕 nope")
-    assert "🆕" not in out2 and "🎫 SSWCI-9" in out2
+    out2 = _render_slack_body(alert, t, wiki, tickets=["SSWCI-9 (open)"], ticket_draft="nope-draft")
+    assert "nope-draft" not in out2 and "🎫 SSWCI-9" in out2
 
 
 async def test_run_log_unavailable_skips(tmp_path: Path) -> None:
@@ -815,38 +818,43 @@ def _render_fixture() -> tuple[Any, Any, list[Any]]:
 
 
 def test_render_slack_body_terse_when_confident() -> None:
-    """A medium/high-confidence call is terse: verdict head + decision + footer,
-    no 요약/추정원인/근거 block, single top action only."""
+    """A medium/high-confidence call is decision-first: verdict head + 판단 + 원인 +
+    근거 code box + footer. No detail block (다음 확인 / 요약 / 검증 prompt), single
+    top action only. likely_cause and log_evidence are surfaced even when terse."""
     from daeyeon_bot.handlers.ci_triage import _render_slack_body
 
     alert, t, wiki = _render_fixture()
     out = _render_slack_body(alert, t, wiki)
 
-    assert out.startswith("🔧 *infra_env* (medium) · ssw-pc-21 heartbeat 0")
-    assert "↪️ *rerun 보류* — 단계 하나." in out  # rerun verdict + top action only
+    assert out.startswith("🔧 인프라/환경 · 신뢰도 보통 · 담당 SysFw\n*ssw-pc-21 heartbeat 0*")
+    assert "*판단:* 🔍 조사 필요 · rerun 보류 — 단계 하나." in out  # verdict + top action
+    assert "*원인:* 원인." in out  # cause always surfaced
+    # evidence in a code box, even when confident.
+    assert "*근거*\n```\n# kernel/ssw-pc-21\nheartbeat: 0\n```" in out
     assert "단계 둘." not in out  # secondary action hidden when confident
-    assert "📋" not in out and "🧾" not in out  # no detail block
-    # one-line footer: run link as <url|repo #PR>, no separate jobs line
+    assert "요약:" not in out and "다음 확인:" not in out  # no detail block
+    assert "⚠️" not in out  # no verify prompt when confident
+    # one-line footer: run link as <url|repo #PR>, no bot signature.
     assert (
         "🔗 <https://github.com/rebellions-sw/ssw-bundle/actions/runs/42|ssw-bundle #3539>" in out
     )
-    assert "🤖 daeyeon-bot" in out
 
 
 def test_render_slack_body_detailed_when_low_confidence() -> None:
-    """A low-confidence call appends the detail block (evidence + summary) and
-    lists secondary actions, because on-call must investigate by hand."""
+    """A low-confidence call appends the detail block (다음 확인 + 요약 + wiki +
+    verify prompt) and lists secondary actions, because on-call must dig by hand."""
     from daeyeon_bot.handlers.ci_triage import _render_slack_body
 
     alert, t, wiki = _render_fixture()
     t = t.model_copy(update={"confidence": "low"})
     out = _render_slack_body(alert, t, wiki)
 
-    assert "📋 요약문." in out
-    assert "🧾 `heartbeat: 0` — kernel/ssw-pc-21" in out
-    assert "• 단계 둘." in out  # secondary action shown in detail mode
-    assert "foo-bar.md" in out  # wiki basename, not full vault path
+    assert "요약: 요약문." in out
+    assert "*근거*\n```\n# kernel/ssw-pc-21\nheartbeat: 0\n```" in out
+    assert "*다음 확인:*\n• 단계 둘." in out  # secondary action shown in detail mode
+    assert "참고: foo-bar.md" in out  # wiki basename, not full vault path
     assert "wiki/oncall/incidents/foo-bar.md" not in out
+    assert "⚠️ 신뢰도 낮음 — 사람이 검증 필요" in out  # feeds the reaction loop
 
 
 def test_render_slack_body_context_lines() -> None:
@@ -859,10 +867,10 @@ def test_render_slack_body_context_lines() -> None:
         alert,
         t,
         wiki,
-        cross_run="🔬 동일 host 최근 5 run 4 fail (PR 무관)",
-        recurrence="🔁 7일 3회",
+        cross_run="교차: 동일 host 최근 5 run 4 fail (PR 무관)",
+        recurrence="재발 7일 3회",
         tickets=["SSWCI-17228 (open)"],
     )
 
-    assert "🔬 동일 host 최근 5 run 4 fail (PR 무관) · 🔁 7일 3회" in out
+    assert "교차: 동일 host 최근 5 run 4 fail (PR 무관) · 재발 7일 3회" in out
     assert "🎫 SSWCI-17228 (open)" in out

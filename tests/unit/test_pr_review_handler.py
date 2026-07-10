@@ -974,8 +974,8 @@ async def test_pause_guard_short_circuits_before_post(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_verdict_approve_emits_gh_approve_event(tmp_path: Path) -> None:
-    """`verdict=APPROVE` with empty `comments[]` posts a GitHub APPROVE review."""
+async def test_verdict_approve_posts_comment_not_gh_approve(tmp_path: Path) -> None:
+    """`verdict=APPROVE` posts a GitHub COMMENT — the bot never emits APPROVE."""
     fake_gh = FakeGh()
     fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
     factory = FakeFactory(
@@ -1001,8 +1001,11 @@ async def test_verdict_approve_emits_gh_approve_event(tmp_path: Path) -> None:
         assert isinstance(result, Ack)
         posted = fake_gh.posted_reviews()
         assert len(posted) == 1
-        assert posted[0]["event"] == "APPROVE"
+        # Operator policy: never a formal GitHub APPROVE, always COMMENT.
+        assert posted[0]["event"] == "COMMENT"
         assert posted[0]["comments"] == []
+        # A clean APPROVE verdict still earns the celebratory 곽철이 GIF.
+        assert "![곽철이 " in posted[0]["body"]
     finally:
         await conn.close()
 
@@ -1043,15 +1046,15 @@ async def test_verdict_pass_emits_gh_comment_event(tmp_path: Path) -> None:
         assert len(posted) == 1
         assert posted[0]["event"] == "COMMENT"
         assert len(posted[0]["comments"]) == 1
-        # COMMENT reviews stay text-only — no celebratory GIF.
-        assert "media.giphy.com" not in posted[0]["body"]
+        # A non-APPROVE verdict (findings present) stays text-only — no GIF.
+        assert "![곽철이 " not in posted[0]["body"]
     finally:
         await conn.close()
 
 
 @pytest.mark.asyncio
-async def test_approve_embeds_lgtm_gif_above_signoff(tmp_path: Path) -> None:
-    """A posted APPROVE carries a curated LGTM GIF; the sign-off stays last."""
+async def test_approve_embeds_celebrate_gif_above_signoff(tmp_path: Path) -> None:
+    """A clean APPROVE carries a 곽철이 GIF; the sign-off stays the last line."""
     fake_gh = FakeGh()
     fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
     factory = FakeFactory(
@@ -1077,10 +1080,10 @@ async def test_approve_embeds_lgtm_gif_above_signoff(tmp_path: Path) -> None:
         assert isinstance(result, Ack)
         posted = fake_gh.posted_reviews()
         assert len(posted) == 1
-        assert posted[0]["event"] == "APPROVE"
+        assert posted[0]["event"] == "COMMENT"
         body = posted[0]["body"]
-        assert "![LGTM: " in body
-        assert "https://media.giphy.com/media/" in body
+        assert "![곽철이 " in body
+        assert "https://media1.tenor.com/" in body
         # Sign-off invariant: GIF goes above it, sign-off remains the last line.
         last_non_empty = next(line for line in reversed(body.split("\n")) if line.strip())
         assert last_non_empty == "— daeyeon-bot 🐥"

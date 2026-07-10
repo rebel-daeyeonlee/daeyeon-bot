@@ -430,11 +430,12 @@ What changes when enabled:
 - The `gh_review_requested` trigger runs a second `author:<operator>`
   search each poll and unions those PRs into the observed set, so your
   own PRs flow through the same state machine + handler.
-- Self-authored reviews are **always submitted as GitHub `COMMENT`
-  events** — GitHub rejects a self-`APPROVE` with HTTP 422, so an
-  `APPROVE` verdict is downgraded to a COMMENT review carrying the same
-  (empty-comments) summary body. The review never counts toward branch
-  protection.
+- Reviews are **always submitted as GitHub `COMMENT` events** (own PRs
+  included) — the bot never submits a formal `APPROVE`, so a clean-pass
+  `APPROVE` verdict posts as a COMMENT carrying its (empty-comments)
+  summary body plus a celebratory 곽철이 GIF. No review counts toward
+  branch protection, and self-review is never blocked by GitHub's
+  self-`APPROVE` (HTTP 422) rejection.
 - The same `allowed_repos` boundary applies — own PRs outside the
   allowlist still land as `skipped_disallowed_repo`.
 

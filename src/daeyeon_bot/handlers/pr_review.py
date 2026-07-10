@@ -50,11 +50,11 @@ from daeyeon_bot.core.pr_review.audit import AuditRow
 from daeyeon_bot.core.pr_review.persona import Persona
 from daeyeon_bot.core.protocols import HandlerContext
 from daeyeon_bot.core.results import Ack, HandlerResult
+from daeyeon_bot.handlers.pr_review_celebrate import pick_celebrate_gif
 from daeyeon_bot.handlers.pr_review_diff import (
     is_anchor_in_hunk,
     parse_hunk_ranges,
 )
-from daeyeon_bot.handlers.pr_review_lgtm import pick_lgtm_gif
 from daeyeon_bot.handlers.pr_review_prompt import build_system_prompt
 from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment, ReviewOutput
@@ -424,21 +424,20 @@ class PrReviewHandler:
             )
             summary = header + "\n\n" + summary
 
-        # APPROVE → GH APPROVE event (counts toward branch protection);
-        # everything else → COMMENT. The schema validator already enforces
-        # `verdict=APPROVE ⇔ comments==[]`, so we trust the verdict field.
-        # Self-authored PRs (review_self) can never APPROVE — GitHub rejects a
-        # self-approval (HTTP 422) — so an APPROVE verdict is downgraded to a
-        # COMMENT review carrying the same (empty-comments) summary body.
-        is_self = sized.author_login == self.github_username
-        gh_event = "APPROVE" if (review.verdict == "APPROVE" and not is_self) else "COMMENT"
-        # House style: a real APPROVE earns a celebratory LGTM GIF in the
-        # Summary (operator preference). Only on the posted APPROVE event —
-        # COMMENT/REQUEST_CHANGES (incl. self-PRs downgraded to COMMENT) stay
-        # text-only. Inserted above the sign-off and after redaction; the GIF
-        # URL is a vetted constant so it can't trip the redaction guard.
-        if gh_event == "APPROVE":
-            summary = _insert_above_signoff(summary, pick_lgtm_gif(sized.head_sha))
+        # Operator policy: the bot NEVER submits a GitHub APPROVE event — every
+        # review posts as a COMMENT. APPROVE counts toward branch protection,
+        # too strong a signal to automate (and GitHub rejects a self-APPROVE
+        # with HTTP 422 anyway). The internal `verdict` still drives the summary
+        # tone and the celebratory GIF below; only the GH-facing event is fixed.
+        gh_event = "COMMENT"
+        # House style: a clean pass (verdict=APPROVE, zero findings) earns a
+        # celebratory 곽철이 GIF in the Summary (operator preference) — the
+        # lightweight "LGTM" marker now that no formal APPROVE is posted. Any
+        # finding (PASS/CONCERNS/FAIL) stays text-only. Inserted above the
+        # sign-off and after redaction; the GIF URL is a vetted constant so it
+        # can't trip the redaction guard.
+        if review.verdict == "APPROVE":
+            summary = _insert_above_signoff(summary, pick_celebrate_gif(sized.head_sha))
         posted = await self.gh.post_review(
             sized.repo,
             sized.pr_number,

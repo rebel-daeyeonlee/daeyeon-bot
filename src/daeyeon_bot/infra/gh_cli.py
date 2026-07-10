@@ -34,8 +34,10 @@ from daeyeon_bot.core.errors import (
 _DEFAULT_TIMEOUT = 30.0
 # GitHub Review API `event` values — see `/repos/.../pulls/.../reviews` docs.
 # `APPROVE` counts toward branch protection. `REQUEST_CHANGES` blocks merge —
-# we don't expose it here (too strong a signal for an automated bot). The
-# handler picks between `APPROVE` (0 findings) and `COMMENT` (any finding).
+# we don't expose it here (too strong a signal for an automated bot). By
+# operator policy the `pr_review` handler always posts `COMMENT` and never
+# selects `APPROVE`; the value stays in the type because this is a general
+# GitHub adapter, not because the bot emits it.
 ReviewEvent = Literal["APPROVE", "COMMENT"]
 
 # stderr patterns. `gh` writes "HTTP <code>" or "gh: <msg> (HTTP <code>)" depending

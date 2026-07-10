@@ -195,10 +195,10 @@ allowed_repos = []
 # Review the operator's OWN open PRs too (default false → own PRs are skipped
 # with audit.status = skipped_self_authored). When true, the trigger adds an
 # `author:<operator>` search and self-authored PRs flow through the same state
-# machine + handler, posted as GitHub COMMENT reviews (GitHub rejects a
-# self-APPROVE with HTTP 422, so an APPROVE verdict is downgraded to COMMENT).
-# Pair with a non-empty `allowed_repos` — with the empty allowlist above this
-# scoops up every open PR you have across all of GitHub.
+# machine + handler. (Every review — own or not — posts as a GitHub COMMENT;
+# the bot never submits a formal APPROVE event, so self-review is never blocked
+# by GitHub's self-APPROVE rejection.) Pair with a non-empty `allowed_repos` —
+# with the empty allowlist above this scoops up every open PR you have.
 review_self = false
 
 [handlers.pr_review.size_budget]

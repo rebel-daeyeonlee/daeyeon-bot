@@ -430,14 +430,46 @@ What changes when enabled:
 - The `gh_review_requested` trigger runs a second `author:<operator>`
   search each poll and unions those PRs into the observed set, so your
   own PRs flow through the same state machine + handler.
-- Reviews are **always submitted as GitHub `COMMENT` events** (own PRs
-  included) — the bot never submits a formal `APPROVE`, so a clean-pass
-  `APPROVE` verdict posts as a COMMENT carrying its (empty-comments)
-  summary body plus a celebratory 곽철이 GIF. No review counts toward
-  branch protection, and self-review is never blocked by GitHub's
-  self-`APPROVE` (HTTP 422) rejection.
+- **Your own PRs always post as GitHub `COMMENT`**, whatever
+  `approve_enabled` says — GitHub rejects a self-`APPROVE` with HTTP 422,
+  so the handler downgrades unconditionally and self-review can never be
+  blocked by it. A clean-pass `APPROVE` verdict on your own PR posts as a
+  COMMENT carrying its (empty-comments) summary body plus a celebratory
+  곽철이 GIF.
+- On **other people's** PRs the event depends on
+  `[handlers.pr_review].approve_enabled` (see below). With it off (the
+  default) nothing the bot posts counts toward branch protection.
 - The same `allowed_repos` boundary applies — own PRs outside the
   allowlist still land as `skipped_disallowed_repo`.
+
+### `approve_enabled` — formal GitHub APPROVE
+
+`[handlers.pr_review].approve_enabled = true` lets a clean pass
+(`verdict == "APPROVE"`, zero findings) on **someone else's** PR submit a
+real GitHub `APPROVE` review event.
+
+**This counts toward branch protection.** Under a "require N approving
+reviews" rule, the bot's approval can be one of those N — an automated
+review can unblock a merge. Treat enabling it as a policy decision.
+
+Unaffected by the knob (always `COMMENT`):
+
+- any verdict other than `APPROVE` (PASS / CONCERNS / FAIL);
+- every self-authored PR (the HTTP 422 guard above).
+
+To turn it off you only need a config edit plus a daemon restart — no code
+change:
+
+```bash
+# 1. config.toml → [handlers.pr_review] approve_enabled = false
+# 2. wait for in-flight reviews to drain, THEN restart. A review can run
+#    9-15 min, well past TimeoutStopSec=180, so restarting mid-review gets
+#    the claude subprocess SIGKILLed and dead-letters the row (exit 143).
+until [ "$(sqlite3 ~/.daeyeon-bot/state.db \
+  "SELECT COUNT(*) FROM outbox WHERE handler='pr_review' \
+   AND status IN ('running','pending');")" = 0 ]; do sleep 20; done
+systemctl --user restart daeyeon-bot
+```
 
 The search subject is the **GitHub login**, not an email. It resolves
 from `[github] username`, or — when that is blank (default) — from

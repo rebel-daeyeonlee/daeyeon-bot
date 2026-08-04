@@ -195,11 +195,22 @@ allowed_repos = []
 # Review the operator's OWN open PRs too (default false → own PRs are skipped
 # with audit.status = skipped_self_authored). When true, the trigger adds an
 # `author:<operator>` search and self-authored PRs flow through the same state
-# machine + handler. (Every review — own or not — posts as a GitHub COMMENT;
-# the bot never submits a formal APPROVE event, so self-review is never blocked
-# by GitHub's self-APPROVE rejection.) Pair with a non-empty `allowed_repos` —
-# with the empty allowlist above this scoops up every open PR you have.
+# machine + handler. Self-authored reviews always post as COMMENT, whatever
+# `approve_enabled` says — GitHub rejects a self-APPROVE with HTTP 422. Pair
+# with a non-empty `allowed_repos` — with the empty allowlist above this scoops
+# up every open PR you have.
 review_self = false
+
+# Submit a formal GitHub APPROVE review on a clean pass (verdict = APPROVE,
+# zero findings) for PRs authored by someone else.
+#
+#   APPROVE counts toward branch protection. With a "require N approving
+#   reviews" rule, a bot approval can be one of those N — i.e. this lets an
+#   automated review unblock a merge. Enable only if that is what you want.
+#
+# Unaffected by this knob (always COMMENT): PASS / CONCERNS / FAIL verdicts,
+# and every self-authored PR. Default false keeps the bot advisory-only.
+approve_enabled = false
 
 [handlers.pr_review.size_budget]
 max_lines = 1000      # additions + deletions across all changed files

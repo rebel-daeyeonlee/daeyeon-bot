@@ -215,13 +215,19 @@ class PrReviewHandlerEntry(HandlerEntry):
     # falls back to handler-only filtering.
     allowed_repos: list[str] = Field(default_factory=list)
     # When true, also review the operator's OWN open PRs (discovered via an
-    # `author:<operator>` search in the trigger). Every review posts as a GitHub
-    # `COMMENT` event (the bot never submits a formal APPROVE), so self-review is
-    # never blocked by GitHub's self-`APPROVE` rejection. Pairs best with a
-    # non-empty `allowed_repos`: with an empty allowlist this scoops up every
-    # open PR you have across all of GitHub. Default false preserves the
-    # `skipped_self_authored` behavior.
+    # `author:<operator>` search in the trigger). Self-authored reviews always
+    # post as `COMMENT` regardless of `approve_enabled` — GitHub rejects a
+    # self-`APPROVE` with HTTP 422. Pairs best with a non-empty `allowed_repos`:
+    # with an empty allowlist this scoops up every open PR you have across all
+    # of GitHub. Default false preserves the `skipped_self_authored` behavior.
     review_self: bool = False
+    # When true, a clean pass (`verdict == "APPROVE"`, zero findings) on a PR
+    # authored by SOMEONE ELSE submits a formal GitHub `APPROVE` review event.
+    # This counts toward branch protection — an automated approval can satisfy
+    # a required-review rule, so treat it as a policy decision, not a cosmetic
+    # one. Everything else (PASS/CONCERNS/FAIL, and every self-authored PR)
+    # still posts as `COMMENT`. Default false keeps the bot advisory-only.
+    approve_enabled: bool = False
 
 
 class JiraTriageHandlerEntry(HandlerEntry):

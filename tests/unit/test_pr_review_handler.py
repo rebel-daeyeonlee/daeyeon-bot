@@ -974,8 +974,8 @@ async def test_pause_guard_short_circuits_before_post(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_verdict_approve_posts_comment_not_gh_approve(tmp_path: Path) -> None:
-    """`verdict=APPROVE` posts a GitHub COMMENT — the bot never emits APPROVE."""
+async def test_verdict_approve_posts_comment_when_approve_disabled(tmp_path: Path) -> None:
+    """With `approve_enabled=False` (the default) a clean APPROVE stays a COMMENT."""
     fake_gh = FakeGh()
     fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
     factory = FakeFactory(
@@ -1001,11 +1001,115 @@ async def test_verdict_approve_posts_comment_not_gh_approve(tmp_path: Path) -> N
         assert isinstance(result, Ack)
         posted = fake_gh.posted_reviews()
         assert len(posted) == 1
-        # Operator policy: never a formal GitHub APPROVE, always COMMENT.
+        # Default policy: advisory-only, so no formal GitHub APPROVE.
         assert posted[0]["event"] == "COMMENT"
         assert posted[0]["comments"] == []
         # A clean APPROVE verdict still earns the celebratory 곽철이 GIF.
         assert "![곽철이 " in posted[0]["body"]
+    finally:
+        await conn.close()
+
+
+def _approve_enabled_cfg() -> PrReviewHandlerEntry:
+    return PrReviewHandlerEntry(
+        persona_skill="pr-review",
+        min_persona_chars=50,
+        size_budget=SizeBudget(max_lines=1000, max_files=50),
+        approve_enabled=True,
+        review_self=True,
+    )
+
+
+def _clean_pass_factory() -> FakeFactory:
+    return FakeFactory(
+        session=FakeClaudeSession(
+            default=json.dumps(
+                {
+                    "verdict": "APPROVE",
+                    "summary": (
+                        "**Verdict**: APPROVE — 모든 finding 0개.\n\n"
+                        "**개요**\n변경사항은 작고 컨벤션을 따라간다.\n\n"
+                        "— daeyeon-bot 🐥"
+                    ),
+                    "comments": [],
+                }
+            )
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_approve_enabled_submits_gh_approve_on_other_authors_pr(tmp_path: Path) -> None:
+    """`approve_enabled=True` + clean APPROVE on someone else's PR → GH APPROVE."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    factory = _clean_pass_factory()
+    handler, conn, _ = await _build_handler(
+        tmp_path, fake_gh=fake_gh, factory=factory, config_overrides=_approve_enabled_cfg()
+    )
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        assert isinstance(await handler.handle(event, _ctx(factory)), Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        assert posted[0]["event"] == "APPROVE"
+        # The GIF is tied to the verdict, not to the GH event — it stays.
+        assert "![곽철이 " in posted[0]["body"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_enabled_still_comments_on_self_authored_pr(tmp_path: Path) -> None:
+    """Self-APPROVE is an HTTP 422 — the knob must NOT override that guard."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author=fake_gh.user_login, files=_FILES_ONE_FILE)
+    factory = _clean_pass_factory()
+    handler, conn, _ = await _build_handler(
+        tmp_path, fake_gh=fake_gh, factory=factory, config_overrides=_approve_enabled_cfg()
+    )
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        assert isinstance(await handler.handle(event, _ctx(factory)), Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        assert posted[0]["event"] == "COMMENT"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_enabled_does_not_approve_a_non_clean_verdict(tmp_path: Path) -> None:
+    """Only verdict=APPROVE earns a GH APPROVE; PASS (MINOR-only) stays COMMENT."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    factory = FakeFactory(
+        session=FakeClaudeSession(
+            default=json.dumps(
+                {
+                    "verdict": "PASS",
+                    "summary": (
+                        "**Verdict**: PASS — MINOR 1건.\n\n"
+                        "**개요**\n작은 개선 여지가 있다.\n\n"
+                        "— daeyeon-bot 🐥"
+                    ),
+                    "comments": [],
+                }
+            )
+        )
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path, fake_gh=fake_gh, factory=factory, config_overrides=_approve_enabled_cfg()
+    )
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        assert isinstance(await handler.handle(event, _ctx(factory)), Ack)
+        posted = fake_gh.posted_reviews()
+        assert len(posted) == 1
+        assert posted[0]["event"] == "COMMENT"
     finally:
         await conn.close()
 

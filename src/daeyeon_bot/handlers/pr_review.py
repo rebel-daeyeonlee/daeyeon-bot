@@ -19,7 +19,8 @@ The single handler that consumes both `gh.review_requested` (auto path) and
           PermanentError("redaction would alter posted content")
     (i) prepend supersede header when force-reviewing on top of a prior
         posted review
-    (j) gh.post_review (event="COMMENT" — baked-in inside `gh_cli`)
+    (j) gh.post_review — event is `APPROVE` only when `approve_enabled` and the
+        verdict is a clean APPROVE on someone else's PR; `COMMENT` otherwise
     (k) record_supersede + insert_audit(status='posted') + Ack
 
 `gh_cli` raises `AuthError` / `RateLimitError` / `TransientError` /
@@ -59,6 +60,7 @@ from daeyeon_bot.handlers.pr_review_diff import (
 from daeyeon_bot.handlers.pr_review_prompt import build_system_prompt
 from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment, ReviewOutput
+from daeyeon_bot.infra.gh_cli import ReviewEvent
 from daeyeon_bot.infra.logging import RedactReason, redact_with_provenance
 from daeyeon_bot.infra.pr_review_audit import (
     find_latest,
@@ -425,12 +427,19 @@ class PrReviewHandler:
             )
             summary = header + "\n\n" + summary
 
-        # Operator policy: the bot NEVER submits a GitHub APPROVE event — every
-        # review posts as a COMMENT. APPROVE counts toward branch protection,
-        # too strong a signal to automate (and GitHub rejects a self-APPROVE
-        # with HTTP 422 anyway). The internal `verdict` still drives the summary
-        # tone and the celebratory GIF below; only the GH-facing event is fixed.
-        gh_event = "COMMENT"
+        # GH-facing review event. `APPROVE` counts toward branch protection, so
+        # it is opt-in via `[handlers.pr_review].approve_enabled` and fires only
+        # on a clean pass. Two guards are NOT configurable:
+        #   * self-authored PRs stay COMMENT — GitHub rejects self-APPROVE with
+        #     HTTP 422, which would DeadLetter the whole review;
+        #   * any verdict other than APPROVE stays COMMENT.
+        # The internal `verdict` still drives summary tone and the GIF below.
+        is_self = bool(sized.author_login) and sized.author_login == self.github_username
+        gh_event: ReviewEvent = (
+            "APPROVE"
+            if self.config.approve_enabled and review.verdict == "APPROVE" and not is_self
+            else "COMMENT"
+        )
         # House style: a clean pass (verdict=APPROVE, zero findings) earns a
         # celebratory 곽철이 GIF in the Summary (operator preference) — the
         # lightweight "LGTM" marker now that no formal APPROVE is posted. Any

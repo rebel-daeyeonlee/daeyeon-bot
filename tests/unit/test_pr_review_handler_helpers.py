@@ -21,7 +21,6 @@ from daeyeon_bot.handlers.pr_review import (
     _read_requested_logins,  # pyright: ignore[reportPrivateUsage]
     _read_review_id,  # pyright: ignore[reportPrivateUsage]
     _read_submitted_at,  # pyright: ignore[reportPrivateUsage]
-    _strip_code_fence,  # pyright: ignore[reportPrivateUsage]
 )
 from daeyeon_bot.handlers.pr_review_render import inline_to_api, render_user_message
 from daeyeon_bot.handlers.pr_review_schemas import InlineComment
@@ -153,28 +152,6 @@ def test_read_submitted_at_handles_invalid_inputs() -> None:
     assert _read_submitted_at({"submitted_at": ""}) is None
     assert _read_submitted_at({"submitted_at": 42}) is None
     assert _read_submitted_at({"submitted_at": "not-a-date"}) is None
-
-
-# ── _strip_code_fence ─────────────────────────────────────────────────────
-
-
-def test_strip_code_fence_unfenced_passthrough() -> None:
-    assert _strip_code_fence('{"x": 1}') == '{"x": 1}'
-
-
-def test_strip_code_fence_with_lang_tag_and_trailing_fence() -> None:
-    src = '```json\n{"x": 1}\n```'
-    assert _strip_code_fence(src) == '{"x": 1}'
-
-
-def test_strip_code_fence_with_only_opening_fence() -> None:
-    src = '```\n{"x": 1}\n'
-    assert _strip_code_fence(src) == '{"x": 1}'
-
-
-def test_strip_code_fence_strips_extra_whitespace() -> None:
-    src = '   ```\n{"x": 1}\n```   '
-    assert _strip_code_fence(src) == '{"x": 1}'
 
 
 # ── _append_folded_bullets ────────────────────────────────────────────────

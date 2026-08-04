@@ -73,6 +73,7 @@ from daeyeon_bot.core.jira_triage.types import (
     TitleParse,
     TriageDraft,
 )
+from daeyeon_bot.core.llm_json import extract_json_object
 from daeyeon_bot.core.manifest import HandlerManifest
 from daeyeon_bot.core.persona import Persona
 from daeyeon_bot.core.protocols import HandlerContext
@@ -679,9 +680,17 @@ class JiraTriageHandler:
                 )
             text: str = text_obj if isinstance(text_obj, str) else str(text_obj)  # type: ignore[arg-type]
             try:
-                data = json.loads(_strip_code_fence(text))
+                data = json.loads(extract_json_object(text))
             except (json.JSONDecodeError, ValueError) as exc:
                 last_error = f"JSON parse error: {exc}"
+                _log.warning(
+                    "jira_triage.claude_unparseable",
+                    attempt=attempt,
+                    error=str(exc),
+                    response_chars=len(text),
+                    response_head=text[:400],
+                    response_tail=text[-200:],
+                )
                 if attempt + 1 < 2:
                     continue
                 raise PermanentError(
@@ -946,18 +955,6 @@ def _parse_jira_datetime(raw: str) -> datetime:
     if len(fixed) >= 5 and (fixed[-5] in "+-") and fixed[-3] != ":":
         fixed = fixed[:-2] + ":" + fixed[-2:]
     return datetime.fromisoformat(fixed)
-
-
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
-
-
-def _strip_code_fence(text: str) -> str:
-    """Strip ```json ... ``` fence if Claude wrapped output despite instructions."""
-    stripped = text.strip()
-    m = _CODE_FENCE_RE.match(stripped)
-    if m is None:
-        return stripped
-    return m.group(1).strip()
 
 
 def _draft_from_output(parsed: TriageOutput) -> TriageDraft:

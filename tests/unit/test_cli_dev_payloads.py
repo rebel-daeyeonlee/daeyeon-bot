@@ -130,9 +130,7 @@ def test_jira_dedup_key_varies_by_issue_key() -> None:
 
 
 def test_ci_triage_omits_thread_coords_by_default() -> None:
-    payload, _ = build_ci_triage_payload(
-        repo="rebellions-sw/ssw-bundle", run_id="123", force=False
-    )
+    payload, _ = build_ci_triage_payload(repo="rebellions-sw/ssw-bundle", run_id="123", force=False)
     assert payload == {"repo": "rebellions-sw/ssw-bundle", "run_id": "123", "force": False}
 
 
@@ -159,9 +157,7 @@ def test_ci_triage_drops_thread_coords_when_partial() -> None:
 
 def test_ci_triage_thread_coords_do_not_change_dedup_key() -> None:
     """Dedup identity is (repo, run_id) — routing coords must not split it."""
-    _, k_plain = build_ci_triage_payload(
-        repo="rebellions-sw/ssw-bundle", run_id="123", force=False
-    )
+    _, k_plain = build_ci_triage_payload(repo="rebellions-sw/ssw-bundle", run_id="123", force=False)
     _, k_thread = build_ci_triage_payload(
         repo="rebellions-sw/ssw-bundle",
         run_id="123",

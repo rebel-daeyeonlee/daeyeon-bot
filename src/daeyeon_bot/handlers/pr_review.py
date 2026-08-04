@@ -45,6 +45,7 @@ from daeyeon_bot.core.errors import (
     ValidationError,
 )
 from daeyeon_bot.core.events import Event
+from daeyeon_bot.core.llm_json import extract_json_object
 from daeyeon_bot.core.manifest import HandlerManifest
 from daeyeon_bot.core.pr_review.audit import AuditRow
 from daeyeon_bot.core.pr_review.persona import Persona
@@ -508,9 +509,20 @@ class PrReviewHandler:
                 )
             response = cast("str", response_obj)
             try:
-                parsed = json.loads(_strip_code_fence(response))
+                parsed = json.loads(extract_json_object(response))
             except (TypeError, ValueError) as exc:
                 last_error = f"JSON parse: {exc}"
+                # The raw reply is the only evidence of *how* the model broke
+                # its output contract; without it a dead-letter says only
+                # "char 0" and the next failure mode is invisible again.
+                _log.warning(
+                    "pr_review.claude_unparseable",
+                    attempt=attempt,
+                    error=str(exc),
+                    response_chars=len(response),
+                    response_head=response[:400],
+                    response_tail=response[-200:],
+                )
                 if attempt == 1:
                     raise PermanentError(
                         f"claude returned malformed review (parse): {exc}"
@@ -700,20 +712,6 @@ def _read_submitted_at(posted: dict[str, Any]) -> datetime | None:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _strip_code_fence(text: str) -> str:
-    """Tolerate Claude wrapping its JSON in ```json … ``` despite the prompt."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        # Drop first line (``` or ```json) and trailing ``` if present.
-        lines = stripped.splitlines()
-        if lines:
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    return stripped
 
 
 def _is_repo_allowed(repo: str, allowed: list[str]) -> bool:

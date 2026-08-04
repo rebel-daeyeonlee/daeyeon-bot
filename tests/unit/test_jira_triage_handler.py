@@ -38,7 +38,6 @@ from tests.fakes.ssh_logs import FakeSshLogClient
 from tests.fakes.ssw_bundle_fixture import build_fixture
 
 # Private helpers — tested via module attribute access (pyright-friendly).
-_strip_code_fence = _jt_module._strip_code_fence  # pyright: ignore[reportPrivateUsage]
 _verify_evidence_quotes = _jt_module._verify_evidence_quotes  # pyright: ignore[reportPrivateUsage]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -576,18 +575,3 @@ def test_verify_evidence_quotes_rejects_fabricated() -> None:
     )
     with pytest.raises(PermanentError, match="fabricated evidence quote"):
         _verify_evidence_quotes(triage, snapshot)
-
-
-def test_strip_code_fence_handles_json_wrapper() -> None:
-    text = '```json\n{"a": 1}\n```'
-    assert _strip_code_fence(text) == '{"a": 1}'
-
-
-def test_strip_code_fence_handles_plain_fence() -> None:
-    text = '```\n{"a": 1}\n```'
-    assert _strip_code_fence(text) == '{"a": 1}'
-
-
-def test_strip_code_fence_no_fence_passthrough() -> None:
-    text = '{"a": 1}'
-    assert _strip_code_fence(text) == '{"a": 1}'

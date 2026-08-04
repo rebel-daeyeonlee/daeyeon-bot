@@ -34,6 +34,7 @@ from daeyeon_bot.core.ci_triage.types import (
 )
 from daeyeon_bot.core.errors import PermanentError, RunLogUnavailableError, TransientError
 from daeyeon_bot.core.events import Event
+from daeyeon_bot.core.llm_json import extract_json_object
 from daeyeon_bot.core.manifest import HandlerManifest
 from daeyeon_bot.core.persona import Persona
 from daeyeon_bot.core.protocols import HandlerContext
@@ -400,9 +401,17 @@ class CiTriageHandler:
                 text_obj: object = await s.query(prompt, system=system_prompt)  # type: ignore[attr-defined]
             text = text_obj if isinstance(text_obj, str) else str(text_obj)  # type: ignore[arg-type]
             try:
-                data = json.loads(_strip_code_fence(text))
+                data = json.loads(extract_json_object(text))
             except (json.JSONDecodeError, ValueError) as exc:
                 last_error = f"JSON parse error: {exc}"
+                _log.warning(
+                    "ci_triage.claude_unparseable",
+                    attempt=attempt,
+                    error=str(exc),
+                    response_chars=len(text),
+                    response_head=text[:400],
+                    response_tail=text[-200:],
+                )
                 if attempt + 1 < 2:
                     continue
                 raise PermanentError(f"ci_triage: malformed JSON after retry: {exc}") from exc
@@ -640,15 +649,6 @@ class CiTriageHandler:
 
 
 # ── module-level helpers ─────────────────────────────────────────────────────
-
-_CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
-
-
-def _strip_code_fence(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = _CODE_FENCE_RE.sub("", stripped)
-    return stripped.strip()
 
 
 def _parse_event(event: Event) -> tuple[ParsedAlert, bool]:

@@ -258,6 +258,107 @@ async def test_whitespace_only_response_raises_transient(stub: _StubClient) -> N
             await session.query("hi")
 
 
+# ── API error envelopes arriving as assistant text ─────────────────────────
+#
+# Regression cover for 2026-08-04..06: a revoked token made the CLI answer with
+# `{"type":"error","error":{"type":"authentication_error",...}}` as the
+# assistant's *text*. No `ProcessError` was raised, so the adapter returned it
+# happily, the handler's JSON parser accepted it, and 108 events dead-lettered
+# on a schema violation instead of the daemon halting with exit 78.
+
+
+def _assistant(text: str) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="m",
+        parent_tool_use_id=None,
+        error=None,
+        usage=None,
+        message_id="mid",
+        stop_reason=None,
+        session_id="s",
+        uuid="u",
+    )
+
+
+async def test_auth_error_envelope_as_text_maps_to_auth_error(stub: _StubClient) -> None:
+    stub.scripted_messages = [
+        _assistant(
+            '{"type": "error", "error": {"type": "authentication_error",'
+            ' "message": "Please authenticate to continue."}, "request_id": null}'
+        )
+    ]
+    async with _session() as session:
+        with pytest.raises(AuthError, match="authentication_error"):
+            await session.query("review this")
+
+
+async def test_permission_error_envelope_maps_to_auth_error(stub: _StubClient) -> None:
+    stub.scripted_messages = [
+        _assistant('{"type": "error", "error": {"type": "permission_error", "message": "nope"}}')
+    ]
+    async with _session() as session:
+        with pytest.raises(AuthError):
+            await session.query("review this")
+
+
+async def test_rate_limit_envelope_maps_to_rate_limit_error(stub: _StubClient) -> None:
+    stub.scripted_messages = [
+        _assistant('{"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}')
+    ]
+    async with _session() as session:
+        with pytest.raises(RateLimitError):
+            await session.query("review this")
+
+
+async def test_unknown_error_envelope_maps_to_transient(stub: _StubClient) -> None:
+    """`overloaded_error` must retry, not halt the daemon and not dead-letter."""
+    stub.scripted_messages = [
+        _assistant('{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}')
+    ]
+    async with _session() as session:
+        with pytest.raises(TransientError) as excinfo:
+            await session.query("review this")
+    assert not isinstance(excinfo.value, RateLimitError)
+
+
+async def test_plaintext_cli_auth_failure_maps_to_auth_error(stub: _StubClient) -> None:
+    """The CLI's own non-JSON form, as reproduced on the revoked daemon token."""
+    stub.scripted_messages = [
+        _assistant("Failed to authenticate. API Error: 401 OAuth access token has been revoked.")
+    ]
+    async with _session() as session:
+        with pytest.raises(AuthError, match="revoked"):
+            await session.query("review this")
+
+
+async def test_review_quoting_an_error_envelope_is_not_treated_as_one(
+    stub: _StubClient,
+) -> None:
+    """Only a reply that is *entirely* the envelope counts.
+
+    This bot reviews code that talks to APIs, so a legitimate review body can
+    contain such a payload verbatim. Misreading one as an auth failure would
+    halt the daemon on a healthy token.
+    """
+    body = (
+        '{"verdict": "CONCERNS", "summary": "The retry path swallows '
+        '{\\"type\\": \\"error\\", \\"error\\": {\\"type\\": '
+        '\\"authentication_error\\"}} instead of surfacing it.", "comments": []}'
+    )
+    stub.scripted_messages = [_assistant(body)]
+    async with _session() as session:
+        out = await session.query("review this")
+    assert out == body
+
+
+async def test_non_error_json_object_passes_through(stub: _StubClient) -> None:
+    stub.scripted_messages = [_assistant('{"verdict": "APPROVE", "summary": "ok", "comments": []}')]
+    async with _session() as session:
+        out = await session.query("review this")
+    assert "APPROVE" in out
+
+
 def test_make_real_factory_builds_sessions() -> None:
     factory = claude_mod.make_real_factory(
         oauth_token="tok",

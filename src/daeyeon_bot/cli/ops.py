@@ -24,25 +24,37 @@ app = typer.Typer(
 
 @app.command(
     "doctor",
-    help="Run pre-flight checks: state dir, disk, heartbeat, PAUSE, DB integrity, schema, token.",
+    help=(
+        "Run pre-flight checks: state dir, disk, heartbeat, PAUSE, DB integrity,"
+        " schema, token. Add --auth-probe for a live credential check."
+    ),
 )
 def doctor(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+    auth_probe: bool = typer.Option(
+        False,
+        "--auth-probe",
+        help=(
+            "Also spend one real Claude call to verify the configured token is"
+            " still accepted upstream (the `token` check only proves it is"
+            " readable). Run this after rotating a token."
+        ),
+    ),
 ) -> None:
     resolved = resolve_config_path(config)
     if resolved is None:
         typer.echo("config: using defaults (no config.toml found)")
     else:
         typer.echo(f"config: {resolved}")
-    report = asyncio.run(_doctor(config_path=config))
+    report = asyncio.run(_doctor(config_path=config, probe_auth=auth_probe))
     _render_doctor(report)
     if not report.ok:
         raise typer.Exit(code=1)
 
 
-async def _doctor(*, config_path: str | None) -> DoctorReport:
+async def _doctor(*, config_path: str | None, probe_auth: bool = False) -> DoctorReport:
     cfg = load(config_path)
-    return await run_checks(cfg)
+    return await run_checks(cfg, probe_auth=probe_auth)
 
 
 def _render_doctor(report: DoctorReport) -> None:

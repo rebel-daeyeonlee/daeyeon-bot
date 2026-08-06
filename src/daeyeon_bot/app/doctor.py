@@ -9,7 +9,9 @@ running — the operator wants the full picture in one shot.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,25 @@ from daeyeon_bot.infra import secrets, storage
 CheckStatus = Literal["ok", "warn", "fail"]
 DISK_WARN_BYTES = 100 * 1024 * 1024  # 100 MiB
 DISK_FAIL_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+# One real Claude round trip. Generous because a cold CLI start on a fresh HOME
+# does more work than a warm one.
+AUTH_PROBE_TIMEOUT_S = 90.0
+_AUTH_PROBE_NAME = "auth_probe"
+_AUTH_PROBE_PROMPT = "Reply with exactly: DAEYEON_BOT_AUTH_OK"
+_AUTH_PROBE_EXPECT = "DAEYEON_BOT_AUTH_OK"
+# Substrings that mean "the credential was rejected" rather than "something else
+# went wrong". Anything unrecognized is reported `warn`, not `fail` — a doctor
+# that cries wolf on a network blip trains the operator to ignore it.
+_AUTH_PROBE_FAIL_HINTS: tuple[str, ...] = (
+    "failed to authenticate",
+    "revoked",
+    "unauthorized",
+    "authentication_error",
+    "invalid api key",
+    "invalid_api_key",
+    "401",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +64,14 @@ class DoctorReport:
         return all(r.status != "fail" for r in self.results)
 
 
-async def run_checks(config: Config) -> DoctorReport:
-    """Execute the full check suite. Order: cheap → expensive."""
+async def run_checks(config: Config, *, probe_auth: bool = False) -> DoctorReport:
+    """Execute the full check suite. Order: cheap → expensive.
+
+    `probe_auth` appends `auth_probe`, which spends one real Claude call. It is
+    opt-in so the default suite stays offline, hermetic, and free; the automatic
+    protection against a dead credential is `infra/claude.py:_raise_if_api_error`
+    (`AuthError` → exit 78), not this check.
+    """
     results: list[CheckResult] = [
         _check_state_dir(config.state_dir_path),
         _check_disk(config.state_dir_path),
@@ -53,6 +80,8 @@ async def run_checks(config: Config) -> DoctorReport:
         await _check_db_and_migrations(config.db_path),
         _check_token(config),
     ]
+    if probe_auth:
+        results.append(await _check_auth_probe(config))
     return DoctorReport(results=tuple(results))
 
 
@@ -123,16 +152,14 @@ def _check_token(config: Config) -> CheckResult:
     """Probe the configured secrets provider and report success/failure.
 
     The token itself is never logged — only its length and the provider name.
+
+    Readability only: this check cannot see a server-side revocation, so an `ok`
+    here means "a secret exists", not "the daemon can call Claude". Use
+    `--auth-probe` for the latter.
     """
     name = "token"
     try:
-        provider = secrets.build_provider(
-            name=config.secrets.provider,
-            keychain_service=config.secrets.keychain_service,
-            keychain_account=config.secrets.keychain_account,
-            file_path=config.secrets.file_path,
-        )
-        token = provider.load_oauth_token()
+        token = _load_token(config)
     except ConfigError as exc:
         return CheckResult(name=name, status="fail", detail=f"config: {exc}")
     except AuthError as exc:
@@ -141,6 +168,94 @@ def _check_token(config: Config) -> CheckResult:
         name=name,
         status="ok",
         detail=f"provider={config.secrets.provider} (token len={len(token)})",
+    )
+
+
+def _load_token(config: Config) -> str:
+    provider = secrets.build_provider(
+        name=config.secrets.provider,
+        keychain_service=config.secrets.keychain_service,
+        keychain_account=config.secrets.keychain_account,
+        file_path=config.secrets.file_path,
+    )
+    return provider.load_oauth_token()
+
+
+async def _check_auth_probe(config: Config) -> CheckResult:
+    """Spend one real Claude call to prove the *configured token* still works.
+
+    **The isolated `HOME` is the whole point.** The `claude` CLI prefers
+    `$HOME/.claude/.credentials.json` over `CLAUDE_CODE_OAUTH_TOKEN`, so a probe
+    that inherits the operator's home validates their interactive login instead
+    of the daemon's token — it returns a cheerful success while the configured
+    secret is revoked. That shadowing is what hid a revoked token for two days
+    on 2026-08-04 (verified: a deliberately corrupt token still succeeded with
+    the real `HOME`, and failed with `401 ... revoked` under a fresh one).
+
+    The token reaches the child through its environment, which is visible in
+    `/proc` for the child's lifetime — the same exposure the SDK already accepts
+    when it spawns the CLI, and the reason this is a short-lived subprocess.
+    """
+    try:
+        token = _load_token(config)
+    except (AuthError, ConfigError) as exc:
+        return CheckResult(name=_AUTH_PROBE_NAME, status="fail", detail=f"token unavailable: {exc}")
+
+    cli = shutil.which("claude")
+    if cli is None:
+        return CheckResult(name=_AUTH_PROBE_NAME, status="warn", detail="claude CLI not on PATH")
+
+    outcome = await _run_auth_probe(cli, token)
+    if isinstance(outcome, CheckResult):
+        return outcome
+    return _classify_auth_probe(outcome)
+
+
+async def _run_auth_probe(cli: str, token: str) -> str | CheckResult:
+    """Run the CLI under a throwaway HOME. Returns its output, or a failed check."""
+    with tempfile.TemporaryDirectory(prefix="daeyeon-bot-auth-probe-") as isolated_home:
+        env = {
+            "HOME": isolated_home,
+            "PATH": os.environ.get("PATH", ""),
+            "CLAUDE_CODE_OAUTH_TOKEN": token,
+            # An auto-update mid-probe would muddy the verdict.
+            "DISABLE_AUTOUPDATER": "1",
+        }
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli,
+                "-p",
+                _AUTH_PROBE_PROMPT,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                cwd=isolated_home,
+            )
+        except OSError as exc:
+            return CheckResult(name=_AUTH_PROBE_NAME, status="warn", detail=f"spawn failed: {exc}")
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=AUTH_PROBE_TIMEOUT_S)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return CheckResult(
+                name=_AUTH_PROBE_NAME,
+                status="warn",
+                detail=f"timed out after {int(AUTH_PROBE_TIMEOUT_S)}s",
+            )
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+def _classify_auth_probe(output: str) -> CheckResult:
+    if _AUTH_PROBE_EXPECT in output:
+        return CheckResult(name=_AUTH_PROBE_NAME, status="ok", detail="token accepted upstream")
+    lowered = output.lower()
+    if any(hint in lowered for hint in _AUTH_PROBE_FAIL_HINTS):
+        return CheckResult(name=_AUTH_PROBE_NAME, status="fail", detail=f"rejected: {output[:160]}")
+    return CheckResult(
+        name=_AUTH_PROBE_NAME,
+        status="warn",
+        detail=f"inconclusive: {output[:160] or '(no output)'}",
     )
 
 

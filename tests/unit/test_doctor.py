@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import shutil
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -144,6 +148,145 @@ async def test_token_check_fail_when_provider_unavailable(
     token = _by_name(report, "token")
     assert token.status == "fail"
     assert "unavailable" in token.detail
+
+
+# ── auth_probe ─────────────────────────────────────────────────────────────
+#
+# `token` only proves the secret is readable. On 2026-08-04 a revoked token sat
+# behind a green `token ✓` for two days because the `claude` CLI prefers
+# `$HOME/.claude/.credentials.json` over `CLAUDE_CODE_OAUTH_TOKEN` — so the
+# isolated HOME below is the load-bearing part of this check, not a detail.
+
+
+class _FakeProc:
+    def __init__(self, output: bytes) -> None:
+        self._output = output
+        self.killed = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._output, b""
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        return 0
+
+
+def _which_present(_name: str) -> str | None:
+    return "/usr/bin/claude"
+
+
+def _which_missing(_name: str) -> str | None:
+    return None
+
+
+def _stub_cli_returning(
+    output: bytes, captured: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pretend `claude` exists on PATH and answers with `output`."""
+
+    def _build(**_: object) -> secrets.SecretsProvider:
+        return _StubProvider()
+
+    monkeypatch.setattr(secrets, "build_provider", _build)
+    monkeypatch.setattr(shutil, "which", _which_present)
+
+    async def _exec(*args: object, **kwargs: object) -> _FakeProc:
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProc(output)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec)
+
+
+async def test_auth_probe_absent_unless_requested(fresh_state_dir: Path) -> None:
+    report = await run_checks(_config(fresh_state_dir))
+    assert all(r.name != "auth_probe" for r in report.results)
+
+
+async def test_auth_probe_isolates_home_and_passes_the_configured_token(
+    fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe must not be able to see the operator's interactive login.
+
+    If `HOME` were inherited, the CLI would authenticate with
+    `~/.claude/.credentials.json` and report success for a revoked token —
+    verified empirically on 2026-08-06 with a deliberately corrupt token.
+    """
+    captured: dict[str, object] = {}
+    _stub_cli_returning(b"DAEYEON_BOT_AUTH_OK\n", captured, monkeypatch)
+
+    report = await run_checks(_config(fresh_state_dir), probe_auth=True)
+    assert _by_name(report, "auth_probe").status == "ok"
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    probe_env = cast("dict[str, str]", env)
+    assert probe_env["CLAUDE_CODE_OAUTH_TOKEN"] == "stub-token-12345"
+    assert probe_env["HOME"] != os.environ.get("HOME")
+    assert "auth-probe" in probe_env["HOME"]
+    # No inherited credential directory can exist under a fresh temp HOME.
+    assert not (Path(probe_env["HOME"]) / ".claude").exists()
+
+
+async def test_auth_probe_fails_on_revoked_token(
+    fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    _stub_cli_returning(
+        b"Failed to authenticate. API Error: 401 OAuth access token has been revoked.",
+        captured,
+        monkeypatch,
+    )
+    report = await run_checks(_config(fresh_state_dir), probe_auth=True)
+    probe = _by_name(report, "auth_probe")
+    assert probe.status == "fail"
+    assert "revoked" in probe.detail
+    assert report.ok is False
+
+
+async def test_auth_probe_warns_on_unrecognized_output(
+    fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unfamiliar failure is `warn`: a doctor that cries wolf gets ignored."""
+    captured: dict[str, object] = {}
+    _stub_cli_returning(b"connect ETIMEDOUT 1.2.3.4:443", captured, monkeypatch)
+    report = await run_checks(_config(fresh_state_dir), probe_auth=True)
+    probe = _by_name(report, "auth_probe")
+    assert probe.status == "warn"
+    assert "inconclusive" in probe.detail
+
+
+async def test_auth_probe_warns_when_cli_missing(
+    fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _build(**_: object) -> secrets.SecretsProvider:
+        return _StubProvider()
+
+    monkeypatch.setattr(secrets, "build_provider", _build)
+    monkeypatch.setattr(shutil, "which", _which_missing)
+    report = await run_checks(_config(fresh_state_dir), probe_auth=True)
+    probe = _by_name(report, "auth_probe")
+    assert probe.status == "warn"
+    assert "not on PATH" in probe.detail
+
+
+async def test_auth_probe_fails_without_spawning_when_token_unreadable(
+    fresh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _build(**_: object) -> secrets.SecretsProvider:
+        raise AuthError("keychain: no token")
+
+    monkeypatch.setattr(secrets, "build_provider", _build)
+
+    async def _never(*_args: object, **_kwargs: object) -> _FakeProc:  # pragma: no cover
+        raise AssertionError("must not spawn the CLI without a token")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _never)
+    report = await run_checks(_config(fresh_state_dir), probe_auth=True)
+    assert _by_name(report, "auth_probe").status == "fail"
 
 
 async def test_report_ok_property_false_on_fail(fresh_state_dir: Path) -> None:

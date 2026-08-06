@@ -11,15 +11,20 @@ Errors map onto `core.errors`:
     * `RateLimitEvent` with a non-allowed status → `RateLimitError`.
       `allowed` / `allowed_warning` are informational and logged, not raised.
     * `ProcessError` whose stderr looks auth-related → `AuthError`.
+    * An API error *envelope* arriving as the assistant's text → `AuthError` /
+      `RateLimitError` / `TransientError` by `error.type`. See
+      `_raise_if_api_error`; this path exists because a rejected upstream call
+      does not always reach us as an exception.
     * Anything else → propagates to the dispatcher's generic catch.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import NoReturn, Protocol, runtime_checkable
+from typing import NoReturn, Protocol, cast, runtime_checkable
 
 import structlog
 from claude_agent_sdk import (
@@ -52,6 +57,18 @@ _AUTH_HINTS: tuple[str, ...] = (
     "token expired",
     "token revoked",
 )
+
+# `error.type` values from the API's error envelope that mean "fix the
+# credential", not "retry later". Matched exactly against `error.type` — never
+# against `error.message`, because a false positive here halts the daemon with
+# exit 78 and a supervisor that refuses to restart it.
+_AUTH_ERROR_TYPES: frozenset[str] = frozenset(
+    {"authentication_error", "permission_error", "invalid_request_error_auth"}
+)
+
+# The CLI prints this (not JSON) when it cannot authenticate at all, e.g.
+# "Failed to authenticate. API Error: 401 OAuth access token has been revoked."
+_CLI_AUTH_FAILURE_PREFIX = "failed to authenticate"
 
 
 @runtime_checkable
@@ -232,7 +249,60 @@ async def _collect_assistant_text(client: ClaudeSDKClient, *, prompt_chars: int)
         # near-cap prompt suggests we're hitting an SDK truncation path.
         _log.warning("claude.empty_assistant_text", prompt_chars=prompt_chars)
         raise TransientError("claude returned no assistant text")
+    _raise_if_api_error(text)
     return text
+
+
+def _raise_if_api_error(text: str) -> None:
+    """Raise when the CLI handed us an API error instead of a model reply.
+
+    A rejected upstream call does not always reach us as an exception: the CLI
+    can surface it as the assistant's own *text*, so the SDK sees a well-formed
+    turn and nothing in the `ProcessError` path fires. Left alone that payload
+    flows into a handler's `json.loads`, parses cleanly, and dies as a schema
+    violation → `DeadLetter` — burning one event per attempt instead of halting
+    the daemon. Observed 2026-08-04..06: 108 `pr_review` rows dead-lettered on
+    `{"type":"error","error":{"type":"authentication_error",...}}` from a
+    revoked token, while `ops doctor` reported the token `ok`.
+
+    Only a reply that is *entirely* the error counts. A review that happens to
+    quote such a payload (plausible — this bot reviews code that talks to APIs)
+    keeps flowing.
+    """
+    stripped = text.strip()
+    if stripped.lower().startswith(_CLI_AUTH_FAILURE_PREFIX):
+        _log.error("claude.cli_auth_failure", detail=stripped[:400])
+        raise AuthError(f"claude auth failure: {stripped[:400]}")
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return
+    try:
+        payload: object = json.loads(stripped)
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    envelope = cast("dict[str, object]", payload)
+    if envelope.get("type") != "error":
+        return
+
+    inner = envelope.get("error")
+    err_type = ""
+    message = ""
+    if isinstance(inner, dict):
+        inner_fields = cast("dict[str, object]", inner)
+        err_type = str(inner_fields.get("type") or "")
+        message = str(inner_fields.get("message") or "")
+    if err_type and message:
+        detail = f"{err_type}: {message}"
+    else:
+        detail = err_type or stripped[:200]
+
+    _log.error("claude.api_error_envelope", error_type=err_type, detail=detail[:400])
+    if err_type in _AUTH_ERROR_TYPES:
+        raise AuthError(f"claude auth failure: {detail}")
+    if err_type == "rate_limit_error":
+        raise RateLimitError(f"claude rate limit: {detail}")
+    raise TransientError(f"claude api error: {detail}")
 
 
 def _raise_process_error(exc: ProcessError) -> NoReturn:

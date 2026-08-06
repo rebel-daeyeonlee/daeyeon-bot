@@ -701,6 +701,39 @@ async def test_claude_malformed_twice_raises_permanent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_schema_failure_writes_failed_audit_row_with_detail(tmp_path: Path) -> None:
+    """A dead-lettered review must leave a trail in `pr_review_audit`.
+
+    Before this, a PermanentError from the Claude call wrote no audit row at
+    all, so the table showed an unbroken run of skips while every real review
+    was being destroyed — and the message said only "(schema)", discarding
+    pydantic's detail. Both halves cost two days of silent failure on
+    2026-08-04.
+    """
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    # Parses as JSON, fails the schema: `verdict` is not in the Literal set.
+    bad = json.dumps({"verdict": "MAYBE", "summary": "hm", "comments": []})
+    factory = FakeFactory(session=FakeClaudeSession(responses=[bad, bad], default=bad))
+    handler, conn, _ = await _build_handler(tmp_path, fake_gh=fake_gh, factory=factory)
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        with pytest.raises(PermanentError, match="schema"):
+            await handler.handle(event, _ctx(factory))
+
+        assert fake_gh.posted_reviews() == []
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "failed"
+        # The detail must name the offending field, not just say "(schema)".
+        assert latest.error is not None
+        assert "verdict" in latest.error
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_out_of_hunk_anchor_folded_into_summary(tmp_path: Path) -> None:
     fake_gh = FakeGh()
     fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)

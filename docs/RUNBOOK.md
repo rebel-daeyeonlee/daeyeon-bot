@@ -150,12 +150,40 @@ Exit codes that matter:
   (`RestartPreventExitStatus=78`).
 - Logs show `AuthError: claude auth failure: …` or `401/403/unauthorized`
   responses from the Claude SDK.
+- `claude.api_error_envelope` / `claude.cli_auth_failure` in the logs — the
+  credential was rejected but the CLI reported it as a normal model reply
+  (see the trap below).
+
+> ⚠️ **A revoked token can present as green.** `ops doctor`'s `token` check
+> only proves the secret is *readable*; it cannot see a server-side
+> revocation. Worse, the `claude` CLI prefers
+> `$HOME/.claude/.credentials.json` over `CLAUDE_CODE_OAUTH_TOKEN`, so while
+> the operator's own interactive login is fresh the daemon borrows it and
+> looks healthy — the outage only starts when that login goes stale.
+> **2026-08-04..06:** the daemon's token was revoked on Aug 4; `doctor`
+> reported `✓ token`, `heartbeat` was fresh, and 108 `pr_review` events were
+> dead-lettered as "malformed review (schema)" — the object failing
+> validation was the API's own auth-error envelope. Two symptoms to trust
+> instead of `doctor`: zero `posted` rows in `pr_review_audit` over a period
+> that had review requests, and a run of `dead_letter` rows sharing one
+> error string.
+>
+> ```bash
+> # Was anything actually posted recently?
+> sqlite3 -readonly ~/.daeyeon-bot/state.db \
+>   "SELECT date(created_at) d, status, COUNT(*) FROM pr_review_audit
+>     WHERE created_at > date('now','-3 day') GROUP BY d, status;"
+> ```
 
 **Recovery**
 1. **Verify the failure mode** before rotating anything.
    ```bash
-   just doctor                          # token: fail / unavailable?
+   just doctor                                  # token: fail / unavailable?
+   daeyeon-bot ops doctor --auth-probe          # spends one real Claude call
    ```
+   `--auth-probe` runs the CLI under a **throwaway `HOME`** so the operator's
+   interactive credentials cannot mask a dead token. Never hand-roll this
+   probe with your own `HOME` — it will pass on a revoked token.
 2. **Issue a fresh token** through the Claude CLI on the operator's laptop:
    ```bash
    claude setup-token                   # opens browser, prints token
@@ -172,15 +200,31 @@ Exit codes that matter:
      ```bash
      just setup-token                   # prompts, writes to Keychain
      ```
-   - **Linux:** write the credential file with `umask 077` and re-run the
-     installer so systemd's `LoadCredential=` picks it up.
+   - **Linux:** `just setup-token` / `just rotate-token` are **macOS-only**
+     (`scripts/setup-token.sh` calls `security add-generic-password`). Write
+     the credential file yourself, at the path `[secrets].file_path` actually
+     names. Read it from the config rather than assuming — this doc used to
+     hardcode `~/.config/daeyeon-bot/oauth_token`, which is *not* where the
+     current deployment looks. Cross-check the unit's `LoadCredential=`: the
+     two must name the same file.
      ```bash
+     grep -A6 '^\[secrets\]' config.toml                       # file_path
+     grep LoadCredential ~/.config/systemd/user/daeyeon-bot.service
      umask 077
-     printf '%s' "<token>" > ~/.config/daeyeon-bot/oauth_token
-     just install-linux ~/.config/daeyeon-bot/oauth_token
+     # -s: no echo. printf '%s': no trailing newline in the file.
+     read -rsp 'OAuth token: ' T && printf '%s' "$T" > ~/.daeyeon-bot/oauth_token && unset T
      ```
+     Writing to a path the daemon does not read is silent: `doctor`'s `token`
+     check keeps reading the **old** file and stays green. Confirm with
+     `--auth-probe`, never with `token` alone.
+
+   Do **not** follow the CLI's own `export CLAUDE_CODE_OAUTH_TOKEN=…` hint
+   here. This daemon reads `[secrets].provider` (the `env` provider needs
+   `--insecure-env`), and an exported token is shadowed anyway — see the trap
+   above.
 4. **Verify and restart.**
    ```bash
+   daeyeon-bot ops doctor --auth-probe  # auth_probe: ok  ← the check that matters
    just doctor                          # token: ok, len>0
    # macOS — only if you used `just setup-token` (not `just rotate-token`).
    launchctl kickstart -k gui/$(id -u)/ai.rebellions.daeyeon-bot
@@ -194,6 +238,14 @@ Exit codes that matter:
    ```
 
 **Postmortem checklist**
+- [ ] Any `dead_letter` rows to replay? A rejected credential dead-letters one
+      event per attempt rather than halting, so the backlog needs triage —
+      `pr_review` rows older than a day are usually merged or withdrawn by then.
+      ```bash
+      sqlite3 -readonly ~/.daeyeon-bot/state.db \
+        "SELECT handler, substr(last_error,1,60), COUNT(*) FROM outbox
+          WHERE status='dead_letter' GROUP BY 1, 2 ORDER BY 3 DESC;"
+      ```
 - [ ] Token expiry date noted? (rotate before next expiry).
 - [ ] Was the old token committed or logged anywhere? `just check` and
       `git log -p` for `sk-ant-` / `oat`. The redact processor scrubs new
@@ -465,9 +517,12 @@ change:
 # 2. wait for in-flight reviews to drain, THEN restart. A review can run
 #    9-15 min, well past TimeoutStopSec=180, so restarting mid-review gets
 #    the claude subprocess SIGKILLed and dead-letters the row (exit 143).
+# Wait on 'running' ONLY. A 'pending' row is unclaimed — no subprocess to
+# kill, it just gets claimed again after boot. Including it means the loop
+# never terminates on a busy day, because the poller keeps refilling pending.
 until [ "$(sqlite3 ~/.daeyeon-bot/state.db \
   "SELECT COUNT(*) FROM outbox WHERE handler='pr_review' \
-   AND status IN ('running','pending');")" = 0 ]; do sleep 20; done
+   AND status='running';")" = 0 ]; do sleep 20; done
 systemctl --user restart daeyeon-bot
 ```
 

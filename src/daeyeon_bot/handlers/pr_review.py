@@ -80,6 +80,12 @@ MANIFEST = HandlerManifest(
     accepts=("gh.review_requested", "pr.review.manual"),
 )
 
+# Cap on error detail written to `outbox.last_error` / `pr_review_audit.error`.
+# Pydantic renders one paragraph per rejected field, so an `extra="forbid"`
+# mismatch on a wide object runs to several KB; enough to name the fields is
+# enough to triage, and the raw reply is logged separately.
+_ERROR_DETAIL_CHARS = 1500
+
 # Templated body when the size budget is exceeded (claude-review-output.md §5).
 _TOO_LARGE_TEMPLATE = (
     "This PR is too large for an automated review at SHA `{head_sha}`.\n"
@@ -176,20 +182,34 @@ class PrReviewHandler:
         prior_reviews = await self.gh.list_prior_reviews_with_comments(
             sized.repo, sized.pr_number, login=self.github_username, limit=2
         )
-        review = await self._call_claude_with_retry(
-            ctx=ctx,
-            system_prompt=build_system_prompt(sized.persona.body),
-            user_message=render_user_message(
-                repo=sized.repo,
-                pr_number=sized.pr_number,
-                title=str(sized.pr.get("title", "")),
-                body=str(sized.pr.get("body") or ""),
-                author_login=sized.author_login,
-                head_sha=sized.head_sha,
-                files=sized.files,
-                prior_reviews=prior_reviews,
-            ),
-        )
+        try:
+            review = await self._call_claude_with_retry(
+                ctx=ctx,
+                system_prompt=build_system_prompt(sized.persona.body),
+                user_message=render_user_message(
+                    repo=sized.repo,
+                    pr_number=sized.pr_number,
+                    title=str(sized.pr.get("title", "")),
+                    body=str(sized.pr.get("body") or ""),
+                    author_login=sized.author_login,
+                    head_sha=sized.head_sha,
+                    files=sized.files,
+                    prior_reviews=prior_reviews,
+                ),
+            )
+        except PermanentError as exc:
+            # A PermanentError here becomes DeadLetter, and until now left no
+            # audit row at all — so `pr_review_audit` showed a clean run of
+            # skips while every real review was being destroyed. `AuthError` is
+            # deliberately not caught: it is not a PermanentError subclass, and
+            # it must reach the dispatcher to halt the daemon (exit 78).
+            await self._write_audit(
+                **sized.audit_kwargs,
+                status="failed",
+                error=str(exc)[:_ERROR_DETAIL_CHARS],
+                created_at=now,
+            )
+            raise
 
         await self.pause_guard()
         return await self._post_review_and_audit(
@@ -541,8 +561,25 @@ class PrReviewHandler:
                 return ReviewOutput.model_validate(parsed)
             except PydanticValidationError as exc:
                 last_error = exc.errors().__repr__()
+                # Symmetry with the parse branch above is the point: without the
+                # raw reply *and* pydantic's detail, a dead-letter row says only
+                # "(schema)" and the actual payload is unrecoverable. That cost
+                # two days on 2026-08-04 — the object being rejected was an API
+                # auth-error envelope, which only became visible because
+                # `ci_triage` happened to embed its validation errors.
+                _log.warning(
+                    "pr_review.claude_schema_invalid",
+                    attempt=attempt,
+                    errors=last_error[:_ERROR_DETAIL_CHARS],
+                    response_chars=len(response),
+                    response_head=response[:400],
+                    response_tail=response[-200:],
+                )
                 if attempt == 1:
-                    raise PermanentError("claude returned malformed review (schema)") from exc
+                    raise PermanentError(
+                        "claude returned malformed review (schema):"
+                        f" {last_error[:_ERROR_DETAIL_CHARS]}"
+                    ) from exc
                 continue
         raise PermanentError("unreachable: claude retry loop fell through")
 

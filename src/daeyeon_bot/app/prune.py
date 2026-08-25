@@ -6,7 +6,9 @@ PLAN.md §4.2 retention defaults:
     runs_days = 30                  # delete runs older than this …
     runs_keep_per_handler = 10      #   … unless they're in the most-recent N per handler.
     dedup_default_ttl_days = 7      # dedup_keys cleanup honours each row's expires_at.
-    gh_state_dormant_days = 90      # delete dormant gh_review_requested_state rows.
+    gh_state_dormant_days = 90      # delete dormant gh_review_requested_state AND
+                                    #   gh_pr_feedback_state rows (feature 004 shares
+                                    #   the knob — both are per-PR polling state).
     dead_letter_days = 30           # delete outbox `dead_letter` rows ahead of events_days.
 
 Events pruning cascades the outbox rows that reference them — but only if
@@ -30,7 +32,7 @@ from datetime import datetime, timedelta
 import aiosqlite
 
 from daeyeon_bot.app.config import Config
-from daeyeon_bot.infra import pr_review_state
+from daeyeon_bot.infra import pr_feedback_state, pr_review_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +61,12 @@ async def prune(conn: aiosqlite.Connection, *, config: Config, now: datetime) ->
         conn,
         cutoff=now - timedelta(days=config.retention.events_days),
     )
-    gh_state_deleted = await pr_review_state.prune_dormant(
-        conn,
-        older_than_iso=(now - timedelta(days=config.retention.gh_state_dormant_days)).isoformat(),
-    )
+    gh_state_cutoff = (now - timedelta(days=config.retention.gh_state_dormant_days)).isoformat()
+    gh_state_deleted = await pr_review_state.prune_dormant(conn, older_than_iso=gh_state_cutoff)
+    # Feature 004. Note this prunes only the POLLING state; `pr_autofix_comment`
+    # is deliberately left alone, so a PR whose state row aged out cannot come
+    # back and have its old comments answered a second time.
+    gh_state_deleted += await pr_feedback_state.prune_dormant(conn, older_than_iso=gh_state_cutoff)
     await conn.commit()
     return PruneReport(
         runs_deleted=runs_deleted,

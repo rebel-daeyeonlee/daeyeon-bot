@@ -1,8 +1,15 @@
 """Async wrapper around the operator's local `gh` CLI.
 
-All GitHub access flows through this module. Auth is delegated to `gh` —
-the daemon stores no GitHub token of its own. The 5 endpoints exposed here
-are the entire GitHub surface (`contracts/github-api-surface.md`).
+All GitHub *API* access flows through this module. Auth is delegated to `gh` —
+the daemon stores no GitHub token of its own. The endpoints exposed here are
+the entire GitHub API surface (`contracts/github-api-surface.md`), grouped as:
+
+    reviews / PR metadata      — feature 001 (`pr_review`)
+    workflow runs / job logs   — feature 003 (`ci_triage`)
+    PR comments + replies      — feature 004 (`pr_autofix`)
+
+Feature 004 also performs git writes (commit / push), but those go through
+`infra/git_workspace.py` and never through this module.
 
 Error mapping (per `contracts/github-api-surface.md` §"Auth & rate-limit"):
     HTTP 401 / auth failure  → AuthError       (daemon halts, exit 78)
@@ -586,6 +593,92 @@ class GhCli:
             rid = r.get("id")
             r["inline_comments"] = comments_by_review.get(rid, []) if isinstance(rid, int) else []
         return recent
+
+    # ── Feature 004: PR review-comment auto-fix surface ───────────────────
+    #
+    # Read:  GET /repos/{repo}/pulls/{n}/comments      (inline review comments)
+    #        GET /repos/{repo}/issues/{n}/comments     (PR-level conversation)
+    #        GET /repos/{repo}/pulls/{n}/reviews       (review bodies)
+    # Write: POST /repos/{repo}/pulls/{n}/comments/{id}/replies
+    #        POST /repos/{repo}/issues/{n}/comments
+    #
+    # The two POSTs are the daemon's ONLY GitHub write calls outside
+    # `post_review`. Everything git-side (commit/push) goes through
+    # `infra/git_workspace.py`, never through here.
+
+    async def list_review_comments(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """All inline review comments on a PR, oldest first.
+
+        Each item carries `id`, `user.login`, `body`, `path`, `line`,
+        `diff_hunk`, and `in_reply_to_id` (present only on replies).
+        """
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/comments",
+            extra=("-f", "per_page=100"),
+            paginate=True,
+        )
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def list_issue_comments(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """All PR-level conversation comments. A PR is an issue for this endpoint."""
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/issues/{pr_number}/comments",
+            extra=("-f", "per_page=100"),
+            paginate=True,
+        )
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def list_reviews(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """All submitted reviews on a PR (any author).
+
+        Distinct from `list_reviews_at`, which filters to one `(commit, login)`
+        pair for dedup. Review *bodies* often hold a bot's summary findings that
+        never became inline comments, so the autofix triage needs them too.
+        """
+        payload = await self._api(
+            "GET",
+            f"/repos/{repo}/pulls/{pr_number}/reviews",
+            extra=("-f", "per_page=100"),
+            paginate=True,
+        )
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def reply_to_review_comment(
+        self, repo: str, pr_number: int, comment_id: int, body: str
+    ) -> dict[str, Any]:
+        """Reply inside an inline review-comment thread.
+
+        `comment_id` MUST be the thread ROOT — GitHub answers 422 for a
+        reply-to-a-reply. Callers resolve the root via `in_reply_to_id`
+        before getting here (see `pr_autofix_comments.build_feedback`).
+        """
+        payload = await self._api(
+            "POST",
+            f"/repos/{repo}/pulls/{pr_number}/comments/{comment_id}/replies",
+            stdin_json={"body": body},
+        )
+        if not isinstance(payload, dict):
+            raise PermanentError("gh reply_to_review_comment returned non-object")
+        return payload
+
+    async def post_issue_comment(self, repo: str, pr_number: int, body: str) -> dict[str, Any]:
+        """Post one PR-level conversation comment."""
+        payload = await self._api(
+            "POST",
+            f"/repos/{repo}/issues/{pr_number}/comments",
+            stdin_json={"body": body},
+        )
+        if not isinstance(payload, dict):
+            raise PermanentError("gh post_issue_comment returned non-object")
+        return payload
 
     async def _discover_existing_review(
         self,

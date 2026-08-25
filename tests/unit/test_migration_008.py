@@ -8,6 +8,10 @@ import aiosqlite
 
 from daeyeon_bot.infra.storage import apply_migrations, open_db
 
+# The running tip, not 8 — these tests guard that apply_migrations reaches the
+# newest migration, and every added migration moves that number.
+_LATEST_SCHEMA_VERSION = 9
+
 
 async def _open(tmp_path: Path) -> aiosqlite.Connection:
     conn = await open_db(tmp_path / "state.db")
@@ -15,13 +19,13 @@ async def _open(tmp_path: Path) -> aiosqlite.Connection:
     return conn
 
 
-async def test_schema_version_is_8(tmp_path: Path) -> None:
+async def test_schema_version_is_latest(tmp_path: Path) -> None:
     conn = await _open(tmp_path)
     try:
         async with conn.execute("SELECT value FROM meta WHERE key = 'schema_version'") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert int(row["value"]) == 8
+        assert int(row["value"]) == _LATEST_SCHEMA_VERSION
     finally:
         await conn.close()
 
@@ -39,6 +43,6 @@ async def test_feedback_columns_exist(tmp_path: Path) -> None:
 async def test_is_idempotent(tmp_path: Path) -> None:
     conn = await _open(tmp_path)
     try:
-        assert await apply_migrations(conn) == 8
+        assert await apply_migrations(conn) == _LATEST_SCHEMA_VERSION
     finally:
         await conn.close()

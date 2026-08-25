@@ -303,6 +303,96 @@ ticket_jira_projects = ["SSWCI", "SDOC"]
 log_only_triage_enabled = true
 ticket_draft_enabled = true
 
+# ─── Feature 004: PR review-comment auto-fix loop ──────────────────────────────
+# Polls YOUR OWN open PRs, reads what review bots and humans commented, judges
+# each remark, fixes the ones worth fixing, pushes, and replies to every one of
+# them — accepted and rejected alike. Stops on its own once nothing is pending.
+#
+# This is the only part of the daemon that WRITES to a git remote. Read the
+# whole section before flipping `enabled`.
+
+[triggers.gh_pr_feedback]
+enabled = false
+# Faster than gh_review_requested (300 s): review bots answer within a minute or
+# two of a push, and the value is in turning that around before you've moved on.
+poll_interval_seconds = 180
+# Cap on how many PRs may start an autofix run per cycle. Each one can spend
+# minutes in an agent session, so a burst of freshly-reviewed PRs must not queue
+# up an unbounded amount of Claude work.
+max_per_cycle = 5
+
+[handlers.pr_autofix]
+enabled = false
+persona_skill = "daeyeon-bot-pr-autofix"
+min_persona_chars = 200
+# skills_root = "~/.claude/skills"   # default: the repo-bundled .claude/skills
+
+# ── scope ─────────────────────────────────────────────────────────────────────
+# Glob allowlist of `owner/repo`. Strongly recommended for a handler that
+# pushes. An empty list means "every repo where you authored an open PR".
+allowed_repos = ["rebel-daeyeonlee/*"]
+# Which comment authors get triaged. `["*"]` = bots AND human reviewers.
+# Narrow to leave humans alone:  comment_authors = ["*[bot]", "coderabbitai"]
+comment_authors = ["*"]
+# Subtracted from the above; wins on conflict.
+ignored_authors = []
+# Substrings identifying the bot's own past replies (they are posted under YOUR
+# gh identity, so without this they'd look like fresh feedback next poll).
+# Keep in sync with the header in handlers/pr_autofix_reply.py.
+self_comment_markers = ["daeyeon-bot autofix"]
+
+# ── runaway brakes ────────────────────────────────────────────────────────────
+# Autofix rounds per PR before the bot stands down and says so on the PR.
+# 0 = unlimited. bot-fixes → bot-re-reviews → bot-fixes has no natural end;
+# this is the only thing that stops it.
+max_rounds = 5
+# Wall-clock budget for one event: triage + agent + verify + push.
+timeout_seconds = 1800
+# Tool-use turns allowed inside one fix session.
+agent_max_turns = 60
+# Post-hoc diff gate. Exceeding either budget means NO push — the bot reverts
+# and hands the work back with an explanation.
+max_changed_files = 30
+max_changed_lines = 800
+# Paths the fix agent may never touch, enforced against the resulting `git diff`
+# regardless of what the agent thought it was doing.
+protected_paths = [
+    ".github/**",
+    "**/*.lock",
+    "uv.lock",
+    "poetry.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "Cargo.lock",
+]
+
+# ── workspace ─────────────────────────────────────────────────────────────────
+# One throwaway clone per repo, under the project root. Rebuildable; gitignored.
+# The path guard refuses anything in $HOME or outside the project root.
+workspace_root = "var/pr-autofix"
+allow_external_workspace = false
+git_timeout_seconds = 300
+
+# ── verification ──────────────────────────────────────────────────────────────
+# Per-repo pre-push command, run inside the workspace clone. A repo listed here
+# is NEVER pushed unless the command exits 0; a repo not listed is pushed
+# without verification. Highly recommended for anything you actually merge.
+verify_timeout_seconds = 900
+
+# ── output ────────────────────────────────────────────────────────────────────
+# Set push_enabled = false for a dry run: the bot triages, fixes, verifies and
+# commits in the workspace, then stops without pushing. Replies still go out, so
+# you can read its judgement before granting it the remote.
+push_enabled = true
+git_author_name = "daeyeon-bot"
+git_author_email = "daeyeon-bot@users.noreply.github.com"
+commit_message_prefix = "fix(review)"
+
+# Per-repo pre-push commands. MUST come last in this section — TOML forbids
+# re-opening `[handlers.pr_autofix]` after a subtable of it.
+[handlers.pr_autofix.verify_commands]
+# "rebel-daeyeonlee/daeyeon-bot" = "just check"
+
 # ─── Routing ───────────────────────────────────────────────────────────────────
 # event.type → list of handler names. A type with no entry is dropped (logged).
 
@@ -314,3 +404,5 @@ ticket_draft_enabled = true
 "jira.triage.manual"  = ["jira_triage"]
 "slack.ci_alert"      = ["ci_triage"]
 "ci.triage.manual"    = ["ci_triage"]
+"gh.pr_feedback"      = ["pr_autofix"]
+"pr.autofix.manual"   = ["pr_autofix"]

@@ -83,13 +83,29 @@ async def apply_migrations(conn: aiosqlite.Connection) -> int:
 
     Each migration runs inside its own transaction. Returns the schema_version
     after the run.
+
+    **One migrator at a time.** In production that is guaranteed by the pidfile
+    flock (`app/lock.py`) plus boot ordering — migrations are step 5 of a
+    single-instance daemon. It is NOT enforced here: each migration script owns
+    its own `BEGIN/COMMIT`, and `executescript` implicitly commits any pending
+    transaction, so this function cannot hold a lock across the run. The
+    per-iteration version re-read below narrows the window but does not close
+    it. Callers that migrate alongside a booting daemon (integration tests)
+    must wait for the boot's migration to finish rather than racing it.
     """
     migrations = migration_files()
     if not migrations:
         return await _current_schema_version(conn)
 
-    current = await _current_schema_version(conn)
     for seq, _name, sql in migrations:
+        # Re-read the version on EVERY iteration rather than trusting a value
+        # read once before the loop. Another connection can advance it while we
+        # are mid-run — a second daemon racing to boot, or an integration test
+        # that migrates alongside `lifecycle.boot()`. Replaying a migration is
+        # mostly harmless because the DDL is `IF NOT EXISTS`, but SQLite has no
+        # `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so migration 007 fails
+        # hard with "duplicate column name" and leaves the loser stuck.
+        current = await _current_schema_version(conn)
         if seq <= current:
             continue
         await conn.executescript("BEGIN;\n" + sql + "\nCOMMIT;")
@@ -98,8 +114,7 @@ async def apply_migrations(conn: aiosqlite.Connection) -> int:
             (str(seq),),
         )
         await conn.commit()
-        current = seq
-    return current
+    return await _current_schema_version(conn)
 
 
 async def fetch_one(

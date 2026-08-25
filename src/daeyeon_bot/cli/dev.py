@@ -259,6 +259,101 @@ async def _fire_pr_review(*, pr: str, force: bool, dry_run: bool, config_path: s
     typer.echo(event.id)
 
 
+@app.command(
+    "fire-pr-autofix",
+    help=(
+        "Enqueue a manual pr_autofix event for one PR. Reads the PR's live head SHA"
+        " and lets the handler recompute which comments are still unanswered, so"
+        " this is the same work the poller would do — just now instead of on the"
+        " next cycle. Bypasses `allowed_repos` (you are authorizing this PR"
+        " explicitly), but NOT the author gate: the bot still refuses to push to"
+        " a PR you did not write."
+    ),
+)
+def fire_pr_autofix(
+    pr: str = typer.Option(..., "--pr", help="PR ref: 'owner/repo#N' or full GitHub URL."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the event JSON instead of writing it."
+    ),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config.toml."),
+) -> None:
+    asyncio.run(_fire_pr_autofix(pr=pr, dry_run=dry_run, config_path=config))
+
+
+async def _fire_pr_autofix(*, pr: str, dry_run: bool, config_path: str | None) -> None:
+    """Build a `pr.autofix.manual` event and enqueue it via the outbox."""
+    repo, pr_number = _parse_pr_ref(pr)
+    cfg = load(config_path)
+    cfg.state_dir_path.mkdir(parents=True, exist_ok=True)
+
+    routing = cfg.routing.get("pr.autofix.manual", [])
+    if not routing:
+        raise typer.BadParameter(
+            "no handlers configured for 'pr.autofix.manual'. Edit config.toml's [routing] section."
+        )
+
+    gh = GhCli(timeout_seconds=cfg.github.gh_call_timeout_seconds)
+    try:
+        pr_payload = await gh.pr_get(repo, pr_number)
+    except (AuthError, PermanentError) as exc:
+        typer.echo(f"failed to fetch PR: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    head_obj = pr_payload.get("head")
+    head_sha = ""
+    if isinstance(head_obj, dict):
+        sha = cast("dict[str, object]", head_obj).get("sha")
+        if isinstance(sha, str):
+            head_sha = sha
+    if not head_sha:
+        typer.echo(f"PR {pr} has no head SHA; aborting", err=True)
+        raise typer.Exit(code=1)
+
+    now = datetime.now(tz=UTC)
+    payload: dict[str, object] = {
+        "repo": repo,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        # Round 1 so a manual fire never trips `max_rounds` on its own; the
+        # handler recomputes the pending comment set regardless.
+        "round": 1,
+        "comment_ids": [],
+        "observed_at": now.isoformat(),
+    }
+    # A fresh UUID per invocation: firing the same PR twice on purpose must not
+    # be swallowed by the events UNIQUE constraint the way a re-poll is.
+    dedup_key = f"pr-autofix-manual-{uuid.uuid4()}"
+    event = make_event(type="pr.autofix.manual", payload=payload, created_at=now)
+
+    if dry_run:
+        typer.echo(
+            json.dumps(
+                {
+                    "event_id": event.id,
+                    "type": event.type,
+                    "payload": payload,
+                    "source_dedup_key": dedup_key,
+                    "routes_to": routing,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    async with storage.connection(cfg.db_path) as conn:
+        await storage.apply_migrations(conn)
+        ok = await outbox.insert_event(
+            conn, event, source="pr_autofix_manual", source_dedup_key=dedup_key
+        )
+        if not ok:
+            typer.echo("duplicate dedup key — an identical event is already queued", err=True)
+            raise typer.Exit(code=1)
+        for handler in routing:
+            await outbox.enqueue_handler(conn, event_id=event.id, handler=handler, now=now)
+        await conn.commit()
+    typer.echo(event.id)
+
+
 _JIRA_ISSUE_RE = re.compile(r"^(?P<key>[A-Z]+-\d+)$")
 _JIRA_URL_RE = re.compile(r"^https?://[^/]+/browse/(?P<key>[A-Z]+-\d+)/?$")
 

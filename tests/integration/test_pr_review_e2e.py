@@ -32,6 +32,7 @@ from daeyeon_bot.core.events import make_event
 from daeyeon_bot.infra import outbox, storage
 from daeyeon_bot.infra.claude import FakeClaudeSession, FakeFactory
 from daeyeon_bot.infra.pr_review_persona import PersonaLoader
+from tests.conftest import wait_for_migrated_db
 from tests.fakes.gh_cli import FakeGh
 from tests.fakes.pr_persona import materialize_persona
 
@@ -159,11 +160,7 @@ async def test_manual_pr_review_flows_end_to_end(
 
     cfg = load(str(config_file))
     db_path = cfg.db_path
-    for _ in range(50):
-        if db_path.exists():
-            break
-        await asyncio.sleep(0.05)
-    assert db_path.exists()
+    await wait_for_migrated_db(db_path)
 
     # Mirror the dev CLI: write the event + outbox row through the public API.
     payload = {
@@ -179,7 +176,6 @@ async def test_manual_pr_review_flows_end_to_end(
     event = make_event(type="pr.review.manual", payload=payload, created_at=now)
 
     async with storage.connection(db_path) as conn:
-        await storage.apply_migrations(conn)
         await outbox.insert_event(
             conn, event, source="pr_review_manual", source_dedup_key=dedup_key
         )
@@ -270,11 +266,7 @@ async def test_self_authored_short_circuits(
 
     cfg = load(str(config_file))
     db_path = cfg.db_path
-    for _ in range(50):
-        if db_path.exists():
-            break
-        await asyncio.sleep(0.05)
-    assert db_path.exists()
+    await wait_for_migrated_db(db_path)
 
     # Fire via the AUTO path — the self-authored short-circuit applies to the
     # `gh.review_requested` poller, not to an explicit manual fire (which now
@@ -289,7 +281,6 @@ async def test_self_authored_short_circuits(
     now = datetime.now(tz=UTC)
     event = make_event(type="gh.review_requested", payload=payload, created_at=now)
     async with storage.connection(db_path) as conn:
-        await storage.apply_migrations(conn)
         await outbox.insert_event(
             conn,
             event,
@@ -403,11 +394,7 @@ async def test_persona_flip_takes_effect_without_restart(
 
     cfg = load(str(config_file))
     db_path = cfg.db_path
-    for _ in range(50):
-        if db_path.exists():
-            break
-        await asyncio.sleep(0.05)
-    assert db_path.exists()
+    await wait_for_migrated_db(db_path)
 
     async def _fire_manual_event(pr_number: int, head_sha: str) -> str:
         payload = {
@@ -422,7 +409,6 @@ async def test_persona_flip_takes_effect_without_restart(
         now = datetime.now(tz=UTC)
         event = make_event(type="pr.review.manual", payload=payload, created_at=now)
         async with storage.connection(db_path) as conn:
-            await storage.apply_migrations(conn)
             await outbox.insert_event(
                 conn, event, source="pr_review_manual", source_dedup_key=dedup_key
             )

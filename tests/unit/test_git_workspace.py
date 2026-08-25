@@ -296,3 +296,28 @@ async def test_concurrent_verifies_do_not_block_the_loop(tmp_path: Path, origin:
         ws.run_verify("sleep 0.3 && true", timeout_s=30.0),
     )
     assert all(r.passed for r in results)
+
+
+async def test_verify_does_not_inherit_the_daemons_virtualenv(
+    tmp_path: Path, origin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon runs inside its own uv venv. Handing that to a verify command
+    meant for the TARGET repo made uv warn and then fail — seen on
+    ssw-bundle#5250 right before `FileNotFoundError`."""
+    monkeypatch.setenv("VIRTUAL_ENV", "/opt/daemon/.venv")
+    monkeypatch.setenv("PYTHONPATH", "/opt/daemon/src")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/opt/daemon/.venv")
+    monkeypatch.setenv("PATH_KEEPS_WORKING", "yes")
+
+    ws = _local_workspace(tmp_path, origin)
+    outcome = await ws.run_verify(
+        'echo "VE=[${VIRTUAL_ENV:-}] PP=[${PYTHONPATH:-}] UV=[${UV_PROJECT_ENVIRONMENT:-}]"'
+        ' && echo "KEEP=[${PATH_KEEPS_WORKING:-}]"',
+        timeout_s=30.0,
+    )
+    assert outcome.passed
+    assert "VE=[]" in outcome.output_tail
+    assert "PP=[]" in outcome.output_tail
+    assert "UV=[]" in outcome.output_tail
+    # Only the venv-shaped vars are dropped; the rest of the environment stands.
+    assert "KEEP=[yes]" in outcome.output_tail

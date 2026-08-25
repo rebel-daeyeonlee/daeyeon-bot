@@ -282,10 +282,16 @@ class GhPrFeedbackTrigger:
                 # settled. Nothing to emit; the PR stays observed and quiet.
                 await conn.commit()
                 return False
-            round_no = await pr_feedback_state.consume_round(
-                conn, repo=repo, pr_number=pr_number, now_iso=now_iso
-            )
-            del state
+            # Consume the round only if an event is actually written. Doing it
+            # first burned a round on every re-poll of an UNCHANGED pending set:
+            # the dedup key is a hash of that set, so `_emit_event` correctly
+            # returns False, but the counter had already moved. A PR whose
+            # comments stay pending on purpose — which is exactly what
+            # `verify_failed` leaves behind — then walked its own round budget
+            # to zero on polling frequency alone and stood itself down without
+            # ever doing the work. Observed on ssw-bundle#5250: round 6, three
+            # events.
+            round_no = state.round + 1
             wrote = await _emit_event(
                 conn,
                 repo=repo,
@@ -296,6 +302,10 @@ class GhPrFeedbackTrigger:
                 now=now,
                 now_iso=now_iso,
             )
+            if wrote:
+                round_no = await pr_feedback_state.consume_round(
+                    conn, repo=repo, pr_number=pr_number, now_iso=now_iso
+                )
             await conn.commit()
         if wrote:
             _log.info(

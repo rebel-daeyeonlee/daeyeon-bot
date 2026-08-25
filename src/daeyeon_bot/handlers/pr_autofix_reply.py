@@ -33,6 +33,10 @@ _MARKER = "daeyeon-bot autofix"
 
 _HEADERS = {
     "accepted": f"🤖 **{_MARKER}** — 수정했습니다",
+    # `push_enabled = false`. A fix exists, but only inside a throwaway clone
+    # that the next round resets — so this must never read as "수정했습니다",
+    # and must never carry a commit link (it would 404).
+    "dry_run": f"🤖 **{_MARKER}** — 수정안만 만들었습니다 (dry run — push 안 함)",
     "rejected": f"🤖 **{_MARKER}** — 수정하지 않았습니다",
     "deferred": f"🤖 **{_MARKER}** — 사람 확인이 필요합니다",
     "failed": f"🤖 **{_MARKER}** — 처리하지 못했습니다",
@@ -57,21 +61,48 @@ def _files_line(files: tuple[str, ...]) -> str:
     return f"- 변경 파일: {shown}"
 
 
-def render_decision_reply(
+def render_decision_reply(  # noqa: PLR0912 — one branch per reply shape; each is documented
     decision: TriageDecision,
     *,
     repo: str,
     outcome: FixOutcome | None,
     commit_sha: str | None,
+    dry_run: bool = False,
 ) -> str:
     """The reply body for one triaged comment.
 
-    An `accepted` decision whose fix produced no commit is deliberately NOT
-    rendered as a success. It reports 미적용 instead — claiming a fix that is
-    not in the branch is worse than admitting the miss, because the reviewer
-    would stop checking.
+    Three outcomes have to stay distinguishable, because a reviewer reads this
+    and decides whether to look:
+      * fixed and shipped      → 수정했습니다, with a commit link;
+      * fixed but NOT shipped  → dry run; says so, and links nothing, since the
+        commit lives only in a workspace clone the next round wipes;
+      * accepted but no fix    → 처리하지 못했습니다.
+    Claiming a fix that is not on the branch is worse than admitting the miss —
+    the reviewer stops checking.
     """
     verdict = decision.verdict
+    if verdict == "accepted" and dry_run:
+        lines = [
+            _HEADERS["dry_run"],
+            "",
+            decision.reasoning,
+            "",
+            f"- 적용 예정: {decision.fix_instruction}" if decision.fix_instruction else "",
+        ]
+        if outcome is not None:
+            files = _files_line(outcome.diff.changed_files)
+            if files:
+                lines.append(files)
+            verify = _verify_line(outcome.verify)
+            if verify:
+                lines.append(verify)
+        lines += [
+            "",
+            "_`push_enabled = false` 이라 실제 브랜치에는 아무것도 올리지 않았습니다._"
+            " 적용을 원하시면 설정을 켠 뒤 이 스레드에 다시 코멘트해 주세요 —"
+            " 다음 폴링에서 새 지적으로 다시 처리합니다.",
+        ]
+        return "\n".join(line for line in lines if line != "")
     if verdict == "accepted" and not commit_sha:
         lines = [
             _HEADERS["failed"],
@@ -137,6 +168,7 @@ def render_aggregate_comment(
     repo: str,
     outcome: FixOutcome | None,
     commit_sha: str | None,
+    dry_run: bool = False,
 ) -> str:
     """One PR-level comment answering every non-inline feedback item."""
     lines = [f"🤖 **{_MARKER}**", ""]
@@ -146,7 +178,9 @@ def render_aggregate_comment(
             "rejected": "🚫 수정 안 함",
             "deferred": "🤔 사람 확인 필요",
         }.get(decision.verdict, "⚠️ 처리 실패")
-        if decision.verdict == "accepted" and not commit_sha:
+        if decision.verdict == "accepted" and dry_run:
+            label = "📝 수정안만 (dry run)"
+        elif decision.verdict == "accepted" and not commit_sha:
             label = "⚠️ 미적용"
         source = (
             f"[`{comment.author}`의 코멘트]({comment.html_url})"
@@ -163,6 +197,10 @@ def render_aggregate_comment(
             lines.append(f"- 적용: {decision.fix_instruction}")
         lines.append("")
 
+    if dry_run:
+        lines.append("---")
+        lines.append("_`push_enabled = false` — 실제 브랜치에는 아무것도 올리지 않았습니다._")
+        return "\n".join(lines)
     commit = _commit_line(commit_sha, repo)
     if commit:
         lines.append("---")

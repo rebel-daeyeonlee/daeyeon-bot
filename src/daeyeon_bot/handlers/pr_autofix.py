@@ -68,6 +68,7 @@ from daeyeon_bot.handlers.pr_autofix_comments import build_feedback
 from daeyeon_bot.handlers.pr_autofix_prompt import (
     build_fix_system_prompt,
     build_triage_system_prompt,
+    parse_verify_command,
     render_fix_message,
     render_triage_message,
 )
@@ -455,7 +456,7 @@ class PrAutofixHandler:
                 ),
             )
 
-        verify = await self._verify(workspace, pr.repo)
+        verify = await self._verify(workspace, pr.repo, agent_reply=summary)
         if verify is not None and not verify.passed:
             return await self._handle_verify_failure(
                 workspace, event, parsed, pr, audit_id, diff, verify, len(accepted), now
@@ -521,9 +522,28 @@ class PrAutofixHandler:
         async with self.agent_session_factory(cwd=workspace.path) as session:
             return await session.query(message, system=system)
 
-    async def _verify(self, workspace: GitWorkspace, repo: str) -> VerifyOutcome | None:
-        command = self.config.verify_command_for(repo)
+    async def _verify(
+        self, workspace: GitWorkspace, repo: str, *, agent_reply: str
+    ) -> VerifyOutcome | None:
+        """Run the pre-push check, or None when there is nothing to run.
+
+        Resolution order:
+          1. `[handlers.pr_autofix.verify_commands]` for this repo — an operator
+             override, normally empty.
+          2. The `VERIFY:` line the fix agent reported. The agent picks it by
+             reading the repository, so nothing in config goes stale when a repo
+             changes its CI.
+          3. Nothing — push and let the PR's own CI be the judge. That is the
+             real gate anyway; this stage is a fast first line of defence, not a
+             reimplementation of the repo's pipeline.
+
+        Either way the handler runs the command and reads the exit code itself,
+        so "did it pass" never rests on the model's own account of it.
+        """
+        override = self.config.verify_command_for(repo)
+        command = override or parse_verify_command(agent_reply) or ""
         if not command:
+            _log.info("pr_autofix.verify_skipped", repo=repo, reason="no command available")
             return None
         outcome = await workspace.run_verify(
             command, timeout_s=float(self.config.verify_timeout_seconds)
@@ -532,6 +552,7 @@ class PrAutofixHandler:
             "pr_autofix.verify",
             repo=repo,
             command=command,
+            source="config_override" if override else "agent",
             exit_code=outcome.exit_code,
         )
         return outcome

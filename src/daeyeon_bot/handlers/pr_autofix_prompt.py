@@ -23,6 +23,7 @@ stage already declined.
 from __future__ import annotations
 
 import json
+import re
 
 from daeyeon_bot.core.pr_autofix.types import FeedbackComment, TriageDecision
 from daeyeon_bot.handlers.pr_autofix_schemas import TriageOutput
@@ -90,13 +91,70 @@ FIX_DIRECTIVE = (
     "4. 다음 경로는 절대 수정하지 마세요: {protected}\n"
     "5. 어떤 항목을 구현할 수 없다고 판단되면, 억지로 고치지 말고 최종"
     " 보고에 그 항목과 이유를 적으세요.\n\n"
+    "## 검증 (이 리포지터리의 방식대로)\n"
+    "수정을 마쳤으면 **이 리포지터리가 원래 쓰는 방식으로** 스스로 검증하세요."
+    " 검증 명령은 설정에 박혀 있지 않습니다 — 리포지터리를 읽고 직접 알아내야"
+    " 합니다. 볼 곳: `CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md`,"
+    " `justfile` / `Makefile` / `tasks.py` / `package.json` scripts,"
+    " 그리고 `.github/workflows/` 중 pull_request 트리거를 가진 것.\n\n"
+    "고른 명령은 **내가 실제로 건드린 것에 대응**해야 합니다. 전체 CI를"
+    " 재현하려 하지 마세요 — 대부분은 이 클론에서 돌지 않습니다"
+    " (하드웨어 러너, 비어 있는 서브모듈, 없는 secret). Python 파일을"
+    " 고쳤으면 그 파일의 lint/unit test, 설정을 고쳤으면 그 설정의 validator"
+    " 정도가 적정선입니다.\n\n"
+    "명령을 Bash로 **직접 실행해 보고**, 결과를 확인한 뒤 최종 보고에 적으세요."
+    " 실패하면 원인이 내 수정 때문인지 보고, 내 탓이면 고치세요.\n\n"
+    "적정한 검증 방법을 못 찾겠으면 그렇다고 적으세요. 억지로 만들어내지"
+    " 마세요 — 최종 판정은 어차피 이 PR의 CI가 합니다.\n\n"
     "## 최종 보고\n"
     "작업이 끝나면 마지막 메시지에 항목별로 한국어 한두 줄 요약을 씁니다:\n"
     "```\n"
     "- [comment #<id>] <무엇을 어떻게 바꿨는지> (<파일:라인>)\n"
     "```\n"
-    "구현하지 못한 항목은 `- [comment #<id>] 미적용 — <이유>` 로 적습니다.\n"
+    "구현하지 못한 항목은 `- [comment #<id>] 미적용 — <이유>` 로 적습니다.\n\n"
+    "그리고 마지막 줄에 검증 명령을 **정확히 이 형식으로** 한 줄 적습니다."
+    " 핸들러가 이 줄을 파싱해서 같은 명령을 다시 돌리고, 그 exit code로"
+    " push 여부를 정합니다:\n"
+    "```\n"
+    "VERIFY: <실행한 셸 명령 한 줄>\n"
+    "```\n"
+    "검증 방법을 못 찾았으면 `VERIFY: none` 이라고 적습니다."
+    " 여러 명령이 필요하면 `&&` 로 이으세요. 이 줄은 반드시 있어야 합니다.\n"
 )
+
+# `VERIFY:` line the fix agent appends. Anchored to the start of a line so a
+# mention inside prose or a code block cannot be mistaken for the directive.
+_VERIFY_LINE_RE = re.compile(r"^\s*VERIFY:\s*(?P<cmd>.+?)\s*$", re.MULTILINE)
+_VERIFY_NONE = frozenset({"none", "없음", "n/a", "-"})
+# A verify command is run by the handler, so keep it to one plausible line.
+_MAX_VERIFY_COMMAND_CHARS = 500
+
+
+def parse_verify_command(agent_reply: str) -> str | None:
+    """Extract the `VERIFY:` command the fix agent chose, or None.
+
+    The agent picks the command because it can READ the repository — its
+    conventions, its justfile, its pull_request workflows — while `config.toml`
+    cannot and would go stale every time a repo changed its CI. The handler
+    still runs the command itself and gates on the exit code, so the decision
+    of WHAT to run is the model's and the judgement of whether it PASSED stays
+    with real process exit status rather than an LLM's self-report.
+
+    This does not widen the agent's reach: it already holds Bash inside the
+    same workspace, so it could run this command itself either way.
+
+    Takes the LAST match — an agent that revises its choice mid-message ends
+    with the one it settled on.
+    """
+    matches = _VERIFY_LINE_RE.findall(agent_reply or "")
+    if not matches:
+        return None
+    command = matches[-1].strip().strip("`").strip()
+    if not command or command.lower() in _VERIFY_NONE:
+        return None
+    if len(command) > _MAX_VERIFY_COMMAND_CHARS:
+        return None
+    return command
 
 
 def build_triage_system_prompt(persona_body: str) -> str:
@@ -216,6 +274,7 @@ __all__ = [
     "TRIAGE_DIRECTIVE",
     "build_fix_system_prompt",
     "build_triage_system_prompt",
+    "parse_verify_command",
     "render_comment",
     "render_fix_message",
     "render_triage_message",

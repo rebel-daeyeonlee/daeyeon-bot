@@ -374,9 +374,13 @@ allow_external_workspace = false
 git_timeout_seconds = 300
 
 # ── verification ──────────────────────────────────────────────────────────────
-# Per-repo pre-push command, run inside the workspace clone. A repo listed here
-# is NEVER pushed unless the command exits 0; a repo not listed is pushed
-# without verification. Highly recommended for anything you actually merge.
+# The fix agent works out how each repo verifies a change by READING it —
+# CLAUDE.md, justfile, tasks.py, the pull_request workflows — runs it, and
+# reports the command. The handler then runs that same command itself and gates
+# the push on its exit code, so "did it pass" never rests on the model's own
+# account. Nothing to configure, and nothing to keep in sync when a repo changes
+# its CI. If no verification can be worked out, the push happens and that PR's
+# own CI is the judge — which it is regardless.
 verify_timeout_seconds = 900
 
 # ── output ────────────────────────────────────────────────────────────────────
@@ -388,10 +392,12 @@ git_author_name = "daeyeon-bot"
 git_author_email = "daeyeon-bot@users.noreply.github.com"
 commit_message_prefix = "fix(review)"
 
-# Per-repo pre-push commands. MUST come last in this section — TOML forbids
-# re-opening `[handlers.pr_autofix]` after a subtable of it.
+# OPTIONAL override: force a specific pre-push command for one repo, instead of
+# letting the agent work it out. Leave empty unless you have a reason. MUST come
+# last in this section — TOML forbids re-opening `[handlers.pr_autofix]` after a
+# subtable of it.
 [handlers.pr_autofix.verify_commands]
-# "rebel-daeyeonlee/daeyeon-bot" = "just check"
+# "owner/repo" = "just check"
 
 # ─── Routing ───────────────────────────────────────────────────────────────────
 # event.type → list of handler names. A type with no entry is dropped (logged).

@@ -24,7 +24,10 @@ async def wait_for_migrated_db(db_path: Path, *, timeout_s: float = 10.0) -> Non
     head = max((seq for seq, _name, _sql in storage.migration_files()), default=0)
     deadline = asyncio.get_running_loop().time() + timeout_s
     while asyncio.get_running_loop().time() < deadline:
-        if db_path.exists():
+        # `exists()` on a local path is a single stat; offloading it to a
+        # thread here would cost more than it saves. noqa'd rather than
+        # wrapped so the polling loop stays readable.
+        if db_path.exists():  # noqa: ASYNC240
             try:
                 async with storage.connection(db_path) as conn:
                     async with conn.execute(

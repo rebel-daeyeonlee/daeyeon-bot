@@ -90,4 +90,3 @@ async def test_ledger_is_unique_per_comment(tmp_path: Path) -> None:
             await conn.execute(stmt)
     finally:
         await conn.close()
-

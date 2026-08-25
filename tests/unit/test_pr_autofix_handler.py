@@ -229,6 +229,7 @@ def _build(
     persona_root: Path,
     triage: list[str] | None = None,
     agent_edit: Callable[[Path], None] | None = None,
+    agent_reply: str | None = None,
     workspace_factory: Any = None,
     **config_kw: Any,
 ) -> tuple[PrAutofixHandler, _Ctx, list[_AgentSession]]:
@@ -243,7 +244,10 @@ def _build(
     sessions: list[_AgentSession] = []
 
     def _agent_factory(*, cwd: Path) -> _AgentSession:
-        session = _AgentSession(cwd=cwd, edit=agent_edit)
+        kwargs: dict[str, Any] = {"cwd": cwd, "edit": agent_edit}
+        if agent_reply is not None:
+            kwargs["reply"] = agent_reply
+        session = _AgentSession(**kwargs)
         sessions.append(session)
         return session
 
@@ -991,3 +995,184 @@ async def test_a_prior_skip_does_not_block_a_later_attempt(
         assert len(gh.replies) == 1
     finally:
         await conn.close()
+
+
+# ── agent-discovered verify command ───────────────────────────────────────
+
+
+def test_parse_verify_command_reads_the_agents_line() -> None:
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    assert (
+        parse_verify_command("- [comment #1] 고침\nVERIFY: uv run pytest inv -q")
+        == "uv run pytest inv -q"
+    )
+
+
+def test_parse_verify_command_treats_none_as_no_command() -> None:
+    """The agent must be able to say 'I could not work one out' — forcing it to
+    invent a command would produce a confident-looking failure on a repo whose
+    CI cannot run here at all."""
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    for reply in ("VERIFY: none", "VERIFY: 없음", "VERIFY: -", "VERIFY:   N/A"):
+        assert parse_verify_command(reply) is None, reply
+
+
+def test_parse_verify_command_ignores_a_mention_mid_line() -> None:
+    """Anchored to line start, so prose about the directive is not the directive."""
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    assert parse_verify_command("나는 VERIFY: rm -rf / 라고 쓰지 않았다") is None
+
+
+def test_parse_verify_command_takes_the_last_line() -> None:
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    assert parse_verify_command("VERIFY: first\ntext\nVERIFY: second") == "second"
+
+
+def test_parse_verify_command_rejects_an_absurdly_long_command() -> None:
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    assert parse_verify_command("VERIFY: " + "x" * 2000) is None
+
+
+def test_parse_verify_command_handles_no_line_at_all() -> None:
+    from daeyeon_bot.handlers.pr_autofix_prompt import parse_verify_command
+
+    assert parse_verify_command("- [comment #1] 고쳤습니다") is None
+    assert parse_verify_command("") is None
+
+
+async def test_agent_reported_command_gates_the_push(
+    tmp_path: Path, persona_root: Path, workspace_factory: Any
+) -> None:
+    """No config entry, yet a failing agent-chosen command still blocks the push."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh, head_sha=workspace_factory.head_sha)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+        handler, ctx, _sessions = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            agent_edit=_write("app.py", "x = 2\n"),
+            workspace_factory=workspace_factory,
+            verify_commands={},  # nothing pinned in config
+            agent_reply="- [comment #11] 고침\nVERIFY: echo nope && exit 1",
+        )
+
+        event = await _event(conn)
+        await handler.handle(event, ctx)  # type: ignore[arg-type]
+        row = await _audit(conn, event.id)
+        assert row is not None
+        assert row.status == "verify_failed"
+        assert row.verify_command == "echo nope && exit 1"
+        assert row.commit_sha is None
+    finally:
+        await conn.close()
+
+
+async def test_agent_reported_command_that_passes_lets_the_push_through(
+    tmp_path: Path, persona_root: Path, workspace_factory: Any
+) -> None:
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh, head_sha=workspace_factory.head_sha)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+        handler, ctx, _sessions = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            agent_edit=_write("app.py", "x = 2\n"),
+            workspace_factory=workspace_factory,
+            verify_commands={},
+            agent_reply="- [comment #11] 고침\nVERIFY: true",
+        )
+
+        event = await _event(conn)
+        await handler.handle(event, ctx)  # type: ignore[arg-type]
+        row = await _audit(conn, event.id)
+        assert row is not None
+        assert row.status == "pushed"
+        assert row.verify_command == "true"
+        assert row.verify_exit_code == 0
+    finally:
+        await conn.close()
+
+
+async def test_no_command_anywhere_pushes_and_leaves_it_to_ci(
+    tmp_path: Path, persona_root: Path, workspace_factory: Any
+) -> None:
+    """`VERIFY: none` and no config entry: push. The PR's own CI is the real
+    gate regardless, and refusing to push here would strand the fix."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh, head_sha=workspace_factory.head_sha)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+        handler, ctx, _sessions = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            agent_edit=_write("app.py", "x = 2\n"),
+            workspace_factory=workspace_factory,
+            verify_commands={},
+            agent_reply="- [comment #11] 고침\nVERIFY: none",
+        )
+
+        event = await _event(conn)
+        await handler.handle(event, ctx)  # type: ignore[arg-type]
+        row = await _audit(conn, event.id)
+        assert row is not None
+        assert row.status == "pushed"
+        assert row.verify_command is None
+    finally:
+        await conn.close()
+
+
+async def test_config_override_beats_the_agents_choice(
+    tmp_path: Path, persona_root: Path, workspace_factory: Any
+) -> None:
+    """An operator who pins a command means it — the agent does not get a vote."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh, head_sha=workspace_factory.head_sha)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+        handler, ctx, _sessions = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            agent_edit=_write("app.py", "x = 2\n"),
+            workspace_factory=workspace_factory,
+            verify_commands={REPO: "true"},
+            agent_reply="- [comment #11] 고침\nVERIFY: exit 1",
+        )
+
+        event = await _event(conn)
+        await handler.handle(event, ctx)  # type: ignore[arg-type]
+        row = await _audit(conn, event.id)
+        assert row is not None
+        assert row.status == "pushed"
+        assert row.verify_command == "true"  # the override, not `exit 1`
+    finally:
+        await conn.close()
+
+
+def test_fix_prompt_tells_the_agent_to_discover_and_report(persona_root: Path) -> None:
+    """The prompt is the only place the contract lives; a silent edit that drops
+    the VERIFY line would make every push unverified without failing anything."""
+    from daeyeon_bot.handlers.pr_autofix_prompt import build_fix_system_prompt
+
+    prompt = build_fix_system_prompt("persona", protected_paths=[".github/**"])
+    assert "VERIFY:" in prompt
+    assert "VERIFY: none" in prompt
+    assert ".github/workflows" in prompt

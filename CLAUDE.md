@@ -228,6 +228,14 @@ Two more invariants worth knowing before touching this feature:
   `ON DELETE CASCADE` would let retention resurrect months-old comments into
   the pending set and have the bot answer them a second time. `app/prune.py`
   prunes the polling state but never the ledger.
+- **The pre-push check is discovered, not configured.** The fix agent reads the
+  target repo (CLAUDE.md, justfile, `tasks.py`, its `pull_request` workflows),
+  runs what fits, and reports the command on a `VERIFY:` line; the handler runs
+  that same command and gates the push on its exit code, so a pass is a real
+  process exit rather than the model's own account. `verify_commands` in config
+  is an override, normally empty — pinning per-repo commands there goes stale
+  every time a repo changes its CI. No command found → push, and that PR's CI is
+  the judge, which it is either way.
 - **Ledger rows are written only after a comment is answered on GitHub.**
   Writing them at triage time would be faster and would silently swallow
   feedback on any crash between triage and reply.

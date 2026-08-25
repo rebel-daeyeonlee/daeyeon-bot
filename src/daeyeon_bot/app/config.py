@@ -390,9 +390,13 @@ class PrAutofixHandlerEntry(HandlerEntry):
     git_timeout_seconds: int = 300
 
     # ── verification ─────────────────────────────────────────────────────
-    # Map of `owner/repo` → shell command run in the workspace before commit.
-    # A repo with no entry is pushed without verification; a repo WITH an entry
-    # is never pushed unless the command exits 0.
+    # OPTIONAL per-repo override of the pre-push check, as `owner/repo` → shell
+    # command run in the workspace. Normally EMPTY: the fix agent works out how
+    # each repo verifies by reading it (CLAUDE.md, justfile, tasks.py, the
+    # pull_request workflows) and reports the command, which the handler then
+    # runs and gates on. Pinning commands here means re-pinning them every time
+    # a repo changes its CI, so use it only to force a specific command.
+    # No entry and no agent-reported command → push, and the PR's own CI judges.
     verify_commands: dict[str, str] = Field(default_factory=dict)
     verify_timeout_seconds: int = 900
 
@@ -403,7 +407,11 @@ class PrAutofixHandlerEntry(HandlerEntry):
     commit_message_prefix: str = "fix(review)"
 
     def verify_command_for(self, repo: str) -> str:
-        """Pre-push command for `repo`, or `""` when none is configured."""
+        """Operator override for `repo`'s pre-push command, or `""` for none.
+
+        `""` is the normal case and does NOT mean "skip verification" — it means
+        "let the fix agent decide", which is what `pr_autofix._verify` does next.
+        """
         return self.verify_commands.get(repo, "")
 
 

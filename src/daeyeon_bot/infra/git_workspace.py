@@ -33,9 +33,11 @@ Error mapping:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import shlex
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +58,10 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 _DEFAULT_GIT_TIMEOUT_S = 300.0
+# Grace between SIGTERM and SIGKILL for a timed-out verify command.
+_VERIFY_TERM_GRACE_S = 5.0
+# Backstop wait after SIGKILL so a zombie cannot wedge the handler.
+_VERIFY_REAP_TIMEOUT_S = 10.0
 # Tail of the verify command's combined output kept for the audit row + reply.
 _VERIFY_TAIL_CHARS = 4000
 
@@ -285,6 +291,14 @@ class GitWorkspace:
         A timeout is reported as a non-zero exit, not an exception — a slow
         verify is a *failed* verify, and the handler's "don't push" branch is
         already the right response.
+
+        `start_new_session=True` is load-bearing, not hygiene. A shell command
+        is `/bin/sh -c "..."` with the real work as a CHILD of that shell, so
+        `proc.kill()` reaps only the shell and leaves the build running — still
+        holding the stdout pipe, so the await does not even return until the
+        orphan finishes on its own. That turns `verify_timeout_seconds` into a
+        suggestion. Putting the command in its own process group lets the
+        timeout path signal the whole tree.
         """
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -293,12 +307,12 @@ class GitWorkspace:
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
             env=self._env(),
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await self._kill_process_group(proc)
             return VerifyOutcome(
                 command=command,
                 exit_code=124,
@@ -310,6 +324,33 @@ class GitWorkspace:
             exit_code=proc.returncode if proc.returncode is not None else 1,
             output_tail=text[-_VERIFY_TAIL_CHARS:],
         )
+
+    async def _kill_process_group(self, proc: asyncio.subprocess.Process) -> None:
+        """SIGTERM the timed-out command's whole process group, then SIGKILL.
+
+        The grace period lets a build tool remove its temp dirs; the follow-up
+        SIGKILL is what guarantees the handler slot is actually released. The
+        group id equals `proc.pid` because the process was started with
+        `start_new_session=True`.
+        """
+        for sig, grace in ((signal.SIGTERM, _VERIFY_TERM_GRACE_S), (signal.SIGKILL, None)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return  # already gone
+            except PermissionError:  # pragma: no cover — should not happen for our own child
+                _log.warning("git_workspace.killpg_denied", pid=proc.pid, signal=sig.name)
+                break
+            if grace is None:
+                break
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=grace)
+            except TimeoutError:
+                continue
+            else:
+                return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=_VERIFY_REAP_TIMEOUT_S)
 
     async def commit_all(self, message: str) -> str:
         """Stage every change and commit. Returns the new commit SHA.

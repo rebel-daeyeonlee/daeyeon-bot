@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -256,10 +257,34 @@ async def test_verify_timeout_is_a_failure_not_an_exception(tmp_path: Path, orig
     """A slow verify IS a failed verify, and the handler's 'don't push' branch
     is already the correct response — raising would take a different path."""
     ws = _local_workspace(tmp_path, origin)
-    outcome = await ws.run_verify("sleep 5", timeout_s=0.2)
+    outcome = await ws.run_verify("sleep 30", timeout_s=0.2)
     assert not outcome.passed
     assert outcome.exit_code == 124
     assert "timed out" in outcome.output_tail
+
+
+async def test_verify_timeout_returns_promptly_and_kills_the_whole_tree(
+    tmp_path: Path, origin: Path
+) -> None:
+    """The timeout must actually free the handler slot.
+
+    A shell command is `/bin/sh -c "..."` with the real work as a CHILD, so
+    killing only the shell leaves the build running AND holding the stdout
+    pipe — the await would then not return until the orphan finished on its
+    own, making `verify_timeout_seconds` a suggestion rather than a bound.
+    Both halves are asserted: the call returns fast, and the grandchild is
+    actually dead (its side effect never lands).
+    """
+    ws = _local_workspace(tmp_path, origin)
+    marker = tmp_path / "still-running"
+    started = time.monotonic()
+    outcome = await ws.run_verify(f"sh -c 'sleep 30; touch {marker}' & wait", timeout_s=0.2)
+    elapsed = time.monotonic() - started
+
+    assert outcome.exit_code == 124
+    assert elapsed < 10.0, f"timeout took {elapsed:.1f}s — the process tree outlived the kill"
+    await asyncio.sleep(0.3)
+    assert not marker.exists(), "the grandchild survived the timeout"
 
 
 async def test_concurrent_verifies_do_not_block_the_loop(tmp_path: Path, origin: Path) -> None:

@@ -466,36 +466,49 @@ class PrAutofixHandler:
         commit_sha = await workspace.commit_all(
             _commit_message(self.config.commit_message_prefix, accepted, pr)
         )
-        if self.config.push_enabled:
-            await workspace.push(head_repo=pr.head_repo, head_ref=pr.head_ref)
-        else:
+        dry_run = not self.config.push_enabled
+        if dry_run:
+            # The commit lives only in the workspace clone, which the next
+            # round resets. Nothing below may present it as shipped.
             _log.warning(
                 "pr_autofix.push_disabled",
                 repo=pr.repo,
                 pr_number=pr.pr_number,
-                commit_sha=commit_sha,
+                local_commit_sha=commit_sha,
             )
+        else:
+            await workspace.push(head_repo=pr.head_repo, head_ref=pr.head_ref)
 
-        outcome = FixOutcome(summary=summary, diff=diff, commit_sha=commit_sha, verify=verify)
-        await self._reply_all(pr, decisions, by_id, outcome=outcome, commit_sha=commit_sha)
+        # `shipped_sha` is what the reply and the ledger may cite: the SHA a
+        # reviewer can actually open. In a dry run there is no such SHA.
+        shipped_sha = None if dry_run else commit_sha
+        outcome = FixOutcome(summary=summary, diff=diff, commit_sha=shipped_sha, verify=verify)
+        await self._reply_all(
+            pr, decisions, by_id, outcome=outcome, commit_sha=shipped_sha, dry_run=dry_run
+        )
         await pr_autofix_audit.finish_run(
             self.db,
             audit_id,
-            status="pushed",
+            status="dry_run" if dry_run else "pushed",
             accepted_count=len(accepted),
             rejected_count=_count(decisions, "rejected"),
             deferred_count=_count(decisions, "deferred"),
+            # The local SHA is kept for forensics even in a dry run — it is the
+            # only handle on what the agent actually produced — but `pushed_at`
+            # stays NULL, which is what distinguishes shipped from not.
             commit_sha=commit_sha,
-            pushed_at=now,
+            pushed_at=None if dry_run else now,
             changed_files=len(diff.changed_files),
             changed_lines=diff.total_lines,
             verify_command=verify.command if verify else None,
             verify_exit_code=verify.exit_code if verify else None,
         )
-        await self._write_ledger(event, pr, decisions, by_id, commit_sha=commit_sha, now=now)
+        await self._write_ledger(
+            event, pr, decisions, by_id, commit_sha=shipped_sha, now=now, dry_run=dry_run
+        )
         await self.db.commit()
         _log.info(
-            "pr_autofix.pushed",
+            "pr_autofix.dry_run" if dry_run else "pr_autofix.pushed",
             repo=pr.repo,
             pr_number=pr.pr_number,
             commit_sha=commit_sha,
@@ -750,6 +763,7 @@ class PrAutofixHandler:
         *,
         outcome: FixOutcome | None,
         commit_sha: str | None,
+        dry_run: bool = False,
     ) -> None:
         """Answer every triaged comment — accepted, rejected and deferred alike.
 
@@ -768,7 +782,11 @@ class PrAutofixHandler:
                 aggregate.append((decision, comment))
                 continue
             body = render_decision_reply(
-                decision, repo=pr.repo, outcome=outcome, commit_sha=commit_sha
+                decision,
+                repo=pr.repo,
+                outcome=outcome,
+                commit_sha=commit_sha,
+                dry_run=dry_run,
             )
             target = comment.reply_target_id or comment.comment_id
             try:
@@ -785,7 +803,11 @@ class PrAutofixHandler:
         if not aggregate:
             return
         body = render_aggregate_comment(
-            aggregate, repo=pr.repo, outcome=outcome, commit_sha=commit_sha
+            aggregate,
+            repo=pr.repo,
+            outcome=outcome,
+            commit_sha=commit_sha,
+            dry_run=dry_run,
         )
         try:
             await self.gh.post_issue_comment(pr.repo, pr.pr_number, body)
@@ -806,16 +828,27 @@ class PrAutofixHandler:
         *,
         commit_sha: str | None,
         now: datetime,
+        dry_run: bool = False,
     ) -> None:
-        """Mark every decided comment handled. This is what ends the loop."""
+        """Mark every decided comment handled. This is what ends the loop.
+
+        A dry-run `accepted` is recorded as `deferred`, never `accepted`. The
+        distinction is not cosmetic: an `accepted` row means "done", so turning
+        `push_enabled` on later would never revisit it and the fix — which only
+        ever existed in a wiped workspace — would be silently lost. `deferred`
+        says what is true: a human still owns this one. The reply tells the
+        reviewer how to bring it back (comment again → new id → pending again).
+        """
         for decision in decisions:
             comment = by_id.get(decision.comment_id)
             if comment is None:
                 continue
             verdict = decision.verdict
+            if verdict == "accepted" and dry_run:
+                verdict = "deferred"  # type: ignore[assignment]
             # An `accepted` comment with no commit was NOT fixed; recording it
             # as accepted would leave a false trail in the ledger.
-            if verdict == "accepted" and commit_sha is None:
+            elif verdict == "accepted" and commit_sha is None:
                 verdict = "failed"  # type: ignore[assignment]
             await pr_autofix_ledger.record_decision(
                 self.db,
@@ -827,7 +860,12 @@ class PrAutofixHandler:
                 verdict=verdict,
                 created_at=now,
                 event_id=event.id,
-                reason=decision.reasoning[:2000],
+                reason=(
+                    "dry run (push_enabled=false) — 수정안만 만들고 브랜치에는 반영하지"
+                    " 않음. " + decision.reasoning
+                    if dry_run and decision.verdict == "accepted"
+                    else decision.reasoning
+                )[:2000],
                 commit_sha=commit_sha if decision.verdict == "accepted" else None,
                 replied=True,
             )

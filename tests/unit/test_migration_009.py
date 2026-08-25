@@ -9,7 +9,7 @@ import pytest
 
 from daeyeon_bot.infra.storage import apply_migrations, open_db
 
-_LATEST_SCHEMA_VERSION = 9
+_LATEST_SCHEMA_VERSION = 10
 
 
 async def _open(tmp_path: Path) -> aiosqlite.Connection:
@@ -88,5 +88,66 @@ async def test_ledger_is_unique_per_comment(tmp_path: Path) -> None:
         await conn.execute(stmt)
         with pytest.raises(aiosqlite.IntegrityError):
             await conn.execute(stmt)
+    finally:
+        await conn.close()
+
+
+async def test_migration_010_allows_the_dry_run_status(tmp_path: Path) -> None:
+    """SQLite cannot alter a CHECK, so 010 rebuilds the table. Verify the new
+    value is accepted and an unknown one is still refused."""
+    conn = await _open(tmp_path)
+    try:
+        await conn.execute(
+            "INSERT INTO events(id, type, schema_version, source, source_dedup_key,"
+            " payload_json, trace_id, created_at) VALUES"
+            " ('e1', 'gh.pr_feedback', 1, 'gh_pr_feedback', 'k', '{}', 't', '2026-01-01')"
+        )
+        await conn.execute(
+            "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+            " status, created_at) VALUES ('e1','o/r',1,'abc',1,'dry_run','2026-01-01')"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+                " status, created_at) VALUES ('e1','o/r',2,'abc',1,'shipped?','2026-01-01')"
+            )
+    finally:
+        await conn.close()
+
+
+async def test_migration_010_preserves_existing_audit_rows(tmp_path: Path) -> None:
+    """The rebuild copies data verbatim — a row written before the upgrade must
+    survive it, since these rows are the handler's crash guard."""
+    conn = await open_db(tmp_path / "state.db")
+    try:
+        # Stop at 9, insert, then let 010 rebuild underneath the row.
+        from daeyeon_bot.infra.storage import migration_files
+
+        for seq, _name, sql in migration_files():
+            if seq > 9:
+                break
+            await conn.executescript("BEGIN;\n" + sql + "\nCOMMIT;")
+            await conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(seq),),
+            )
+        await conn.execute(
+            "INSERT INTO events(id, type, schema_version, source, source_dedup_key,"
+            " payload_json, trace_id, created_at) VALUES"
+            " ('e9', 'gh.pr_feedback', 1, 'gh_pr_feedback', 'k9', '{}', 't', '2026-01-01')"
+        )
+        await conn.execute(
+            "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+            " status, commit_sha, created_at)"
+            " VALUES ('e9','o/r',7,'deadbeef',2,'pushed','abc123','2026-01-01')"
+        )
+        await conn.commit()
+
+        assert await apply_migrations(conn) == _LATEST_SCHEMA_VERSION
+        async with conn.execute(
+            "SELECT repo, pr_number, status, commit_sha FROM pr_autofix_audit"
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        assert rows == [{"repo": "o/r", "pr_number": 7, "status": "pushed", "commit_sha": "abc123"}]
     finally:
         await conn.close()

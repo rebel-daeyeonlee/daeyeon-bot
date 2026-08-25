@@ -14,10 +14,12 @@ from typing import Any
 from daeyeon_bot.app.config import (
     CiTriageHandlerEntry,
     Config,
+    GhPrFeedbackTriggerEntry,
     GhReviewRequestedTriggerEntry,
     HandlerEntry,
     JiraAssignedTriggerEntry,
     JiraTriageHandlerEntry,
+    PrAutofixHandlerEntry,
     PrReviewHandlerEntry,
     SlackCiAlertTriggerEntry,
 )
@@ -27,10 +29,12 @@ from daeyeon_bot.core.time import Clock
 from daeyeon_bot.handlers import ci_triage as ci_triage_handler
 from daeyeon_bot.handlers import echo as echo_handler
 from daeyeon_bot.handlers import jira_triage as jira_triage_handler
+from daeyeon_bot.handlers import pr_autofix as pr_autofix_handler
 from daeyeon_bot.handlers import pr_review as pr_review_handler
 from daeyeon_bot.handlers.pr_review import PauseGuard
 from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraIdentity
 from daeyeon_bot.infra.persona_loader import PersonaLoader
+from daeyeon_bot.triggers import gh_pr_feedback as gh_pr_feedback_trigger
 from daeyeon_bot.triggers import gh_review_requested as gh_review_requested_trigger
 from daeyeon_bot.triggers import jira_assigned as jira_assigned_trigger
 from daeyeon_bot.triggers import slack_ci_alert as slack_ci_alert_trigger
@@ -100,6 +104,30 @@ class PrReviewDeps:
     pause_guard: PauseGuard | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PrAutofixDeps:
+    """Runtime deps for the `pr_autofix` handler (feature 004).
+
+    `agent_session_factory` is the piece no other handler needs: a callable
+    taking `cwd=` and returning a TOOL-ENABLED Claude session (see
+    `infra/claude.py:RealClaudeAgentSession`). The plain
+    `ctx.claude_session_factory` the dispatcher supplies is text-only and is
+    still used for the triage stage; only the fix stage needs tools.
+
+    `project_root` bounds the workspace path guard in `infra/git_workspace.py`.
+    Inspection-only callers omit these deps and the registry skips the handler,
+    mirroring `PrReviewDeps`.
+    """
+
+    gh: Any
+    persona_loader: PersonaLoader
+    db: Any
+    github_username: str
+    agent_session_factory: Callable[..., Any]
+    project_root: Any = None  # Path | None
+    pause_guard: PauseGuard | None = None
+
+
 @dataclass(slots=True)
 class HandlerRegistry:
     """Registry the dispatcher consults to look up a handler by name."""
@@ -141,6 +169,7 @@ def build_handler_registry(
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
     ci_triage_deps: CiTriageDeps | None = None,
+    pr_autofix_deps: PrAutofixDeps | None = None,
 ) -> HandlerRegistry:
     """Instantiate enabled handlers from config, applying manifest overrides.
 
@@ -160,6 +189,8 @@ def build_handler_registry(
             continue
         if name == "ci_triage" and ci_triage_deps is None:
             continue
+        if name == "pr_autofix" and pr_autofix_deps is None:
+            continue
         record = instantiate_handler(
             name,
             entry,
@@ -167,13 +198,14 @@ def build_handler_registry(
             pr_review_deps=pr_review_deps,
             jira_triage_deps=jira_triage_deps,
             ci_triage_deps=ci_triage_deps,
+            pr_autofix_deps=pr_autofix_deps,
         )
         registry.register(record)
 
     return registry
 
 
-def instantiate_handler(
+def instantiate_handler(  # noqa: PLR0912 — one explicit branch per handler, by design
     name: str,
     entry: HandlerEntry,
     *,
@@ -181,6 +213,7 @@ def instantiate_handler(
     pr_review_deps: PrReviewDeps | None = None,
     jira_triage_deps: JiraTriageDeps | None = None,
     ci_triage_deps: CiTriageDeps | None = None,
+    pr_autofix_deps: PrAutofixDeps | None = None,
 ) -> HandlerRecord:
     if name == "echo":
         manifest = _override_manifest(echo_handler.MANIFEST, entry)
@@ -270,6 +303,31 @@ def instantiate_handler(
             ct_kwargs["pause_guard"] = ci_triage_deps.pause_guard
         instance = ci_triage_handler.CiTriageHandler(**ct_kwargs)
         return HandlerRecord(name=name, manifest=manifest, instance=instance)
+    if name == "pr_autofix":
+        if pr_autofix_deps is None:
+            raise ConfigError(
+                "pr_autofix handler requires PrAutofixDeps; build via container.build()"
+            )
+        af_entry = (
+            entry
+            if isinstance(entry, PrAutofixHandlerEntry)
+            else PrAutofixHandlerEntry.model_validate(entry.model_dump())
+        )
+        manifest = _override_manifest(pr_autofix_handler.MANIFEST, af_entry)
+        af_kwargs: dict[str, Any] = {
+            "manifest": manifest,
+            "gh": pr_autofix_deps.gh,
+            "persona_loader": pr_autofix_deps.persona_loader,
+            "config": af_entry,
+            "github_username": pr_autofix_deps.github_username,
+            "db": pr_autofix_deps.db,
+            "agent_session_factory": pr_autofix_deps.agent_session_factory,
+            "project_root": pr_autofix_deps.project_root,
+        }
+        if pr_autofix_deps.pause_guard is not None:
+            af_kwargs["pause_guard"] = pr_autofix_deps.pause_guard
+        instance = pr_autofix_handler.PrAutofixHandler(**af_kwargs)
+        return HandlerRecord(name=name, manifest=manifest, instance=instance)
     raise ConfigError(f"unknown handler in config: {name!r}")
 
 
@@ -341,12 +399,30 @@ class SlackCiAlertDeps:
     permanent_failure_reporter: slack_ci_alert_trigger.PermanentFailureReporter
 
 
+@dataclass(frozen=True, slots=True)
+class GhPrFeedbackDeps:
+    """Runtime deps for the `gh_pr_feedback` polling trigger (feature 004).
+
+    Same shape as `GhReviewRequestedDeps` — the trigger persists events itself
+    so that the state UPSERT, the round bump and the `events` INSERT commit as
+    one transaction.
+    """
+
+    gh: Any
+    storage_factory: StorageFactory
+    github_username: str
+    clock: Clock
+    pause_check: Callable[[], bool]
+    permanent_failure_reporter: gh_pr_feedback_trigger.PermanentFailureReporter
+
+
 def build_trigger_registry(
     config: Config,
     *,
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
     slack_ci_alert_deps: SlackCiAlertDeps | None = None,
+    gh_pr_feedback_deps: GhPrFeedbackDeps | None = None,
 ) -> list[TriggerRecord]:
     """Instantiate enabled live triggers from `config.triggers`."""
     out: list[TriggerRecord] = []
@@ -359,6 +435,8 @@ def build_trigger_registry(
             continue
         if name == "slack_ci_alert" and slack_ci_alert_deps is None:
             continue
+        if name == "gh_pr_feedback" and gh_pr_feedback_deps is None:
+            continue
         record = instantiate_trigger(
             name,
             entry,
@@ -366,6 +444,7 @@ def build_trigger_registry(
             gh_review_requested_deps=gh_review_requested_deps,
             jira_assigned_deps=jira_assigned_deps,
             slack_ci_alert_deps=slack_ci_alert_deps,
+            gh_pr_feedback_deps=gh_pr_feedback_deps,
         )
         if record is not None:
             out.append(record)
@@ -380,6 +459,7 @@ def instantiate_trigger(
     gh_review_requested_deps: GhReviewRequestedDeps | None = None,
     jira_assigned_deps: JiraAssignedDeps | None = None,
     slack_ci_alert_deps: SlackCiAlertDeps | None = None,
+    gh_pr_feedback_deps: GhPrFeedbackDeps | None = None,
 ) -> TriggerRecord | None:
     if name == "manual":
         # `manual` has no live loop — events arrive via the CLI. Skip.
@@ -473,6 +553,41 @@ def instantiate_trigger(
         return TriggerRecord(
             name=name,
             manifest=slack_ci_alert_trigger.MANIFEST,
+            instance=instance,
+        )
+    if name == "gh_pr_feedback":
+        if gh_pr_feedback_deps is None:
+            raise ConfigError(
+                "gh_pr_feedback trigger requires GhPrFeedbackDeps; build via container.build()"
+            )
+        gpf_entry = (
+            entry
+            if isinstance(entry, GhPrFeedbackTriggerEntry)
+            else config.gh_pr_feedback_trigger_entry()
+        )
+        # Same single-source-of-truth arrangement `gh_review_requested` uses:
+        # the trigger inherits its scope from the handler's config so operators
+        # only ever edit `[handlers.pr_autofix]`.
+        autofix_entry = config.pr_autofix_handler_entry()
+        instance = gh_pr_feedback_trigger.GhPrFeedbackTrigger(
+            gh=gh_pr_feedback_deps.gh,
+            storage_factory=gh_pr_feedback_deps.storage_factory,
+            github_username=gh_pr_feedback_deps.github_username,
+            poll_interval_seconds=float(gpf_entry.poll_interval_seconds),
+            clock=gh_pr_feedback_deps.clock,
+            max_per_cycle=gpf_entry.max_per_cycle,
+            search_extra_query=gh_review_requested_trigger.build_search_extra_query(
+                autofix_entry.allowed_repos
+            ),
+            comment_authors=list(autofix_entry.comment_authors),
+            ignored_authors=list(autofix_entry.ignored_authors),
+            self_comment_markers=list(autofix_entry.self_comment_markers),
+            pause_check=gh_pr_feedback_deps.pause_check,
+            permanent_failure_reporter=gh_pr_feedback_deps.permanent_failure_reporter,
+        )
+        return TriggerRecord(
+            name=name,
+            manifest=gh_pr_feedback_trigger.MANIFEST,
             instance=instance,
         )
     raise ConfigError(f"unknown trigger in config: {name!r}")

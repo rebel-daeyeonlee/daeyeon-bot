@@ -174,6 +174,22 @@ class SlackCiAlertTriggerEntry(TriggerEntry):
     thread_lookback_seconds: int = 3600
 
 
+class GhPrFeedbackTriggerEntry(TriggerEntry):
+    """Typed view of `[triggers.gh_pr_feedback]`. Feature 004.
+
+    Polls faster than `gh_review_requested` (180 s vs 300 s) on purpose: this
+    loop is interactive from the operator's point of view — they push a PR,
+    review bots comment within a minute or two, and the whole value is in the
+    bot turning that around before they have context-switched away.
+    """
+
+    poll_interval_seconds: int = 180
+    # Per-cycle cap on how many PRs may emit an autofix event. Each event can
+    # run a multi-minute agent session, so a burst of freshly-reviewed PRs must
+    # not queue up an unbounded amount of Claude work in one poll.
+    max_per_cycle: int = 5
+
+
 class HandlerEntry(BaseModel):
     """Runtime override for a handler. Mirrors HandlerManifest fields."""
 
@@ -310,6 +326,87 @@ class CiTriageHandlerEntry(HandlerEntry):
     ticket_draft_enabled: bool = True
 
 
+class PrAutofixHandlerEntry(HandlerEntry):
+    """Typed view of `[handlers.pr_autofix]`. Feature 004.
+
+    This is the only handler that WRITES to a git remote, so its defaults are
+    inverted relative to `pr_review`: where `pr_review` reads an empty
+    `allowed_repos` as "no filter", an empty list here still permits every repo
+    the operator authored a PR in — but `push_enabled` and `enabled` both
+    default to a state where nothing reaches GitHub until the operator opts in.
+    """
+
+    persona_skill: str | None = "daeyeon-bot-pr-autofix"
+    min_persona_chars: int = 200
+    skills_root: str | None = None
+
+    # ── scope ────────────────────────────────────────────────────────────
+    # Glob allowlist of `owner/repo`. Empty list = no repo filter (the
+    # author-only gate below is then the sole scope boundary).
+    allowed_repos: list[str] = Field(default_factory=list)
+    # Glob allowlist of comment authors to triage. Default `["*"]` covers both
+    # review bots and human reviewers. Narrow to `["*[bot]", "coderabbitai"]`
+    # to leave humans alone. The operator's own login is always excluded — the
+    # bot must not answer its author's own notes to themselves.
+    comment_authors: list[str] = Field(default_factory=lambda: ["*"])
+    # Globs subtracted from `comment_authors`. Wins on conflict.
+    ignored_authors: list[str] = Field(default_factory=list)
+    # Substrings that mark a comment as the bot's own output. A reply the bot
+    # posted is authored by the operator's `gh` identity and would otherwise
+    # look like fresh feedback on the next poll.
+    self_comment_markers: list[str] = Field(default_factory=lambda: ["daeyeon-bot autofix"])
+
+    # ── runaway brakes ───────────────────────────────────────────────────
+    # Autofix rounds allowed per PR before the bot stands down and says so.
+    # 0 = unlimited. Without a cap, bot-fixes-then-bot-re-reviews is a loop
+    # with no natural end; 5 rounds is well past where a real review converges.
+    max_rounds: int = 5
+    # Per-event wall-clock budget covering triage + agent + verify + push.
+    timeout_seconds: int = 1800
+    # Hard cap on agent tool-use turns inside one fix session.
+    agent_max_turns: int = 60
+    # Post-hoc diff gate. A fix that sprawls past these is not a fix; the bot
+    # refuses to push and hands it back with an explanation.
+    max_changed_files: int = 30
+    max_changed_lines: int = 800
+    # Paths the agent may never modify, checked against the resulting diff
+    # regardless of what the agent believed it was doing.
+    protected_paths: list[str] = Field(
+        default_factory=lambda: [
+            ".github/**",
+            "**/*.lock",
+            "uv.lock",
+            "poetry.lock",
+            "package-lock.json",
+            "yarn.lock",
+            "Cargo.lock",
+        ]
+    )
+
+    # ── workspace ────────────────────────────────────────────────────────
+    # Project-root-relative path holding one throwaway clone per repo.
+    workspace_root: str = "var/pr-autofix"
+    allow_external_workspace: bool = False
+    git_timeout_seconds: int = 300
+
+    # ── verification ─────────────────────────────────────────────────────
+    # Map of `owner/repo` → shell command run in the workspace before commit.
+    # A repo with no entry is pushed without verification; a repo WITH an entry
+    # is never pushed unless the command exits 0.
+    verify_commands: dict[str, str] = Field(default_factory=dict)
+    verify_timeout_seconds: int = 900
+
+    # ── output ───────────────────────────────────────────────────────────
+    push_enabled: bool = True
+    git_author_name: str = "daeyeon-bot"
+    git_author_email: str = "daeyeon-bot@users.noreply.github.com"
+    commit_message_prefix: str = "fix(review)"
+
+    def verify_command_for(self, repo: str) -> str:
+        """Pre-push command for `repo`, or `""` when none is configured."""
+        return self.verify_commands.get(repo, "")
+
+
 class Config(BaseSettings):
     # `extra="forbid"` so a typo like `[handlrs.pr_review]` raises at boot
     # instead of silently dropping the section. The two leaf entries
@@ -380,6 +477,20 @@ class Config(BaseSettings):
         if raw is None:
             return CiTriageHandlerEntry()
         return CiTriageHandlerEntry.model_validate(raw.model_dump())
+
+    def gh_pr_feedback_trigger_entry(self) -> GhPrFeedbackTriggerEntry:
+        """Typed view of `[triggers.gh_pr_feedback]` (with defaults). Feature 004."""
+        raw = self.triggers.get("gh_pr_feedback")
+        if raw is None:
+            return GhPrFeedbackTriggerEntry()
+        return GhPrFeedbackTriggerEntry.model_validate(raw.model_dump())
+
+    def pr_autofix_handler_entry(self) -> PrAutofixHandlerEntry:
+        """Typed view of `[handlers.pr_autofix]` (with defaults). Feature 004."""
+        raw = self.handlers.get("pr_autofix")
+        if raw is None:
+            return PrAutofixHandlerEntry()
+        return PrAutofixHandlerEntry.model_validate(raw.model_dump())
 
     @property
     def state_dir_path(self) -> Path:

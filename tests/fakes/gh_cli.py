@@ -32,6 +32,15 @@ class _FakePr:
     files: list[dict[str, Any]]
     draft: bool = False
     state: str = "open"
+    # Feature 004 needs the push target and the search-payload freshness
+    # signal the autofix trigger short-circuits on.
+    head_ref: str = "feature-branch"
+    head_repo: str = ""  # empty → same as `repo` (non-fork PR)
+    merged_at: str | None = None
+    # Empty by default: a search payload with NO `updated_at` is what makes a
+    # trigger fall through to `pr_get`, and several tests depend on that.
+    # Set it explicitly to exercise the freshness short-circuit instead.
+    updated_at: str = ""
 
 
 @dataclass(slots=True)
@@ -58,6 +67,17 @@ class FakeGh:
     _posted_reviews: list[dict[str, Any]] = field(default_factory=list)
     _next_review_id: int = field(default=0)
     _prior_reviews: list[dict[str, Any]] = field(default_factory=list)
+    # Feature 004 stores + capture lists.
+    raise_on_reply: Exception | None = None
+    # Records every comment-surface fetch so trigger tests can assert the
+    # `updated_at` short-circuit actually saved the round-trips.
+    comment_fetches: list[tuple[str, str, int]] = field(default_factory=list)
+    replies: list[dict[str, Any]] = field(default_factory=list)
+    issue_comments_posted: list[dict[str, Any]] = field(default_factory=list)
+    _review_comments: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict)
+    _reviews_all: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict)
+    _issue_comments: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict)
+    _next_reply_id: int = field(default=0)
 
     # ── Helpers used by tests ────────────────────────────────────────────
 
@@ -76,6 +96,10 @@ class FakeGh:
         in_authored_set: bool = False,
         draft: bool = False,
         state: str = "open",
+        head_ref: str = "feature-branch",
+        head_repo: str = "",
+        merged_at: str | None = None,
+        updated_at: str = "",
     ) -> None:
         if not requested:
             requested = (self.user_login,)
@@ -90,6 +114,10 @@ class FakeGh:
             files=list(files) if files is not None else [],
             draft=draft,
             state=state,
+            head_ref=head_ref,
+            head_repo=head_repo,
+            merged_at=merged_at,
+            updated_at=updated_at,
         )
         if in_search_set:
             self._search_set.add((repo, pr_number))
@@ -117,6 +145,11 @@ class FakeGh:
 
     def remove_from_search(self, repo: str, pr_number: int) -> None:
         self._search_set.discard((repo, pr_number))
+
+    def remove_from_authored(self, repo: str, pr_number: int) -> None:
+        """Drop a PR from the `author:<operator>` search result — what a merge
+        or close looks like to the `gh_pr_feedback` trigger."""
+        self._authored_set.discard((repo, pr_number))
 
     def add_to_search(self, repo: str, pr_number: int) -> None:
         if (repo, pr_number) in self._prs:
@@ -179,6 +212,7 @@ class FakeGh:
                 {
                     "number": pr_number,
                     "repository_url": f"https://api.github.com/repos/{repo}",
+                    **({"updated_at": pr.updated_at} if pr.updated_at else {}),
                     "pull_request": {
                         "url": f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
                         "draft": pr.draft,
@@ -195,10 +229,16 @@ class FakeGh:
             "number": pr.pr_number,
             "title": pr.title,
             "body": pr.body,
-            "head": {"sha": pr.head_sha},
+            "head": {
+                "sha": pr.head_sha,
+                "ref": pr.head_ref,
+                "repo": {"full_name": pr.head_repo or pr.repo},
+            },
             "user": {"login": pr.author},
             "draft": pr.draft,
             "state": pr.state,
+            "merged_at": pr.merged_at,
+            "updated_at": pr.updated_at,
             "requested_reviewers": [{"login": login} for login in pr.requested],
         }
 
@@ -261,6 +301,130 @@ class FakeGh:
     def seed_prior_reviews(self, reviews: list[dict[str, Any]]) -> None:
         """Test seam — preload the prior-reviews list for the next handler call."""
         self._prior_reviews = list(reviews)
+
+    # ── Feature 004: PR comment surface ───────────────────────────────────
+
+    def add_review_comment(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        comment_id: int,
+        author: str,
+        body: str,
+        path: str | None = "src/app.py",
+        line: int | None = 10,
+        diff_hunk: str | None = "@@ -1,3 +1,4 @@\n+new line",
+        in_reply_to_id: int | None = None,
+        created_at: str = "2026-01-01T00:00:00Z",
+    ) -> None:
+        """Seed one inline review comment. `line=None` marks it OUTDATED."""
+        item: dict[str, Any] = {
+            "id": comment_id,
+            "user": {"login": author},
+            "body": body,
+            "path": path,
+            "line": line,
+            "position": line,
+            "diff_hunk": diff_hunk,
+            "created_at": created_at,
+            "html_url": f"https://github.com/{repo}/pull/{pr_number}#discussion_r{comment_id}",
+        }
+        if in_reply_to_id is not None:
+            item["in_reply_to_id"] = in_reply_to_id
+        self._review_comments.setdefault((repo, pr_number), []).append(item)
+
+    def add_review(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        review_id: int,
+        author: str,
+        body: str,
+        submitted_at: str = "2026-01-01T00:00:00Z",
+    ) -> None:
+        """Seed one review body (the summary text bots put outside inline comments)."""
+        self._reviews_all.setdefault((repo, pr_number), []).append(
+            {
+                "id": review_id,
+                "user": {"login": author},
+                "body": body,
+                "submitted_at": submitted_at,
+                "html_url": f"https://github.com/{repo}/pull/{pr_number}#pullrequestreview-{review_id}",
+            }
+        )
+
+    def add_issue_comment(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        comment_id: int,
+        author: str,
+        body: str,
+        created_at: str = "2026-01-01T00:00:00Z",
+    ) -> None:
+        """Seed one PR-level conversation comment."""
+        self._issue_comments.setdefault((repo, pr_number), []).append(
+            {
+                "id": comment_id,
+                "user": {"login": author},
+                "body": body,
+                "created_at": created_at,
+                "html_url": f"https://github.com/{repo}/pull/{pr_number}#issuecomment-{comment_id}",
+            }
+        )
+
+    async def list_review_comments(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        self._raise_if_unhealthy()
+        self.comment_fetches.append(("review_comments", repo, pr_number))
+        return [dict(c) for c in self._review_comments.get((repo, pr_number), [])]
+
+    async def list_reviews(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        self._raise_if_unhealthy()
+        self.comment_fetches.append(("reviews", repo, pr_number))
+        return [dict(r) for r in self._reviews_all.get((repo, pr_number), [])]
+
+    async def list_issue_comments(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        self._raise_if_unhealthy()
+        self.comment_fetches.append(("issue_comments", repo, pr_number))
+        return [dict(c) for c in self._issue_comments.get((repo, pr_number), [])]
+
+    async def reply_to_review_comment(
+        self, repo: str, pr_number: int, comment_id: int, body: str
+    ) -> dict[str, Any]:
+        if self.raise_on_reply is not None:
+            raise self.raise_on_reply
+        self._next_reply_id += 1
+        record = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "in_reply_to_id": comment_id,
+            "body": body,
+            "id": 500000 + self._next_reply_id,
+        }
+        self.replies.append(record)
+        return record
+
+    async def post_issue_comment(self, repo: str, pr_number: int, body: str) -> dict[str, Any]:
+        if self.raise_on_reply is not None:
+            raise self.raise_on_reply
+        self._next_reply_id += 1
+        record = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "body": body,
+            "id": 600000 + self._next_reply_id,
+        }
+        self.issue_comments_posted.append(record)
+        return record
+
+    def _raise_if_unhealthy(self) -> None:
+        if not self.auth_ok:
+            raise AuthError("fake gh: not logged in")
+        if self.rate_limited:
+            raise RateLimitError("fake gh: rate limited")
 
 
 __all__ = ["FakeGh"]

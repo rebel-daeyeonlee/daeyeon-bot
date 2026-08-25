@@ -22,10 +22,12 @@ from daeyeon_bot.app import pause as pause_mod
 from daeyeon_bot.app.config import CiTriageHandlerEntry, Config
 from daeyeon_bot.app.registry import (
     CiTriageDeps,
+    GhPrFeedbackDeps,
     GhReviewRequestedDeps,
     HandlerRegistry,
     JiraAssignedDeps,
     JiraTriageDeps,
+    PrAutofixDeps,
     PrReviewDeps,
     SlackCiAlertDeps,
     TriggerRecord,
@@ -37,7 +39,11 @@ from daeyeon_bot.core.errors import AuthError, ConfigError, QuotaError
 from daeyeon_bot.core.time import Clock, SystemClock
 from daeyeon_bot.handlers.pr_review import PauseGuard
 from daeyeon_bot.infra import storage
-from daeyeon_bot.infra.claude import ClaudeSession, make_real_factory
+from daeyeon_bot.infra.claude import (
+    ClaudeSession,
+    make_real_agent_factory,
+    make_real_factory,
+)
 from daeyeon_bot.infra.gh_cli import GhCli
 from daeyeon_bot.infra.host_resolver import HostResolver
 from daeyeon_bot.infra.jira_client import FieldDiscovery, JiraClient, JiraIdentity
@@ -92,6 +98,10 @@ class ContainerOverrides:
     # Feature 003 overrides.
     slack: object | None = None  # SlackClient or a FakeSlack
     oncall_wiki: object | None = None  # OncallWiki or a fake
+    # Feature 004 override. Callable[[*, cwd: Path], ClaudeAgentSession] — the
+    # TOOL-ENABLED session the pr_autofix fix stage uses. Tests inject a fake
+    # that writes files into the workspace instead of calling the real SDK.
+    claude_agent_session_factory: Callable[..., Any] | None = None
 
 
 async def build(
@@ -177,11 +187,30 @@ async def build(
         config=config, slack_client=slack_client, clock=clock
     )
 
+    # Feature 004: PR autofix handler + gh_pr_feedback trigger. Both need the
+    # same `gh` client and operator login `pr_review` resolved; when
+    # `[handlers.pr_review]` is off but `[handlers.pr_autofix]` is on we resolve
+    # them here instead.
+    pr_autofix_deps, gh, github_username = await _build_pr_autofix_deps(
+        config=config,
+        db=db,
+        clock=clock,
+        overrides=overrides,
+        gh=gh,
+        github_username=github_username,
+        persona_loader=persona_loader,
+        oauth_token=oauth_token,
+    )
+    gh_pr_feedback_deps = _build_gh_pr_feedback_deps(
+        config=config, gh=gh, github_username=github_username, clock=clock
+    )
+
     triggers = build_trigger_registry(
         config,
         gh_review_requested_deps=gh_trigger_deps,
         jira_assigned_deps=jira_assigned_deps,
         slack_ci_alert_deps=slack_ci_alert_deps,
+        gh_pr_feedback_deps=gh_pr_feedback_deps,
     )
 
     return Container(
@@ -193,6 +222,7 @@ async def build(
             pr_review_deps=pr_deps,
             jira_triage_deps=jira_triage_deps,
             ci_triage_deps=ci_triage_deps,
+            pr_autofix_deps=pr_autofix_deps,
         ),
         triggers=tuple(triggers),
         claude_session_factory=factory,
@@ -583,6 +613,129 @@ async def _build_jira_deps(  # noqa: PLR0912, PLR0915 — composition root branc
         )
 
     return (triage_deps, trigger_deps)
+
+
+def _pr_autofix_enabled(config: Config) -> bool:
+    entry = config.handlers.get("pr_autofix")
+    return entry is not None and entry.enabled
+
+
+def _gh_pr_feedback_enabled(config: Config) -> bool:
+    entry = config.triggers.get("gh_pr_feedback")
+    return entry is not None and entry.enabled
+
+
+async def _build_pr_autofix_deps(
+    *,
+    config: Config,
+    db: aiosqlite.Connection,
+    clock: Clock,
+    overrides: ContainerOverrides,
+    gh: object | None,
+    github_username: str | None,
+    persona_loader: PersonaLoader | None,
+    oauth_token: str | None,
+) -> tuple[PrAutofixDeps | None, object | None, str | None]:
+    """Feature 004 handler deps. Returns `(deps, gh, github_username)`.
+
+    `gh` and `github_username` are threaded back out because this may be the
+    first thing in the boot to need them — `pr_autofix` can run with
+    `[handlers.pr_review]` disabled, and the `gh_pr_feedback` trigger builder
+    downstream needs the same two values.
+    """
+    del clock
+    if not (_pr_autofix_enabled(config) or _gh_pr_feedback_enabled(config)):
+        return (None, gh, github_username)
+
+    gh_client = overrides.gh or gh or GhCli(timeout_seconds=config.github.gh_call_timeout_seconds)
+    login = (
+        await _resolve_github_username(
+            override=overrides.github_username,
+            configured=config.github.username,
+            gh=gh_client,
+        )
+        if github_username is None
+        else github_username
+    )
+
+    if not _pr_autofix_enabled(config):
+        # Trigger on, handler off. The trigger would emit events nothing
+        # consumes, so leave the handler deps unbuilt and let the trigger
+        # builder skip too.
+        return (None, gh_client, login)
+
+    entry = config.pr_autofix_handler_entry()
+    loader = (
+        overrides.persona_loader
+        or persona_loader
+        or PersonaLoader(skills_root=_resolve_skills_root(config))
+    )
+    agent_factory = overrides.claude_agent_session_factory
+    if agent_factory is None:
+        if oauth_token is None:
+            raise RuntimeError(
+                "container.build: pr_autofix requires oauth_token (production) OR a"
+                " claude_agent_session_factory override (test path)"
+            )
+        agent_factory = make_real_agent_factory(
+            oauth_token=oauth_token,
+            model=config.claude.model,
+            max_turns=entry.agent_max_turns,
+        )
+    return (
+        PrAutofixDeps(
+            gh=gh_client,
+            persona_loader=loader,
+            db=db,
+            github_username=login,
+            agent_session_factory=agent_factory,
+            project_root=overrides.project_root,
+            pause_guard=overrides.pause_guard or _make_pause_guard(config),
+        ),
+        gh_client,
+        login,
+    )
+
+
+def _build_gh_pr_feedback_deps(
+    *,
+    config: Config,
+    gh: object | None,
+    github_username: str | None,
+    clock: Clock,
+) -> GhPrFeedbackDeps | None:
+    """Feature 004 trigger deps. Skipped unless the handler is also enabled —
+    an autofix event with no consumer is dead weight in the outbox."""
+    if not _gh_pr_feedback_enabled(config) or not _pr_autofix_enabled(config):
+        return None
+    if gh is None or github_username is None:
+        return None
+    db_path = config.db_path
+
+    def _storage_factory() -> Any:
+        return storage.connection(db_path)
+
+    pause_flag_path = config.pause_flag_path
+
+    def _pause_check() -> bool:
+        return pause_mod.is_paused(pause_flag_path)
+
+    supervisor = TriggerSupervisor()
+
+    async def _report_permanent_failure(reason: str) -> bool:
+        async with storage.connection(db_path) as conn:
+            return await supervisor.record_failure(
+                conn, trigger_name="gh_pr_feedback", reason=reason, at=clock.now()
+            )
+
+    return GhPrFeedbackDeps(
+        gh=gh,
+        storage_factory=_storage_factory,
+        github_username=github_username,
+        clock=clock,
+        pause_check=_pause_check,
+        permanent_failure_reporter=_report_permanent_failure,
+    )
 
 
 def _pr_review_enabled(config: Config) -> bool:

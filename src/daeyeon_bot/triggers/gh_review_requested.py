@@ -443,10 +443,17 @@ async def _emit_event(
     return True
 
 
+# Public alias. `gh_pr_feedback` (feature 004) runs the same `/search/issues`
+# payload shape through the same parser; duplicating it there would let the two
+# triggers drift on GitHub's `repository_url` format.
+parse_search_item = _parse_search_item
+
+
 __all__ = [
     "MANIFEST",
     "GhReviewRequestedTrigger",
     "PermanentFailureReporter",
     "StorageFactory",
     "build_search_extra_query",
+    "parse_search_item",
 ]

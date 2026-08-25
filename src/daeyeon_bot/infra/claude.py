@@ -1,6 +1,12 @@
 """Claude Agent SDK adapter.
 
-Two implementations of the same `ClaudeSession` shape:
+Two session shapes live here:
+
+    * `ClaudeSession`      — text in, text out. No tools, no filesystem.
+    * `ClaudeAgentSession` — pinned to a `cwd` with a tool allowlist, so the
+      model can read and edit a repository (feature 004, `pr_autofix`).
+
+Implementations of the plain `ClaudeSession` shape:
     * `FakeClaudeSession` — scripted responses for tests.
     * `RealClaudeSession` — wraps `claude_agent_sdk.ClaudeSDKClient`. The
       OAuth token is passed to the CLI subprocess via an explicit env
@@ -23,6 +29,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import TracebackType
 from typing import NoReturn, Protocol, cast, runtime_checkable
 
@@ -327,11 +334,224 @@ def make_real_factory(
     return _factory
 
 
+# ── Tool-enabled agent sessions (feature 004) ─────────────────────────────
+#
+# `ClaudeSession` above is text-in / text-out: the model reads a rendered
+# prompt and writes a reply. That is the right shape for review / triage
+# handlers, which never touch the filesystem.
+#
+# `pr_autofix` needs the other shape — the model must READ the repository and
+# EDIT it. That means a session pinned to a working directory with a tool
+# allowlist. The blast radius is bounded by three things, in this order:
+#   1. `cwd` — the SDK subprocess starts in the throwaway workspace clone;
+#   2. `allowed_tools` / `disallowed_tools` — no WebFetch, no Task fan-out;
+#   3. `setting_sources=None` (the SDK default) — the operator's own
+#      ~/.claude settings, hooks and MCP servers are NOT loaded, so the
+#      daemon's agent can't inherit interactive credentials.
+# The handler adds a fourth: it inspects `git diff` before committing and
+# refuses protected paths / oversized diffs regardless of what the agent did.
+
+# Read + edit + local shell. `Bash` is included because a real fix often needs
+# to run the formatter or a single test; the handler's post-hoc diff gate is
+# what keeps that honest. `WebFetch`/`WebSearch`/`Task` are excluded — a fix
+# agent that reaches the network or fans out to sub-agents is out of contract.
+DEFAULT_AGENT_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Edit",
+    "Write",
+    "Grep",
+    "Glob",
+    "Bash",
+)
+DEFAULT_AGENT_DISALLOWED_TOOLS: tuple[str, ...] = (
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "NotebookEdit",
+)
+
+
+@runtime_checkable
+class ClaudeAgentSession(Protocol):
+    """A `ClaudeSession` that also has tools and a working directory."""
+
+    async def __aenter__(self) -> ClaudeAgentSession: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None: ...
+
+    async def query(self, prompt: str, *, system: str | None = None) -> str: ...
+
+
+class ClaudeAgentSessionFactory(Protocol):
+    """Builds a fresh tool-enabled session bound to `cwd`."""
+
+    def __call__(self, *, cwd: Path) -> ClaudeAgentSession: ...
+
+
+@dataclass(slots=True)
+class FakeClaudeAgentSession:
+    """Test double for `ClaudeAgentSession`.
+
+    Records the `cwd` it was built for and every prompt. `on_query` lets a test
+    simulate the side effect a real agent would have (writing files into the
+    workspace) before the scripted text is returned.
+    """
+
+    cwd: Path
+    responses: list[str] = field(default_factory=list[str])
+    default: str | None = None
+    calls: list[dict[str, str | None]] = field(default_factory=list[dict[str, str | None]])
+    on_query: Callable[[Path], None] | None = None
+    closed: bool = False
+
+    async def __aenter__(self) -> FakeClaudeAgentSession:
+        self.closed = False
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.closed = True
+
+    async def query(self, prompt: str, *, system: str | None = None) -> str:
+        self.calls.append({"prompt": prompt, "system": system})
+        if self.on_query is not None:
+            self.on_query(self.cwd)
+        if self.responses:
+            return self.responses.pop(0)
+        if self.default is not None:
+            return self.default
+        return f"[fake-agent] {prompt}"
+
+
+@dataclass(slots=True)
+class RealClaudeAgentSession:
+    """`ClaudeSDKClient` wrapper with `cwd` + a tool allowlist.
+
+    `permission_mode="bypassPermissions"` is required, not a shortcut: the
+    daemon is headless, so any interactive permission prompt would hang the
+    handler until its timeout. The allowlist above plus the handler's diff gate
+    are what stand in for the human at the prompt. Never point this at anything
+    but a throwaway workspace clone (`infra/git_workspace.py` enforces that
+    the path sits under the configured workspace root).
+    """
+
+    oauth_token: str
+    model: str | None
+    cwd: Path
+    allowed_tools: tuple[str, ...] = DEFAULT_AGENT_TOOLS
+    disallowed_tools: tuple[str, ...] = DEFAULT_AGENT_DISALLOWED_TOOLS
+    max_turns: int | None = None
+    _client: ClaudeSDKClient | None = field(default=None, init=False)
+    _connected_system: str | None = field(default=None, init=False)
+    _entered: bool = field(default=False, init=False)
+
+    async def __aenter__(self) -> RealClaudeAgentSession:
+        self._entered = True
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._entered = False
+        client = self._client
+        self._client = None
+        self._connected_system = None
+        if client is None:
+            return
+        try:
+            await client.disconnect()
+        except Exception as disconnect_exc:  # pragma: no cover — best-effort teardown
+            _log.warning("claude_agent.disconnect_failed", error=str(disconnect_exc))
+
+    async def query(self, prompt: str, *, system: str | None = None) -> str:
+        if not self._entered:
+            raise TransientError("RealClaudeAgentSession used outside of `async with`")
+        client = await self._ensure_connected(system)
+        try:
+            await client.query(prompt)
+            return await _collect_assistant_text(client, prompt_chars=len(prompt))
+        except ProcessError as exc:
+            _raise_process_error(exc)
+        except CLIConnectionError as exc:
+            raise TransientError(f"claude CLI connection lost: {exc}") from exc
+
+    async def _ensure_connected(self, system_prompt: str | None) -> ClaudeSDKClient:
+        if self._client is not None:
+            if system_prompt != self._connected_system:
+                raise TransientError(
+                    "RealClaudeAgentSession cannot change system prompt mid-session;"
+                    " open a new session per persona"
+                )
+            return self._client
+        options = ClaudeAgentOptions(
+            model=self.model,
+            system_prompt=system_prompt,
+            cwd=self.cwd,
+            allowed_tools=list(self.allowed_tools),
+            disallowed_tools=list(self.disallowed_tools),
+            permission_mode="bypassPermissions",
+            max_turns=self.max_turns,
+            # Do NOT inherit the operator's ~/.claude settings, hooks, or MCP
+            # servers into a daemon-driven agent. None is the SDK default; it
+            # is spelled out here because the isolation is load-bearing.
+            setting_sources=None,
+            env={"CLAUDE_CODE_OAUTH_TOKEN": self.oauth_token},
+        )
+        client = ClaudeSDKClient(options=options)
+        try:
+            await client.connect()
+        except CLINotFoundError as exc:
+            raise TransientError(f"claude CLI not found: {exc}") from exc
+        except CLIConnectionError as exc:
+            raise TransientError(f"claude CLI connect failed: {exc}") from exc
+        self._client = client
+        self._connected_system = system_prompt
+        return client
+
+
+def make_real_agent_factory(
+    *,
+    oauth_token: str,
+    model: str | None,
+    max_turns: int | None = None,
+) -> Callable[..., RealClaudeAgentSession]:
+    """Closure that builds a fresh tool-enabled session per workspace."""
+
+    def _factory(*, cwd: Path) -> RealClaudeAgentSession:
+        return RealClaudeAgentSession(
+            oauth_token=oauth_token,
+            model=model,
+            cwd=cwd,
+            max_turns=max_turns,
+        )
+
+    return _factory
+
+
 __all__ = [
+    "DEFAULT_AGENT_DISALLOWED_TOOLS",
+    "DEFAULT_AGENT_TOOLS",
+    "ClaudeAgentSession",
+    "ClaudeAgentSessionFactory",
     "ClaudeSession",
     "ClaudeSessionFactory",
+    "FakeClaudeAgentSession",
     "FakeClaudeSession",
     "FakeFactory",
+    "RealClaudeAgentSession",
     "RealClaudeSession",
+    "make_real_agent_factory",
     "make_real_factory",
 ]

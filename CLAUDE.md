@@ -16,7 +16,7 @@ unless `docs/PLAN.md` is updated first.
 
 ### Current state — what's actually built
 
-Phases 0–7 of `docs/PLAN.md` are landed:
+Phases 0–9 of `docs/PLAN.md` are landed (7–9 are features 001/002+003/004):
 
 | Phase | What |
 |---|---|
@@ -29,9 +29,11 @@ Phases 0–7 of `docs/PLAN.md` are landed:
 | 6 | Hardening: events retention with FK-aware cascade, hot SQLite backup, heartbeat self-alert, runbook. |
 | 7 | GitHub PR-review bot (feature 001) — `gh_review_requested` polling trigger + `pr_review` handler. Lands behind `[handlers.pr_review].enabled = false`; flip to enable. Persona reloaded from `~/.claude/skills/pr-reviewer/SKILL.md` on every event by mtime. Migration 002 adds `gh_review_requested_state` + `pr_review_audit`. Auth flows through the operator's local `gh` CLI. Opt-in `[handlers.pr_review].review_self = true` also reviews the operator's own PRs (discovered via an `author:<operator>` search; always posted as COMMENT since GitHub rejects self-APPROVE). |
 | 8 | Jira regression triage (feature 002) — `jira_assigned` polling trigger + `jira_triage` handler. Auto-triages SSWCI tickets assigned to daeyeon or the DevOps Team: clones ssw-bundle at the parent Epic's branch+commit, fetches Loki streams (kernel/syslog/fwlog/smclog via `[rbln-fwi]` and bmc-sel labels) + SSH artifacts + evidence-driven `products/` source grep, then synthesizes a 4-section Jira wiki-markup comment (Summary / Evidences / Analysis / Action Items) with windowed `{code}` log attachments. Persona at `.claude/skills/daeyeon-bot-jira-triage/SKILL.md`. Migration 005 adds `jira_assigned_state` + `jira_triage_audit`. |
+| 9 | PR review-comment auto-fix loop (feature 004) — `gh_pr_feedback` polling trigger + `pr_autofix` handler. Polls the operator's OWN open PRs, collects unanswered review feedback from all three GitHub comment surfaces (inline comments / review bodies / conversation), has Claude triage each remark (`accepted` / `rejected` / `deferred`), runs a TOOL-ENABLED Claude agent in a throwaway workspace clone to implement the accepted ones, runs a per-repo `verify_command`, commits + pushes, and replies to every comment — accepted and rejected alike. Lands behind `[handlers.pr_autofix].enabled = false`. Migration 009 adds `gh_pr_feedback_state` + `pr_autofix_comment` + `pr_autofix_audit`. **The daemon's only git writer.** |
 
-Built-in triggers: `manual`, `gh_review_requested`, `jira_assigned`. Built-in handlers:
-`echo`, `pr_review`, `jira_triage`. Other workloads (cron, webhook, slack, digest, …) are
+Built-in triggers: `manual`, `gh_review_requested`, `jira_assigned`,
+`slack_ci_alert`, `gh_pr_feedback`. Built-in handlers: `echo`, `pr_review`,
+`jira_triage`, `ci_triage`, `pr_autofix`. Other workloads (cron, webhook, slack, digest, …) are
 added one trigger/handler at a time using the recipes below.
 
 ## Daily commands
@@ -199,6 +201,47 @@ it emits `_log.error("heartbeat.tick_lag", elapsed_s=…)`. journald (Linux)
 and launchd-stderr (macOS) surface that line directly so a hung daemon
 flags itself.
 
+### Write-side git is exactly one module (feature 004)
+
+`pr_autofix` is the only handler that mutates a git remote. Three rules keep
+that contained, and all three are enforced in code, not by convention:
+
+1. **`infra/git_workspace.py` is the only place `commit` / `push` may live.**
+   `infra/ssw_bundle.py` and `infra/oncall_wiki.py` stay read-only; do not add a
+   write verb to either. The workspace path guard refuses anything in `$HOME`,
+   anything outside `project_root` (without `allow_external`), and any existing
+   clone whose `origin` points somewhere else.
+2. **The author gate is absolute.** `pr_autofix` reads the LIVE PR payload and
+   skips unless `pr.user.login == github.username`. The bot never pushes to a
+   branch the operator did not author, and a manual `dev fire-pr-autofix` does
+   not bypass this (it bypasses only `allowed_repos`).
+3. **`idempotent=False`, and the audit row is the crash guard.** `git push` has
+   no undo, so an `interrupted` outbox row goes to `dead_letter` rather than
+   being re-claimed. A `pr_autofix_audit` row still reading `in_progress` on
+   re-entry means we died mid-push; the handler DeadLetters for the operator
+   instead of risking a duplicate commit.
+
+Two more invariants worth knowing before touching this feature:
+
+- **The `pr_autofix_comment` ledger has no FK to `events`, on purpose.** It is
+  the loop's termination condition (`pending = live ids - ledger ids`); an
+  `ON DELETE CASCADE` would let retention resurrect months-old comments into
+  the pending set and have the bot answer them a second time. `app/prune.py`
+  prunes the polling state but never the ledger.
+- **Ledger rows are written only after a comment is answered on GitHub.**
+  Writing them at triage time would be faster and would silently swallow
+  feedback on any crash between triage and reply.
+
+### Tool-enabled Claude sessions
+
+`infra/claude.py` now holds two session shapes. `ClaudeSession` is text-in /
+text-out and is what every other handler uses. `ClaudeAgentSession` is pinned to
+a `cwd` with a tool allowlist so the model can actually edit a repository; only
+`pr_autofix`'s fix stage uses it. Its blast radius is bounded by `cwd`, the
+tool allowlist, `setting_sources=None` (the operator's own `~/.claude` settings,
+hooks and MCP servers are NOT inherited), and — after the fact — the handler's
+`git diff` gate for protected paths and diff size.
+
 ## Configuration model
 
 - `config.toml` is **not committed** (`.gitignore`). `config.example.toml`
@@ -312,6 +355,9 @@ Update **all three** in the same commit:
 ## When in doubt
 
 - Operations: `docs/RUNBOOK.md` (routine ops + Mac/Linux parity + 5 incident playbooks).
+- Autofix triage/fix judgement: `.claude/skills/daeyeon-bot-pr-autofix/SKILL.md`
+  (accept/reject/defer catalogue — change the persona, not the handler, to
+  retune what the bot is willing to fix).
 - Design questions: `docs/PLAN.md`.
 - Interface guarantees: `CONTRACTS.md`.
 - Live state: `daeyeon-bot ops doctor && daeyeon-bot inspect status`.
@@ -321,4 +367,5 @@ Update **all three** in the same commit:
 - SQLite WAL (existing `state.db`). One additive migration: `002_gh_review_requested_state.sql`. (001-github-pr-review-bot)
 
 ## Recent Changes
+- 004-pr-autofix-bot: `gh_pr_feedback` trigger + `pr_autofix` handler. First write-side git adapter (`infra/git_workspace.py`) and first tool-enabled Claude session (`infra/claude.py:RealClaudeAgentSession`). No new runtime deps — git access goes through `gh auth git-credential`.
 - 001-github-pr-review-bot: Added Python 3.12 (`requires-python = ">=3.12,<3.13"` in `pyproject.toml`). + existing — `claude-agent-sdk`, `pydantic` (v2), `pydantic-settings`, `structlog`, `aiosqlite`, `typer`, `keyring`, `uuid-utils`. No new runtime deps; GitHub access goes through the operator's local `gh` CLI via subprocess.

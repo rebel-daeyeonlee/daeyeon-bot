@@ -518,3 +518,72 @@ def _unused_ctx() -> Any:
         clock: Any = None
 
     return _Ctx()
+
+
+# ── a round must cost an actual event ─────────────────────────────────────
+
+
+async def test_repolling_an_unchanged_set_does_not_burn_a_round(tmp_path: Path) -> None:
+    """The bug that killed ssw-bundle#5250: round 6, only three events.
+
+    `consume_round` ran before `_emit_event`, so a re-poll of an UNCHANGED
+    pending set — correctly refused by the dedup key — still moved the counter.
+    A PR whose comments stay pending on purpose (what `verify_failed` leaves
+    behind) then walked its own budget to zero on polling frequency alone and
+    stood itself down without ever doing the work.
+    """
+    db_path = await _prepare(tmp_path)
+    gh = FakeGh(user_login=OPERATOR)
+    _seed(gh)
+    gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+    trigger = _trigger(db_path, gh, force_rescan_seconds=0.0)
+
+    assert await trigger.poll_once() == 1
+    for _ in range(4):
+        assert await trigger.poll_once() == 0
+
+    async with storage.connection(db_path) as conn:
+        row = await pr_feedback_state.get_state(conn, REPO, PR)
+    assert row is not None
+    assert row.round == 1, f"4 no-op polls burned {row.round - 1} phantom round(s)"
+    assert len(await _events(db_path)) == 1
+
+
+async def test_the_round_in_the_payload_matches_the_persisted_counter(
+    tmp_path: Path,
+) -> None:
+    """The handler's `max_rounds` gate reads the payload, so a payload round that
+    disagreed with the stored one would gate on a number nothing else believes."""
+    import json
+
+    db_path = await _prepare(tmp_path)
+    gh = FakeGh(user_login=OPERATOR)
+    _seed(gh)
+    gh.add_review_comment(REPO, PR, comment_id=11, author="coderabbitai[bot]", body="a")
+    trigger = _trigger(db_path, gh, force_rescan_seconds=0.0)
+
+    await trigger.poll_once()
+    gh.add_review_comment(REPO, PR, comment_id=12, author="coderabbitai[bot]", body="b")
+    await trigger.poll_once()
+
+    rounds = [json.loads(r["payload_json"])["round"] for r in await _events(db_path)]
+    async with storage.connection(db_path) as conn:
+        row = await pr_feedback_state.get_state(conn, REPO, PR)
+    assert rounds == [1, 2]
+    assert row is not None and row.round == 2
+
+
+async def test_an_ignored_author_never_costs_a_round(tmp_path: Path) -> None:
+    """Noise bots were consuming a round AND a Claude call each: 12 of the first
+    13 rejections in production were linkback / CI-status / review-body posts."""
+    db_path = await _prepare(tmp_path)
+    gh = FakeGh(user_login=OPERATOR)
+    _seed(gh)
+    gh.add_review_comment(REPO, PR, comment_id=11, author="ssw-buildkite[bot]", body="CI ok")
+    gh.add_issue_comment(REPO, PR, comment_id=12, author="linear[bot]", body="<details>link")
+
+    trigger = _trigger(db_path, gh, ignored_authors=["ssw-buildkite[bot]", "linear[bot]"])
+    assert await trigger.poll_once() == 0
+    async with storage.connection(db_path) as conn:
+        row = await pr_feedback_state.get_state(conn, REPO, PR)
+    assert row is not None and row.round == 0

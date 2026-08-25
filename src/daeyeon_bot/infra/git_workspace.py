@@ -57,6 +57,22 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # instead of a cryptic git one, and stops a crafted ref from becoming an option.
 _REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
+# The daemon runs inside its OWN uv venv, and a naive `dict(os.environ)` hands
+# that venv to a verify command meant to run against the TARGET repo's
+# environment. Observed as `warning: VIRTUAL_ENV=<daemon>/.venv does not match
+# the project environment path .venv and will be ignored` on ssw-bundle#5250,
+# right before the command failed. Dropped so the workspace resolves its own.
+_STRIPPED_ENV: frozenset[str] = frozenset(
+    {
+        "VIRTUAL_ENV",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "UV_PROJECT_ENVIRONMENT",
+        "UV_ACTIVE",
+    }
+)
+
 _DEFAULT_GIT_TIMEOUT_S = 300.0
 # Grace between SIGTERM and SIGKILL for a timed-out verify command.
 _VERIFY_TERM_GRACE_S = 5.0
@@ -408,7 +424,7 @@ class GitWorkspace:
     # ── internals ─────────────────────────────────────────────────────────
 
     def _env(self) -> dict[str, str]:
-        env = dict(os.environ)
+        env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_ENV}
         # A missing credential must fail fast; a daemon has no terminal to
         # answer a username prompt on, and a hung git holds the handler slot.
         env["GIT_TERMINAL_PROMPT"] = "0"

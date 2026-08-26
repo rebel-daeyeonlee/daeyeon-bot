@@ -13,7 +13,10 @@ conversation comment. All three are folded into one stream here.
 
 Filtering, in order (each step is a separate reason a comment is dropped, and
 the order matters for the logs):
-  1. the operator's own login — you don't answer your own notes;
+  1. the operator's own login — you don't answer your own notes. EXCEPT for
+     this daemon's own `pr_review` output, which posts under that same identity
+     and is identified by review id (`own_review_ids`); those findings are real
+     feedback and are let through;
   2. our own prior replies, matched by `self_comment_markers`, because those
      are posted under the operator's `gh` identity and would otherwise read as
      fresh feedback on the next poll;
@@ -117,6 +120,7 @@ def build_feedback(
     allow_globs: list[str],
     ignore_globs: list[str],
     self_comment_markers: list[str],
+    own_review_ids: frozenset[int] | set[int] = frozenset(),
 ) -> list[FeedbackComment]:
     """Merge and filter the three surfaces into one ordered feedback stream.
 
@@ -137,9 +141,17 @@ def build_feedback(
         parent = _int_or_none(raw.get("in_reply_to_id"))
         root_of[cid] = cid if parent is None else root_of.get(parent, parent)
 
-    def eligible(author: str, body: str) -> bool:
+    def eligible(author: str, body: str, *, from_own_review: bool = False) -> bool:
         if not body or _is_own_reply(body, self_comment_markers):
             return False
+        if from_own_review:
+            # Our own `pr_review` output. It arrives under the operator's `gh`
+            # identity, so the author gate below would drop it — which silently
+            # made the bot's own findings the one class of feedback autofix
+            # could never act on. The marker check above still stops it from
+            # answering its OWN replies, which is the loop that actually needs
+            # preventing.
+            return True
         return is_author_eligible(
             author,
             operator_login=operator_login,
@@ -152,7 +164,8 @@ def build_feedback(
         if cid is None or _is_outdated_inline(raw):
             continue
         author, body = _author_of(raw), _body_of(raw)
-        if not eligible(author, body):
+        own = _int_or_none(raw.get("pull_request_review_id")) in own_review_ids
+        if not eligible(author, body, from_own_review=own):
             continue
         out.append(
             FeedbackComment(
@@ -176,7 +189,7 @@ def build_feedback(
         # A review that only carries inline comments has an empty body and is
         # already represented by those comments — no need for a duplicate item.
         author, body = _author_of(raw), _body_of(raw)
-        if not eligible(author, body):
+        if not eligible(author, body, from_own_review=rid in own_review_ids):
             continue
         out.append(
             FeedbackComment(

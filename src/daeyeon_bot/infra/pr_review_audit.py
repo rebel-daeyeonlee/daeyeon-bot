@@ -137,6 +137,28 @@ async def list_recent(
     return [_row_to_audit(r) for r in rows]
 
 
+async def posted_review_ids(conn: aiosqlite.Connection, repo: str, pr_number: int) -> set[int]:
+    """GitHub review ids this daemon posted on `(repo, pr_number)` via `pr_review`.
+
+    `pr_autofix` uses this to tell its OWN reviewer apart from the operator.
+    Both post under the same `gh` identity, so an author check alone cannot
+    separate "daeyeon-bot reviewed my PR and found a MAJOR" from "daeyeon typed
+    a note to himself" — and the former is exactly the feedback autofix exists
+    to act on.
+
+    Matching on ids rather than on body text (`[MAJOR]`, `**Verdict**:`) keeps
+    this independent of the review persona's output format, which is tuned in a
+    SKILL.md and is free to change.
+    """
+    async with conn.execute(
+        "SELECT review_id FROM pr_review_audit"
+        " WHERE repo = ? AND pr_number = ? AND review_id IS NOT NULL",
+        (repo, pr_number),
+    ) as cur:
+        rows = await cur.fetchall()
+    return {int(row["review_id"]) for row in rows}
+
+
 async def record_supersede(
     conn: aiosqlite.Connection,
     audit_id: int,
@@ -219,5 +241,6 @@ __all__ = [
     "insert_audit",
     "list_for_pr",
     "list_recent",
+    "posted_review_ids",
     "record_supersede",
 ]

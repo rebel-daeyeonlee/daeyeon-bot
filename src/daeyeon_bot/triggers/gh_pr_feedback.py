@@ -53,7 +53,12 @@ from daeyeon_bot.core.manifest import TriggerManifest
 from daeyeon_bot.core.protocols import EmitFn, TriggerContext
 from daeyeon_bot.core.time import Clock
 from daeyeon_bot.handlers.pr_autofix_comments import build_feedback
-from daeyeon_bot.infra import outbox, pr_autofix_ledger, pr_feedback_state
+from daeyeon_bot.infra import (
+    outbox,
+    pr_autofix_ledger,
+    pr_feedback_state,
+    pr_review_audit,
+)
 from daeyeon_bot.triggers.gh_review_requested import (
     PermanentFailureReporter,
     StorageFactory,
@@ -259,6 +264,9 @@ class GhPrFeedbackTrigger:
             )
             return False
 
+        async with self.storage_factory() as conn:
+            own_review_ids = await pr_review_audit.posted_review_ids(conn, repo, pr_number)
+
         feedback = build_feedback(
             review_comments=review_comments,
             reviews=reviews,
@@ -267,6 +275,7 @@ class GhPrFeedbackTrigger:
             allow_globs=self.comment_authors,
             ignore_globs=self.ignored_authors,
             self_comment_markers=self.self_comment_markers,
+            own_review_ids=own_review_ids,
         )
 
         async with self.storage_factory() as conn:

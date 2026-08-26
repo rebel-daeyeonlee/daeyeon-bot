@@ -47,6 +47,7 @@ def _build(**kwargs: Any) -> list[Any]:
         "allow_globs": ["*"],
         "ignore_globs": [],
         "self_comment_markers": ["daeyeon-bot autofix"],
+        "own_review_ids": frozenset(),
     }
     defaults.update(kwargs)
     return build_feedback(**defaults)
@@ -249,3 +250,73 @@ def test_glob_is_anchored_at_both_ends() -> None:
 
     assert author_matches("coderabbitai", "coderabbit*")
     assert not author_matches("evil-coderabbitai", "coderabbit*")
+
+
+# ── the daemon's own pr_review findings ───────────────────────────────────
+#
+# `pr_review` posts under the operator's `gh` identity, so the author gate made
+# the bot's own findings the one class of feedback autofix could never act on.
+# Observed on ssw-bundle#5302: a [MAJOR] "password rendered into the log by
+# TimeoutExpired.__str__" sat untouched until a human fixed it by hand.
+
+
+def test_our_own_review_body_is_triaged() -> None:
+    out = _build(
+        reviews=[
+            {
+                "id": 5028435215,
+                "user": {"login": OPERATOR},
+                "body": "**Verdict**: CONCERNS — argv에 패스워드가 노출된다",
+                "submitted_at": "2026-01-01T00:00:00Z",
+            }
+        ],
+        own_review_ids={5028435215},
+    )
+    assert [c.comment_id for c in out] == [5028435215]
+
+
+def test_our_own_inline_finding_is_triaged() -> None:
+    out = _build(
+        review_comments=[_rc(3861082574, OPERATOR, "[MAJOR] rbln_ccl.py:983 — 패스워드 노출")],
+        own_review_ids=set(),
+    )
+    assert out == [], "sanity: without the review id it is still filtered"
+
+    comment = _rc(3861082574, OPERATOR, "[MAJOR] rbln_ccl.py:983 — 패스워드 노출")
+    comment["pull_request_review_id"] = 5028435215
+    out = _build(review_comments=[comment], own_review_ids={5028435215})
+    assert [c.comment_id for c in out] == [3861082574]
+
+
+def test_the_operators_hand_typed_comment_is_still_skipped() -> None:
+    """Opening our own reviewer must not open the operator's notes to himself.
+    Only comments belonging to a review id we recorded get through."""
+    out = _build(
+        review_comments=[_rc(1, OPERATOR, "나중에 이거 확인")],
+        own_review_ids={5028435215},
+    )
+    assert out == []
+
+
+def test_our_own_autofix_reply_stays_filtered_even_inside_our_review() -> None:
+    """The marker check is what prevents the infinite reply loop, and it has to
+    win over the own-review allowance — GitHub wraps an inline reply in a review
+    of its own, so a reply can carry a review id too."""
+    comment = _rc(2, OPERATOR, "🤖 **daeyeon-bot autofix** — 수정했습니다\n\n- 커밋: abc")
+    comment["pull_request_review_id"] = 5028438137
+    out = _build(review_comments=[comment], own_review_ids={5028438137})
+    assert out == []
+
+
+def test_own_review_ids_defaults_to_nothing() -> None:
+    """Callers that do not pass the set keep the old behaviour exactly."""
+    out = build_feedback(
+        review_comments=[_rc(1, OPERATOR, "[MAJOR] something")],
+        reviews=[],
+        issue_comments=[],
+        operator_login=OPERATOR,
+        allow_globs=["*"],
+        ignore_globs=[],
+        self_comment_markers=["daeyeon-bot autofix"],
+    )
+    assert out == []

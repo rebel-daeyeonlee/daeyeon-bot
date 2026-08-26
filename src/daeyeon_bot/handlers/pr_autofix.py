@@ -79,7 +79,7 @@ from daeyeon_bot.handlers.pr_autofix_reply import (
     render_verify_failed_comment,
 )
 from daeyeon_bot.handlers.pr_autofix_schemas import TriageOutput
-from daeyeon_bot.infra import pr_autofix_audit, pr_autofix_ledger
+from daeyeon_bot.infra import pr_autofix_audit, pr_autofix_ledger, pr_review_audit
 from daeyeon_bot.infra.git_workspace import GitWorkspace
 from daeyeon_bot.infra.persona_loader import PersonaLoader
 
@@ -327,6 +327,7 @@ class PrAutofixHandler:
             allow_globs=self.config.comment_authors,
             ignore_globs=self.config.ignored_authors,
             self_comment_markers=self.config.self_comment_markers,
+            own_review_ids=await pr_review_audit.posted_review_ids(self.db, pr.repo, pr.pr_number),
         )
         handled = await pr_autofix_ledger.handled_comment_ids(
             self.db, repo=pr.repo, pr_number=pr.pr_number

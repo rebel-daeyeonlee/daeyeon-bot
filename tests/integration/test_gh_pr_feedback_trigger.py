@@ -19,7 +19,12 @@ from typing import Any
 import aiosqlite
 import pytest
 
-from daeyeon_bot.infra import pr_autofix_ledger, pr_feedback_state, storage
+from daeyeon_bot.infra import (
+    pr_autofix_ledger,
+    pr_feedback_state,
+    pr_review_audit,
+    storage,
+)
 from daeyeon_bot.triggers.gh_pr_feedback import GhPrFeedbackTrigger
 from tests.fakes.gh_cli import FakeGh
 
@@ -587,3 +592,43 @@ async def test_an_ignored_author_never_costs_a_round(tmp_path: Path) -> None:
     async with storage.connection(db_path) as conn:
         row = await pr_feedback_state.get_state(conn, REPO, PR)
     assert row is not None and row.round == 0
+
+
+async def test_our_own_pr_review_finding_wakes_the_handler(tmp_path: Path) -> None:
+    """End to end through the real audit table: a review this daemon posted must
+    reach the pending set, since it arrives under the operator's own login and
+    was previously invisible to autofix."""
+    db_path = await _prepare(tmp_path)
+    gh = FakeGh(user_login=OPERATOR)
+    _seed(gh)
+    gh.add_review(
+        REPO,
+        PR,
+        review_id=5028435215,
+        author=OPERATOR,
+        body="**Verdict**: CONCERNS — argv에 패스워드가 노출된다",
+    )
+
+    # Without an audit row it is just the operator talking to himself.
+    assert await _trigger(db_path, gh, force_rescan_seconds=0.0).poll_once() == 0
+
+    async with storage.connection(db_path) as conn:
+        await conn.execute(
+            "INSERT INTO events(id, type, schema_version, source, source_dedup_key,"
+            " payload_json, trace_id, created_at) VALUES"
+            " ('rev-1','gh.review_requested',1,'gh_review_requested','k','{}','t','2026-01-01')"
+        )
+        await pr_review_audit.insert_audit(
+            conn,
+            event_id="rev-1",
+            repo=REPO,
+            pr_number=PR,
+            head_sha=SHA,
+            request_gen="1",
+            status="posted",
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+            review_id=5028435215,
+        )
+        await conn.commit()
+
+    assert await _trigger(db_path, gh, force_rescan_seconds=0.0).poll_once() == 1

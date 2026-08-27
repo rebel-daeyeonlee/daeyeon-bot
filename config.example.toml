@@ -387,6 +387,13 @@ verify_timeout_seconds = 900
 # Set push_enabled = false for a dry run: the bot triages, fixes, verifies and
 # commits in the workspace, then stops without pushing. Replies still go out, so
 # you can read its judgement before granting it the remote.
+# Set false to run COMMENT-ONLY: triage every comment and reply with the
+# judgement, but never open a workspace. Distinct from push_enabled = false,
+# which still clones, runs the fix agent and commits — that costs minutes per
+# event, and when reviews arrive faster than events drain the queue (and the
+# round counter with it) runs away. Comment-only finishes in about a minute.
+fix_enabled = true
+
 push_enabled = true
 git_author_name = "daeyeon-bot"
 git_author_email = "daeyeon-bot@users.noreply.github.com"

@@ -28,6 +28,8 @@ AutofixStatus = Literal[
     # A fix was made and deliberately NOT shipped (`push_enabled = false`). The
     # commit exists only inside the workspace clone; nothing reached the remote.
     "dry_run",
+    # `fix_enabled = false` — triaged and replied, no workspace ever opened.
+    "comment_only",
     "no_changes",
     "all_rejected",
     "verify_failed",

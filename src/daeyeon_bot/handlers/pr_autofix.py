@@ -237,6 +237,22 @@ class PrAutofixHandler:
                 event, parsed, pr, decisions, by_id, status="all_rejected", now=now
             )
 
+        if not self.config.fix_enabled:
+            # Comment-only: report the judgement and stop. No clone, no agent,
+            # no commit — which is what keeps an event to about a minute. The
+            # expensive path is what let the queue outrun the drain and spend a
+            # PR's whole round budget on duplicate events.
+            return await self._settle_without_push(
+                event,
+                parsed,
+                pr,
+                decisions,
+                by_id,
+                status="comment_only",
+                now=now,
+                comment_only=True,
+            )
+
         return await self._fix_and_push(
             event=event,
             parsed=parsed,
@@ -505,7 +521,17 @@ class PrAutofixHandler:
             verify_exit_code=verify.exit_code if verify else None,
         )
         await self._write_ledger(
-            event, pr, decisions, by_id, commit_sha=shipped_sha, now=now, dry_run=dry_run
+            event,
+            pr,
+            decisions,
+            by_id,
+            commit_sha=shipped_sha,
+            now=now,
+            unapplied_note=(
+                "dry run (push_enabled=false) — 수정안은 만들었으나 브랜치에 반영하지 않음."
+                if dry_run
+                else None
+            ),
         )
         await self.db.commit()
         _log.info(
@@ -659,9 +685,12 @@ class PrAutofixHandler:
         *,
         status: pr_autofix_audit.AutofixStatus,
         now: datetime,
+        comment_only: bool = False,
     ) -> HandlerResult:
         """Answer everything and record the run, without ever touching git."""
-        await self._reply_all(pr, decisions, by_id, outcome=None, commit_sha=None)
+        await self._reply_all(
+            pr, decisions, by_id, outcome=None, commit_sha=None, comment_only=comment_only
+        )
         await pr_autofix_audit.insert_audit(
             self.db,
             event_id=event.id,
@@ -675,7 +704,19 @@ class PrAutofixHandler:
             rejected_count=_count(decisions, "rejected"),
             deferred_count=_count(decisions, "deferred"),
         )
-        await self._write_ledger(event, pr, decisions, by_id, commit_sha=None, now=now)
+        await self._write_ledger(
+            event,
+            pr,
+            decisions,
+            by_id,
+            commit_sha=None,
+            now=now,
+            unapplied_note=(
+                "comment-only (fix_enabled=false) — 판정만 하고 수정은 시도하지 않음."
+                if comment_only
+                else None
+            ),
+        )
         await self.db.commit()
         _log.info(
             "pr_autofix.settled",
@@ -765,6 +806,7 @@ class PrAutofixHandler:
         outcome: FixOutcome | None,
         commit_sha: str | None,
         dry_run: bool = False,
+        comment_only: bool = False,
     ) -> None:
         """Answer every triaged comment — accepted, rejected and deferred alike.
 
@@ -788,6 +830,7 @@ class PrAutofixHandler:
                 outcome=outcome,
                 commit_sha=commit_sha,
                 dry_run=dry_run,
+                comment_only=comment_only,
             )
             target = comment.reply_target_id or comment.comment_id
             try:
@@ -809,6 +852,7 @@ class PrAutofixHandler:
             outcome=outcome,
             commit_sha=commit_sha,
             dry_run=dry_run,
+            comment_only=comment_only,
         )
         try:
             await self.gh.post_issue_comment(pr.repo, pr.pr_number, body)
@@ -829,7 +873,7 @@ class PrAutofixHandler:
         *,
         commit_sha: str | None,
         now: datetime,
-        dry_run: bool = False,
+        unapplied_note: str | None = None,
     ) -> None:
         """Mark every decided comment handled. This is what ends the loop.
 
@@ -845,7 +889,7 @@ class PrAutofixHandler:
             if comment is None:
                 continue
             verdict = decision.verdict
-            if verdict == "accepted" and dry_run:
+            if verdict == "accepted" and unapplied_note is not None:
                 verdict = "deferred"  # type: ignore[assignment]
             # An `accepted` comment with no commit was NOT fixed; recording it
             # as accepted would leave a false trail in the ledger.
@@ -862,9 +906,8 @@ class PrAutofixHandler:
                 created_at=now,
                 event_id=event.id,
                 reason=(
-                    "dry run (push_enabled=false) — 수정안만 만들고 브랜치에는 반영하지"
-                    " 않음. " + decision.reasoning
-                    if dry_run and decision.verdict == "accepted"
+                    f"{unapplied_note} {decision.reasoning}"
+                    if unapplied_note is not None and decision.verdict == "accepted"
                     else decision.reasoning
                 )[:2000],
                 commit_sha=commit_sha if decision.verdict == "accepted" else None,

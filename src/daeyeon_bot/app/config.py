@@ -401,6 +401,13 @@ class PrAutofixHandlerEntry(HandlerEntry):
     verify_timeout_seconds: int = 900
 
     # ── output ───────────────────────────────────────────────────────────
+    # When false the handler stops after triage: it replies to every comment
+    # with its judgement and never opens a workspace at all. Distinct from
+    # `push_enabled = false`, which still clones, runs the fix agent and
+    # commits — that costs minutes per event, and when reviews arrive faster
+    # than events drain, the queue (and the round counter with it) runs away.
+    # Comment-only finishes in about a minute, so the drain keeps up.
+    fix_enabled: bool = True
     push_enabled: bool = True
     git_author_name: str = "daeyeon-bot"
     git_author_email: str = "daeyeon-bot@users.noreply.github.com"

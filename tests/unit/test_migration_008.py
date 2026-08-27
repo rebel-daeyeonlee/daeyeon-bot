@@ -10,7 +10,7 @@ from daeyeon_bot.infra.storage import apply_migrations, open_db
 
 # The running tip, not 8 — these tests guard that apply_migrations reaches the
 # newest migration, and every added migration moves that number.
-_LATEST_SCHEMA_VERSION = 10
+_LATEST_SCHEMA_VERSION = 11
 
 
 async def _open(tmp_path: Path) -> aiosqlite.Connection:

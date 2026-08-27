@@ -37,6 +37,9 @@ _HEADERS = {
     # that the next round resets — so this must never read as "수정했습니다",
     # and must never carry a commit link (it would 404).
     "dry_run": f"🤖 **{_MARKER}** — 수정안만 만들었습니다 (dry run — push 안 함)",
+    # `fix_enabled = false`. No workspace was opened, so unlike `dry_run` there
+    # is not even a local commit to point at — only the judgement.
+    "comment_only": f"🤖 **{_MARKER}** — 판정만 했습니다 (자동 수정 꺼짐)",
     "rejected": f"🤖 **{_MARKER}** — 수정하지 않았습니다",
     "deferred": f"🤖 **{_MARKER}** — 사람 확인이 필요합니다",
     "failed": f"🤖 **{_MARKER}** — 처리하지 못했습니다",
@@ -68,6 +71,7 @@ def render_decision_reply(  # noqa: PLR0912 — one branch per reply shape; each
     outcome: FixOutcome | None,
     commit_sha: str | None,
     dry_run: bool = False,
+    comment_only: bool = False,
 ) -> str:
     """The reply body for one triaged comment.
 
@@ -81,6 +85,18 @@ def render_decision_reply(  # noqa: PLR0912 — one branch per reply shape; each
     the reviewer stops checking.
     """
     verdict = decision.verdict
+    if verdict == "accepted" and comment_only:
+        lines = [
+            _HEADERS["comment_only"],
+            "",
+            decision.reasoning,
+            "",
+            f"- 고칠 내용: {decision.fix_instruction}" if decision.fix_instruction else "",
+            "",
+            "_`fix_enabled = false` 이라 이번에는 판정만 하고 코드는 건드리지 않았습니다._"
+            " 설정을 켜면 이 지적부터 다시 처리합니다.",
+        ]
+        return "\n".join(line for line in lines if line != "")
     if verdict == "accepted" and dry_run:
         lines = [
             _HEADERS["dry_run"],
@@ -169,6 +185,7 @@ def render_aggregate_comment(
     outcome: FixOutcome | None,
     commit_sha: str | None,
     dry_run: bool = False,
+    comment_only: bool = False,
 ) -> str:
     """One PR-level comment answering every non-inline feedback item."""
     lines = [f"🤖 **{_MARKER}**", ""]
@@ -178,7 +195,9 @@ def render_aggregate_comment(
             "rejected": "🚫 수정 안 함",
             "deferred": "🤔 사람 확인 필요",
         }.get(decision.verdict, "⚠️ 처리 실패")
-        if decision.verdict == "accepted" and dry_run:
+        if decision.verdict == "accepted" and comment_only:
+            label = "📝 판정만 (자동 수정 꺼짐)"
+        elif decision.verdict == "accepted" and dry_run:
             label = "📝 수정안만 (dry run)"
         elif decision.verdict == "accepted" and not commit_sha:
             label = "⚠️ 미적용"

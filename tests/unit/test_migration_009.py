@@ -9,7 +9,7 @@ import pytest
 
 from daeyeon_bot.infra.storage import apply_migrations, open_db
 
-_LATEST_SCHEMA_VERSION = 10
+_LATEST_SCHEMA_VERSION = 11
 
 
 async def _open(tmp_path: Path) -> aiosqlite.Connection:
@@ -149,5 +149,33 @@ async def test_migration_010_preserves_existing_audit_rows(tmp_path: Path) -> No
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
         assert rows == [{"repo": "o/r", "pr_number": 7, "status": "pushed", "commit_sha": "abc123"}]
+    finally:
+        await conn.close()
+
+
+async def test_migration_011_allows_comment_only(tmp_path: Path) -> None:
+    """`fix_enabled = false` needs its own status: it is neither `dry_run` (a fix
+    was made and withheld) nor `all_rejected` (nothing was worth fixing)."""
+    conn = await _open(tmp_path)
+    try:
+        await conn.execute(
+            "INSERT INTO events(id, type, schema_version, source, source_dedup_key,"
+            " payload_json, trace_id, created_at) VALUES"
+            " ('e2','gh.pr_feedback',1,'gh_pr_feedback','k2','{}','t','2026-01-01')"
+        )
+        await conn.execute(
+            "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+            " status, created_at) VALUES ('e2','o/r',1,'abc',1,'comment_only','2026-01-01')"
+        )
+        # The values 010 added must survive 011's rebuild.
+        await conn.execute(
+            "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+            " status, created_at) VALUES ('e2','o/r',2,'abc',1,'dry_run','2026-01-01')"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO pr_autofix_audit(event_id, repo, pr_number, head_sha, round,"
+                " status, created_at) VALUES ('e2','o/r',3,'abc',1,'commented?','2026-01-01')"
+            )
     finally:
         await conn.close()

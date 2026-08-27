@@ -1281,6 +1281,7 @@ async def test_dry_run_leaves_the_comment_for_a_human_not_marked_done(
         assert [r.verdict for r in rows] == ["deferred"]
         assert rows[0].commit_sha is None
         assert "dry run" in (rows[0].reason or "")
+        assert "push_enabled=false" in (rows[0].reason or "")
     finally:
         await conn.close()
 
@@ -1345,3 +1346,136 @@ async def test_a_real_push_still_claims_the_fix_and_links_the_commit(
         assert [r.verdict for r in rows] == ["accepted"]
     finally:
         await conn.close()
+
+
+# ── comment-only mode ─────────────────────────────────────────────────────
+#
+# `fix_enabled = false` stops after triage. Unlike `push_enabled = false`, which
+# still clones, runs the agent and commits, this opens no workspace at all —
+# which is what keeps an event to about a minute. The expensive path let the
+# queue outrun the drain until duplicate events spent a PR's whole round budget
+# (observed on ssw-bundle#4931: 4 of 11 rounds were queued duplicates that found
+# nothing left to do, and three real Copilot findings were blocked as a result).
+
+
+async def test_comment_only_never_opens_a_workspace(
+    tmp_path: Path, persona_root: Path, workspace_factory: Any
+) -> None:
+    """The whole point: no clone, no agent. If either runs, the event is slow
+    again and the queue problem comes back."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh, head_sha=workspace_factory.head_sha)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="Copilot", body="off by one")
+        handler, ctx, sessions = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            agent_edit=_write("app.py", "x = 2\n"),
+            workspace_factory=workspace_factory,
+            fix_enabled=False,
+        )
+        event = await _event(conn)
+        assert isinstance(await handler.handle(event, ctx), Ack)  # type: ignore[arg-type]
+
+        assert sessions == [], "fix agent must not run"
+        assert workspace_factory.made == [], "workspace must not be built"
+        row = await _audit(conn, event.id)
+        assert row is not None
+        assert row.status == "comment_only"
+        assert row.commit_sha is None
+    finally:
+        await conn.close()
+
+
+async def test_comment_only_still_replies_with_the_judgement(
+    tmp_path: Path, persona_root: Path
+) -> None:
+    """Turning fixing off must not turn REPORTING off — the judgement is the
+    whole remaining value."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="Copilot", body="off by one")
+        handler, ctx, _s = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            fix_enabled=False,
+        )
+        await handler.handle(await _event(conn), ctx)  # type: ignore[arg-type]
+
+        body = gh.replies[0]["body"]
+        assert "판정만 했습니다" in body
+        assert "수정했습니다" not in body
+        assert "/commit/" not in body, "nothing was committed — no link may be offered"
+        assert "fix_enabled" in body  # tells the reviewer why, and how to resume
+    finally:
+        await conn.close()
+
+
+async def test_comment_only_leaves_the_comment_for_later_not_marked_done(
+    tmp_path: Path, persona_root: Path
+) -> None:
+    """Recording `accepted` would seal it, so re-enabling `fix_enabled` would
+    never revisit a comment the bot agreed with but never acted on."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="Copilot", body="off by one")
+        handler, ctx, _s = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_accept())],
+            fix_enabled=False,
+        )
+        await handler.handle(await _event(conn), ctx)  # type: ignore[arg-type]
+
+        rows = await pr_autofix_ledger.list_for_pr(conn, repo=REPO, pr_number=PR)
+        assert [r.verdict for r in rows] == ["deferred"]
+        assert rows[0].commit_sha is None
+    finally:
+        await conn.close()
+
+
+async def test_comment_only_still_rejects_what_deserves_rejecting(
+    tmp_path: Path, persona_root: Path
+) -> None:
+    """A rejection needs no workspace either way, so it must read exactly as it
+    does with fixing on — no dry-run wording leaking into it."""
+    conn = await _db(tmp_path)
+    try:
+        gh = FakeGh(user_login=OPERATOR)
+        _seed_pr(gh)
+        gh.add_review_comment(REPO, PR, comment_id=11, author="Copilot", body="nit")
+        handler, ctx, _s = _build(
+            db=conn,
+            gh=gh,
+            persona_root=persona_root,
+            triage=[_triage_json(_reject())],
+            fix_enabled=False,
+        )
+        event = await _event(conn)
+        await handler.handle(event, ctx)  # type: ignore[arg-type]
+
+        row = await _audit(conn, event.id)
+        assert row is not None and row.status == "all_rejected"
+        body = gh.replies[0]["body"]
+        assert "수정하지 않았습니다" in body
+        assert "판정만 했습니다" not in body
+    finally:
+        await conn.close()
+
+
+async def test_fix_enabled_defaults_to_on(tmp_path: Path, persona_root: Path) -> None:
+    """The knob is an opt-OUT: an operator who never heard of it keeps fixing."""
+    from daeyeon_bot.app.config import PrAutofixHandlerEntry
+
+    assert PrAutofixHandlerEntry().fix_enabled is True
+    del tmp_path, persona_root

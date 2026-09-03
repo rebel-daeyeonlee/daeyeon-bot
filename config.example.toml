@@ -192,14 +192,25 @@ min_persona_chars = 200
 #   allowed_repos = ["rebellions-sw/*", "octo/cat"]              # mixed
 allowed_repos = []
 
-# Review the operator's OWN open PRs too (default false → own PRs are skipped
-# with audit.status = skipped_self_authored). When true, the trigger adds an
-# `author:<operator>` search and self-authored PRs flow through the same state
-# machine + handler. Self-authored reviews always post as COMMENT, whatever
-# `approve_enabled` says — GitHub rejects a self-APPROVE with HTTP 422. Pair
-# with a non-empty `allowed_repos` — with the empty allowlist above this scoops
-# up every open PR you have.
-review_self = false
+# WHOSE PRs the bot reviews. Replaces the old `review_self` boolean (which
+# could only ADD your own PRs on top of the review-requested set, never say
+# "mine only"). A leftover `review_self` key now fails the daemon at boot with
+# a message pointing here, rather than being silently ignored.
+#
+#   "self"      — ONLY PRs you authored (`author:<operator>`). The default.
+#                 Always posted as COMMENT whatever `approve_enabled` says —
+#                 GitHub rejects a self-APPROVE with HTTP 422.
+#   "requested" — ONLY PRs where you are a requested reviewer (audit
+#                 status = skipped_self_authored for your own).
+#   "both"      — the union (audit status = skipped_not_authored never fires).
+#
+# Pair with a non-empty `allowed_repos` — with the empty allowlist above,
+# "self" scoops up every open PR you have across all of GitHub.
+#
+# Flip for a single run without editing this file (this ONE key has an explicit
+# env read; the generic DAEYEON_BOT__ path cannot reach inside `handlers`):
+#   DAEYEON_BOT__HANDLERS__PR_REVIEW__SCOPE=requested just run
+scope = "self"
 
 # Submit a formal GitHub APPROVE review on a clean pass (verdict = APPROVE,
 # zero findings) for PRs authored by someone else.

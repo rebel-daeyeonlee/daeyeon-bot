@@ -106,6 +106,9 @@ enabled = false
 enabled = true
 persona_skill = "pr-reviewer"
 min_persona_chars = 50
+# This suite exercises the pre-`scope` behavior (review other people's
+# PRs, skip our own); `scope = "self"` is covered by the unit tests.
+scope = "requested"
 
 [routing]
 "pr.review.manual" = ["pr_review"]
@@ -228,7 +231,9 @@ async def test_self_authored_short_circuits(
     state_dir: Path,
     skills_root: Path,
 ) -> None:
-    """The operator opening their own PR ⇒ no review posted, audit row recorded."""
+    """Under `scope = "requested"`, the operator's own PR ⇒ no review posted,
+    audit row recorded. (Under the default `scope = "self"` it is the reverse —
+    see `test_scope_self_*` in tests/unit/test_pr_review_handler.py.)"""
     head_sha = "self001self001self001"
     repo = "octo/cat"
     pr_number = 99

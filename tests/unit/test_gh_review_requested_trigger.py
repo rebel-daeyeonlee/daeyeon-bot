@@ -55,7 +55,11 @@ def _trigger(*, gh: FakeGh, db_path: Path, **kwargs: Any) -> GhReviewRequestedTr
         clock=kwargs.pop("clock", SystemClock()),
         pause_check=pause_check,
         permanent_failure_reporter=permanent_failure_reporter,
-        review_self=kwargs.pop("review_self", False),
+        # Most fixtures in this module are review-requested shaped
+        # (`in_search_set=True`), so the helper defaults to that scope even
+        # though the production default is "self". Scope selection itself is
+        # covered by the `test_scope_*` cases below.
+        scope=kwargs.pop("scope", "requested"),
     )
 
 
@@ -129,10 +133,9 @@ async def test_first_observation_emits_gen_one(db_path: Path) -> None:
     assert await _outbox_handlers(db_path) == ["pr_review"]
 
 
-async def test_review_self_unions_authored_search(db_path: Path) -> None:
-    """`review_self=True` folds `author:<operator>` PRs into the observed set."""
+def _two_pr_fixture() -> FakeGh:
+    """One review-requested PR (someone else's) + one authored PR (ours)."""
     gh = FakeGh()
-    # A review-requested PR (someone else's) and an authored PR (operator's own).
     gh.add_pr(REPO, PR, head_sha="sha1", in_search_set=True)
     gh.add_pr(
         REPO,
@@ -142,35 +145,66 @@ async def test_review_self_unions_authored_search(db_path: Path) -> None:
         in_search_set=False,
         in_authored_set=True,
     )
-    trig = _trigger(gh=gh, db_path=db_path, review_self=True)
+    return gh
+
+
+async def test_scope_self_only_observes_authored_prs(db_path: Path) -> None:
+    """The default scope polls `author:<operator>` and nothing else."""
+    trig = _trigger(gh=_two_pr_fixture(), db_path=db_path, scope="self")
 
     emitted = await trig.poll_once()
 
-    assert emitted == 2
+    assert emitted == 1
     own = await _state_for(db_path, REPO, PR + 1)
     assert own is not None
     assert own["head_sha"] == "sha2"
     assert own["request_gen"] == 1
+    # Someone else's review-requested PR never enters the state machine.
+    assert await _state_for(db_path, REPO, PR) is None
 
 
-async def test_review_self_disabled_ignores_authored_search(db_path: Path) -> None:
-    """Default `review_self=False` never runs the authored search."""
-    gh = FakeGh()
-    gh.add_pr(
-        REPO,
-        PR + 1,
-        head_sha="sha2",
-        author="daeyeon-lee",
-        in_search_set=False,
-        in_authored_set=True,
+async def test_scope_self_is_the_dataclass_default(db_path: Path) -> None:
+    """Guard the production default — `_trigger` overrides it to "requested"."""
+    gh = _two_pr_fixture()
+
+    @asynccontextmanager
+    async def factory():  # type: ignore[no-untyped-def]
+        async with storage.connection(db_path) as conn:
+            yield conn
+
+    trig = GhReviewRequestedTrigger(
+        gh=gh,
+        storage_factory=factory,
+        github_username="daeyeon-lee",
+        poll_interval_seconds=0.01,
+        clock=SystemClock(),
     )
-    trig = _trigger(gh=gh, db_path=db_path)
+    assert trig.scope == "self"
+
+    assert await trig.poll_once() == 1
+    assert await _state_for(db_path, REPO, PR) is None
+
+
+async def test_scope_requested_ignores_authored_search(db_path: Path) -> None:
+    """`scope="requested"` is the pre-scope behavior: other people's PRs only."""
+    trig = _trigger(gh=_two_pr_fixture(), db_path=db_path, scope="requested")
 
     emitted = await trig.poll_once()
 
-    assert emitted == 0
-    # The authored PR never enters the state machine when review_self is off.
+    assert emitted == 1
+    assert await _state_for(db_path, REPO, PR) is not None
     assert await _state_for(db_path, REPO, PR + 1) is None
+
+
+async def test_scope_both_unions_the_two_searches(db_path: Path) -> None:
+    """`scope="both"` is the old `review_self = true` union."""
+    trig = _trigger(gh=_two_pr_fixture(), db_path=db_path, scope="both")
+
+    emitted = await trig.poll_once()
+
+    assert emitted == 2
+    assert await _state_for(db_path, REPO, PR) is not None
+    assert await _state_for(db_path, REPO, PR + 1) is not None
 
 
 async def test_same_observation_twice_no_emit_second_time(db_path: Path) -> None:

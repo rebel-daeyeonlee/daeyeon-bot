@@ -108,6 +108,10 @@ async def _build_handler(
         persona_skill="pr-review",
         min_persona_chars=50,
         size_budget=SizeBudget(max_lines=1000, max_files=50),
+        # Most cases in this module review someone else's PR, so the helper
+        # pins the pre-`scope` behavior. The production default is "self";
+        # the `test_scope_*` cases below cover scope selection itself.
+        scope="requested",
     )
     handler = PrReviewHandler(
         manifest=MANIFEST,
@@ -299,8 +303,8 @@ async def test_skipped_self_authored(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_self_downgrades_approve_to_comment(tmp_path: Path) -> None:
-    """`review_self=True` reviews the operator's own PR, posting COMMENT not APPROVE."""
+async def test_scope_self_downgrades_approve_to_comment(tmp_path: Path) -> None:
+    """`scope="self"` reviews the operator's own PR, posting COMMENT not APPROVE."""
     fake_gh = FakeGh()
     fake_gh.add_pr(
         "o/r",
@@ -333,7 +337,7 @@ async def test_review_self_downgrades_approve_to_comment(tmp_path: Path) -> None
             persona_skill="pr-review",
             min_persona_chars=50,
             size_budget=SizeBudget(max_lines=1000, max_files=50),
-            review_self=True,
+            scope="self",
         ),
     )
     try:
@@ -354,8 +358,8 @@ async def test_review_self_downgrades_approve_to_comment(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_review_self_disabled_still_skips_own_pr(tmp_path: Path) -> None:
-    """Default `review_self=False` keeps the `skipped_self_authored` gate."""
+async def test_scope_requested_still_skips_own_pr(tmp_path: Path) -> None:
+    """`scope="requested"` keeps the `skipped_self_authored` gate."""
     fake_gh = FakeGh()
     fake_gh.add_pr(
         "o/r",
@@ -502,6 +506,7 @@ async def test_allowed_repo_proceeds_through_gate(tmp_path: Path) -> None:
             persona_skill="pr-review",
             min_persona_chars=50,
             allowed_repos=["rebellions-sw/*"],
+            scope="requested",  # the PR is authored by alice, not the operator
         ),
     )
     try:
@@ -567,9 +572,9 @@ async def test_manual_bypasses_disallowed_repo_and_withdrawn(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_manual_reviews_own_pr_even_without_review_self(tmp_path: Path) -> None:
+async def test_manual_reviews_own_pr_even_when_scope_is_requested(tmp_path: Path) -> None:
     """A manual fire reviews the operator's own PR (COMMENT) even when
-    `review_self=False` — the explicit command overrides the self-skip."""
+    `scope="requested"` — the explicit command overrides the self-skip."""
     fake_gh = FakeGh()
     fake_gh.add_pr(
         "rebellions-sw/daeyeon-bot",
@@ -590,7 +595,7 @@ async def test_manual_reviews_own_pr_even_without_review_self(tmp_path: Path) ->
             persona_skill="pr-review",
             min_persona_chars=50,
             allowed_repos=["rebellions-sw/*"],
-            review_self=False,  # auto path would skip; manual must not
+            scope="requested",  # auto path would skip; manual must not
         ),
     )
     try:
@@ -1043,13 +1048,114 @@ async def test_verdict_approve_posts_comment_when_approve_disabled(tmp_path: Pat
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_scope_self_skips_someone_elses_pr(tmp_path: Path) -> None:
+    """The default scope audits another author's PR as `skipped_not_authored`."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr(
+        "o/r",
+        7,
+        head_sha="deadbeef",
+        author="alice",
+        requested=(FakeGh.user_login,),  # we ARE the requested reviewer...
+        files=_FILES_ONE_FILE,
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            size_budget=SizeBudget(max_lines=1000, max_files=50),
+            # ...and scope="self" still declines: mine-only means mine-only.
+        ),
+    )
+    try:
+        event = _auto_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
+        assert isinstance(result, Ack)
+        assert fake_gh.posted_reviews() == []
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "skipped_not_authored"
+        assert "scope='self'" in (latest.error or "")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_self_manual_still_reviews_someone_elses_pr(tmp_path: Path) -> None:
+    """An explicit `dev fire-pr-review` overrides the scope gate both ways."""
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="alice", files=_FILES_ONE_FILE)
+    factory = FakeFactory(
+        session=FakeClaudeSession(default='{"verdict": "PASS", "summary": "ok", "comments": []}')
+    )
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        factory=factory,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            size_budget=SizeBudget(max_lines=1000, max_files=50),
+            scope="self",  # auto path would skip alice's PR; manual must not
+        ),
+    )
+    try:
+        event = _manual_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(factory))
+        assert isinstance(result, Ack)
+        assert len(fake_gh.posted_reviews()) == 1
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "posted"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_self_skips_unattributable_pr(tmp_path: Path) -> None:
+    """No resolvable author + scope="self" → skip, not review.
+
+    An empty `author_login` is not provably ours, and the fail-safe direction
+    for a bot that posts in the operator's name is to say nothing.
+    """
+    fake_gh = FakeGh()
+    fake_gh.add_pr("o/r", 7, head_sha="deadbeef", author="", files=_FILES_ONE_FILE)
+    handler, conn, _ = await _build_handler(
+        tmp_path,
+        fake_gh=fake_gh,
+        config_overrides=PrReviewHandlerEntry(
+            persona_skill="pr-review",
+            min_persona_chars=50,
+            size_budget=SizeBudget(max_lines=1000, max_files=50),
+        ),
+    )
+    try:
+        event = _auto_event()
+        await _seed_event_row(conn, event)
+        result = await handler.handle(event, _ctx(FakeFactory(session=FakeClaudeSession())))
+        assert isinstance(result, Ack)
+        assert fake_gh.posted_reviews() == []
+        latest = await find_latest(conn, "o/r", 7, "deadbeef")
+        assert latest is not None
+        assert latest.status == "skipped_not_authored"
+    finally:
+        await conn.close()
+
+
 def _approve_enabled_cfg() -> PrReviewHandlerEntry:
     return PrReviewHandlerEntry(
         persona_skill="pr-review",
         min_persona_chars=50,
         size_budget=SizeBudget(max_lines=1000, max_files=50),
         approve_enabled=True,
-        review_self=True,
+        # "both": these cases assert APPROVE on someone else's PR AND the
+        # forced COMMENT downgrade on our own, so both sets must be in scope.
+        scope="both",
     )
 
 

@@ -104,6 +104,9 @@ enabled = false
 enabled = true
 persona_skill = "pr-reviewer"
 min_persona_chars = 50
+# The poller fixture below is review-requested shaped, so pin the scope
+# that searches for it — the production default is "self".
+scope = "requested"
 
 [routing]
 "gh.review_requested" = ["pr_review"]

@@ -63,6 +63,7 @@ from daeyeon_bot.handlers.pr_review_schemas import InlineComment, ReviewOutput
 from daeyeon_bot.infra.gh_cli import ReviewEvent
 from daeyeon_bot.infra.logging import RedactReason, redact_with_provenance
 from daeyeon_bot.infra.pr_review_audit import (
+    AuditStatus,
     find_latest,
     insert_audit,
     record_supersede,
@@ -310,23 +311,39 @@ class PrReviewHandler:
         self, prep: _PrepState, now: datetime
     ) -> HandlerResult | None:
         is_self = bool(prep.author_login) and prep.author_login == self.github_username
-        # Skip own PRs unless `review_self` opts in — but an explicit manual
-        # fire always reviews. The post stage forces a COMMENT event for
-        # self-authored PRs (GitHub rejects self-APPROVE).
-        if is_self and not self.config.review_self and not prep.is_manual:
-            await self._write_audit(
-                **prep.audit_kwargs,
-                status="skipped_self_authored",
-                error=f"author_login={prep.author_login!r} == github_username",
-                created_at=now,
-            )
-            _log.info(
-                "pr_review.skipped_self_authored",
-                repo=prep.repo,
-                pr_number=prep.pr_number,
-                head_sha=prep.head_sha,
-            )
-            return Ack()
+        # `scope` decides WHOSE PRs get reviewed, and this is where it is
+        # actually enforced: the trigger only narrows the GitHub search, and a
+        # manual `dev fire-pr-review` never goes through the trigger at all.
+        # An explicit manual fire overrides the gate in both directions.
+        # The post stage forces a COMMENT event for self-authored PRs
+        # (GitHub rejects self-APPROVE).
+        if not prep.is_manual:
+            skip_status: AuditStatus | None = None
+            reason = ""
+            if is_self and not self.config.reviews_self:
+                skip_status = "skipped_self_authored"
+                reason = f"author_login={prep.author_login!r} == github_username"
+            elif not is_self and not self.config.reviews_requested:
+                # Includes the author-unknown case (`author_login` empty) — with
+                # scope="self" an unattributable PR is not provably ours, and
+                # skipping is the safe direction.
+                skip_status = "skipped_not_authored"
+                reason = f"author_login={prep.author_login!r} != github_username"
+            if skip_status is not None:
+                await self._write_audit(
+                    **prep.audit_kwargs,
+                    status=skip_status,
+                    error=f"{reason}; scope={self.config.scope!r}",
+                    created_at=now,
+                )
+                _log.info(
+                    f"pr_review.{skip_status}",
+                    repo=prep.repo,
+                    pr_number=prep.pr_number,
+                    head_sha=prep.head_sha,
+                    scope=self.config.scope,
+                )
+                return Ack()
         # Manual fires and force re-runs honor the request even when the
         # operator is not (or no longer) a requested reviewer; auto runs
         # always require current membership.

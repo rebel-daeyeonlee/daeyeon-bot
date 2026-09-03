@@ -204,8 +204,8 @@ class GhCli:
     ) -> list[dict[str, Any]]:
         """Search open PRs authored by `username`.
 
-        Used by the trigger when `[handlers.pr_review].review_self = true` so
-        the operator's own PRs get reviewed. `extra_query` carries the same
+        Used by the trigger when `[handlers.pr_review].scope` is "self" (the
+        default) or "both". `extra_query` carries the same
         repo-allowlist narrowing as `search_review_requested`. The two searches
         are disjoint — GitHub never lists you as a reviewer of your own PR — so
         the trigger can union the results without de-duping by author.

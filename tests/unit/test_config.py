@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from daeyeon_bot.app.config import (
+    PR_REVIEW_SCOPE_ENV,
     Config,
     GhReviewRequestedTriggerEntry,
     GitHubConfig,
@@ -154,6 +155,93 @@ def test_typo_in_section_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(Exception):  # noqa: B017
         load(str(cfg_path))
+
+
+# ── pr_review scope (mine-only review) ───────────────────────────────────────
+
+
+def test_pr_review_scope_defaults_to_self() -> None:
+    """The bot reviews only the operator's own PRs unless told otherwise."""
+    entry = Config().pr_review_handler_entry()
+    assert entry.scope == "self"
+    assert entry.reviews_self is True
+    assert entry.reviews_requested is False
+
+
+@pytest.mark.parametrize(
+    ("scope", "reviews_self", "reviews_requested"),
+    [
+        ("self", True, False),
+        ("requested", False, True),
+        ("both", True, True),
+    ],
+)
+def test_pr_review_scope_predicates(
+    scope: str, reviews_self: bool, reviews_requested: bool
+) -> None:
+    entry = PrReviewHandlerEntry(scope=scope)  # type: ignore[arg-type]
+    assert entry.reviews_self is reviews_self
+    assert entry.reviews_requested is reviews_requested
+
+
+def test_pr_review_rejects_unknown_scope() -> None:
+    with pytest.raises(Exception):  # noqa: B017
+        PrReviewHandlerEntry(scope="everyone")  # type: ignore[arg-type]
+
+
+def test_pr_review_legacy_review_self_key_rejected(tmp_path: Path) -> None:
+    """A leftover `review_self` must fail at boot, not be silently swallowed.
+
+    `HandlerEntry` is `extra="allow"`, so without the validator this key would
+    be accepted and ignored — the config would say one thing and the bot do
+    another.
+    """
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        "[handlers.pr_review]\nenabled = true\nreview_self = true\n", encoding="utf-8"
+    )
+    cfg = load(str(cfg_path))
+    with pytest.raises(Exception, match="review_self"):
+        cfg.pr_review_handler_entry()
+
+
+def test_pr_review_scope_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The env escape hatch beats a `[handlers.pr_review]` table in TOML.
+
+    The generic pydantic-settings env path cannot do this: `load()` passes the
+    TOML as init kwargs, which outrank every env source.
+    """
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[handlers.pr_review]\nscope = "self"\n', encoding="utf-8")
+    assert load(str(cfg_path)).pr_review_handler_entry().scope == "self"
+
+    monkeypatch.setenv(PR_REVIEW_SCOPE_ENV, "requested")
+    assert load(str(cfg_path)).pr_review_handler_entry().scope == "requested"
+
+
+def test_pr_review_scope_env_override_rejects_garbage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A set-but-bogus value fails loudly instead of falling back to config."""
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[handlers.pr_review]\nscope = "self"\n', encoding="utf-8")
+    monkeypatch.setenv(PR_REVIEW_SCOPE_ENV, "mine")
+    with pytest.raises(Exception, match="not one of"):
+        load(str(cfg_path)).pr_review_handler_entry()
+
+
+def test_pr_review_scope_env_blank_is_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[handlers.pr_review]\nscope = "self"\n', encoding="utf-8")
+    monkeypatch.setenv(PR_REVIEW_SCOPE_ENV, "  ")
+    assert load(str(cfg_path)).pr_review_handler_entry().scope == "self"
+
+
+def test_pr_review_scope_env_without_toml_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no `[handlers.pr_review]` table the generic pydantic env path also
+    reaches `scope` — the two routes must agree on the result."""
+    monkeypatch.setenv(PR_REVIEW_SCOPE_ENV, "both")
+    assert Config().pr_review_handler_entry().scope == "both"
 
 
 # ── Jira-triage feature config (Feature 002, T015) ────────────────────────────

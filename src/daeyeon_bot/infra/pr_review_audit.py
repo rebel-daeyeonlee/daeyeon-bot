@@ -19,6 +19,7 @@ from daeyeon_bot.core.pr_review.audit import AuditRow
 AuditStatus = Literal[
     "posted",
     "skipped_self_authored",
+    "skipped_not_authored",
     "skipped_withdrawn",
     "skipped_too_large",
     "skipped_already_reviewed",

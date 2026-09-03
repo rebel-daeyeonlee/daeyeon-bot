@@ -337,9 +337,11 @@ CREATE TABLE pr_review_audit (
     status                   TEXT NOT NULL CHECK (status IN
                                  ('posted',
                                   'skipped_self_authored',
+                                  'skipped_not_authored',    -- 012
                                   'skipped_withdrawn',
                                   'skipped_too_large',
                                   'skipped_already_reviewed',
+                                  'skipped_disallowed_repo', -- 004
                                   'failed')),
     review_id                INTEGER,
     submitted_at             TEXT,

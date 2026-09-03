@@ -1,9 +1,9 @@
 """Polling trigger for unanswered review comments on the operator's own PRs.
 
-Feature 004. Runs the same `author:<operator>` GitHub search the `pr_review`
-`review_self` path uses, then asks a different question of each hit: not "was I
-asked to review this?" but "did anyone leave feedback here that I have not
-answered yet?".
+Feature 004. Runs the same `author:<operator>` GitHub search that `pr_review`
+uses under `[handlers.pr_review].scope = "self"`, then asks a different question
+of each hit: not "was I asked to review this?" but "did anyone leave feedback
+here that I have not answered yet?".
 
 The answer is a set difference, and that is the whole loop-termination story:
 

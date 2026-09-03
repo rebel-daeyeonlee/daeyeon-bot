@@ -491,7 +491,7 @@ def instantiate_trigger(
             pause_check=gh_review_requested_deps.pause_check,
             permanent_failure_reporter=gh_review_requested_deps.permanent_failure_reporter,
             search_extra_query=search_extra_query,
-            review_self=pr_review_entry.review_self,
+            scope=pr_review_entry.scope,
         )
         return TriggerRecord(
             name=name,

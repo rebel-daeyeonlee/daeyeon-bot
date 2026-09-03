@@ -381,7 +381,8 @@ persona=<skill> [supersedes=[…]] [err=…]`. Statuses you'll see:
 | status | meaning |
 |---|---|
 | `posted` | Review submitted to GitHub. `review_id` is the GitHub Review ID. |
-| `skipped_self_authored` | PR author is the bot's own user. Default behaviour. Set `[handlers.pr_review].review_self = true` to review your own PRs instead (see "Review my own PRs" below). |
+| `skipped_self_authored` | PR author is the operator, and `[handlers.pr_review].scope = "requested"`. Not the default any more — see "Whose PRs get reviewed (`scope`)" below. |
+| `skipped_not_authored` | PR author is someone else, and `scope = "self"` (the default). The mirror of the row above. Flip to `"requested"` or `"both"` if you want other people's PRs reviewed. |
 | `skipped_withdrawn` | `requested_reviewers` no longer includes the bot — request was rescinded. |
 | `skipped_too_large` | PR diff exceeds the 1000-line / 50-file budget. Operator must `--force` or wait for a smaller follow-up. |
 | `skipped_already_reviewed` | An audit row already exists for this `(repo, pr, head_sha)`. Use `daeyeon-bot dev fire-pr-review --pr 'o/r#N' --force` to supersede. |
@@ -466,33 +467,57 @@ allowed_repos = ["rebellions-sw/*", "octo/cat"]
 Blocked PRs land as `audit.status = skipped_disallowed_repo`. Confirm
 with `daeyeon-bot inspect pr-review --pr 'owner/repo#N'`.
 
-### Review my own PRs (`review_self`)
+### Whose PRs get reviewed (`scope`)
 
-By default the bot skips PRs it authored (`skipped_self_authored`). To
-have it review your own open PRs too, opt in:
+`[handlers.pr_review].scope` decides which PRs the bot reviews at all. It
+replaces the old `review_self` boolean, which could only *add* your own PRs on
+top of the review-requested set and had no way to say "mine only".
 
 ```toml
 [handlers.pr_review]
-review_self = true
+scope = "self"                        # "self" | "requested" | "both"
 allowed_repos = ["rebellions-sw/*"]   # pair with a non-empty allowlist
 ```
 
-What changes when enabled:
+| `scope` | Trigger searches | Reviewed | Skipped as |
+|---|---|---|---|
+| `"self"` (default) | `author:<operator>` | your own open PRs | `skipped_not_authored` for everyone else's |
+| `"requested"` | `review-requested:<operator>` | PRs you were asked to review | `skipped_self_authored` for your own |
+| `"both"` | both searches | either | — |
 
-- The `gh_review_requested` trigger runs a second `author:<operator>`
-  search each poll and unions those PRs into the observed set, so your
-  own PRs flow through the same state machine + handler.
-- **Your own PRs always post as GitHub `COMMENT`**, whatever
-  `approve_enabled` says — GitHub rejects a self-`APPROVE` with HTTP 422,
-  so the handler downgrades unconditionally and self-review can never be
-  blocked by it. A clean-pass `APPROVE` verdict on your own PR posts as a
-  COMMENT carrying its (empty-comments) summary body plus a celebratory
-  곽철이 GIF.
-- On **other people's** PRs the event depends on
-  `[handlers.pr_review].approve_enabled` (see below). With it off (the
-  default) nothing the bot posts counts toward branch protection.
-- The same `allowed_repos` boundary applies — own PRs outside the
-  allowlist still land as `skipped_disallowed_repo`.
+A leftover `review_self` key now **fails the daemon at boot** (exit 78) with a
+message naming the `scope` value that preserves your old behavior — it is not
+silently ignored.
+
+Flip it for a single run without editing `config.toml` (this one key gets an
+explicit env read; the generic `DAEYEON_BOT__…` path cannot reach inside the
+`handlers` table when config.toml defines it):
+
+```bash
+DAEYEON_BOT__HANDLERS__PR_REVIEW__SCOPE=requested just run
+```
+
+A bogus value raises `ConfigError` at boot rather than falling back to the
+config file — the bot must never quietly review a different set of PRs than
+you just asked for.
+
+Other behavior worth knowing:
+
+- **Your own PRs always post as GitHub `COMMENT`**, whatever `approve_enabled`
+  says — GitHub rejects a self-`APPROVE` with HTTP 422, so the handler
+  downgrades unconditionally. A clean-pass `APPROVE` verdict on your own PR
+  posts as a COMMENT carrying its (empty-comments) summary body plus a
+  celebratory 곽철이 GIF.
+- With `scope = "self"`, `approve_enabled` is effectively inert: it only ever
+  applies to someone else's PR, and no such PR is in scope.
+- An explicit `daeyeon-bot dev fire-pr-review --pr 'owner/repo#N'` **overrides
+  the scope gate in both directions** — it is your own authorization, so it
+  reviews whoever's PR you name.
+- The same `allowed_repos` boundary still applies on the auto path — an
+  in-scope PR outside the allowlist still lands as `skipped_disallowed_repo`.
+- `scope = "self"` feeds the `pr_autofix` loop: `pr_review` posts findings on
+  your PR, and `pr_autofix` treats its own daemon's review as real feedback
+  (matched by review id, not author) and goes and fixes it.
 
 ### `approve_enabled` — formal GitHub APPROVE
 

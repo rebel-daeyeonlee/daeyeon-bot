@@ -9,10 +9,12 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from daeyeon_bot.core.errors import ConfigError
 
 
 class RuntimeSection(BaseModel):
@@ -230,13 +232,26 @@ class PrReviewHandlerEntry(HandlerEntry):
     # Globs accepted: `owner/repo`, `owner/*`. Anything else (e.g. `*foo*`)
     # falls back to handler-only filtering.
     allowed_repos: list[str] = Field(default_factory=list)
-    # When true, also review the operator's OWN open PRs (discovered via an
-    # `author:<operator>` search in the trigger). Self-authored reviews always
-    # post as `COMMENT` regardless of `approve_enabled` — GitHub rejects a
-    # self-`APPROVE` with HTTP 422. Pairs best with a non-empty `allowed_repos`:
-    # with an empty allowlist this scoops up every open PR you have across all
-    # of GitHub. Default false preserves the `skipped_self_authored` behavior.
-    review_self: bool = False
+    # WHOSE PRs the bot reviews. Replaces the old `review_self` boolean, which
+    # could only ever *add* self-authored PRs on top of the review-requested
+    # set — it had no way to say "mine only".
+    #
+    #   "self"      — ONLY PRs the operator authored (`author:<operator>`).
+    #                 The default. Always posted as `COMMENT`; GitHub rejects
+    #                 a self-`APPROVE` with HTTP 422, so `approve_enabled` is
+    #                 inert here.
+    #   "requested" — ONLY PRs where the operator is a requested reviewer.
+    #                 The pre-`scope` default behavior.
+    #   "both"      — the union (the old `review_self = true`).
+    #
+    # Enforced twice: the trigger picks which GitHub searches to run (traffic),
+    # and the handler re-checks the LIVE PR author before posting (the actual
+    # boundary — a manual `dev fire-pr-review` never touches the trigger).
+    # An explicit manual fire overrides the scope gate in both directions.
+    #
+    # Pairs best with a non-empty `allowed_repos`: with an empty allowlist,
+    # "self" scoops up every open PR you have across all of GitHub.
+    scope: Literal["self", "requested", "both"] = "self"
     # When true, a clean pass (`verdict == "APPROVE"`, zero findings) on a PR
     # authored by SOMEONE ELSE submits a formal GitHub `APPROVE` review event.
     # This counts toward branch protection — an automated approval can satisfy
@@ -244,6 +259,36 @@ class PrReviewHandlerEntry(HandlerEntry):
     # one. Everything else (PASS/CONCERNS/FAIL, and every self-authored PR)
     # still posts as `COMMENT`. Default false keeps the bot advisory-only.
     approve_enabled: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_review_self(cls, data: Any) -> Any:
+        """Fail loudly on the removed `review_self` key.
+
+        `HandlerEntry` is `extra="allow"`, so a stale `review_self = true` would
+        otherwise be silently swallowed and the operator would get the `scope`
+        default instead of what their config says — the config would lie. This
+        section already fails the daemon at boot on a typo'd table name; a
+        removed key deserves the same treatment.
+        """
+        if isinstance(data, dict) and "review_self" in cast("dict[str, Any]", data):
+            legacy = bool(cast("dict[str, Any]", data)["review_self"])
+            raise ValueError(
+                "[handlers.pr_review].review_self was replaced by `scope`."
+                f" Set scope = {'"both"' if legacy else '"requested"'} to keep the"
+                ' old behavior, or scope = "self" to review only your own PRs.'
+            )
+        return data
+
+    @property
+    def reviews_self(self) -> bool:
+        """True when self-authored PRs are in scope."""
+        return self.scope in ("self", "both")
+
+    @property
+    def reviews_requested(self) -> bool:
+        """True when PRs the operator was asked to review are in scope."""
+        return self.scope in ("requested", "both")
 
 
 class JiraTriageHandlerEntry(HandlerEntry):
@@ -459,11 +504,21 @@ class Config(BaseSettings):
         return GhReviewRequestedTriggerEntry.model_validate(raw.model_dump())
 
     def pr_review_handler_entry(self) -> PrReviewHandlerEntry:
-        """Typed view of `[handlers.pr_review]` (with defaults)."""
+        """Typed view of `[handlers.pr_review]` (with defaults).
+
+        Honors the `PR_REVIEW_SCOPE_ENV` escape hatch. The generic
+        `DAEYEON_BOT__…` pydantic-settings path cannot reach a key inside the
+        `handlers` dict: `load()` passes the parsed TOML as init kwargs, and
+        init kwargs outrank every env source — so a `[handlers.pr_review]`
+        table in config.toml shadows the whole dict. This one knob gets an
+        explicit read so the scope can be flipped for a single run
+        (`DAEYEON_BOT__HANDLERS__PR_REVIEW__SCOPE=requested just run`) without
+        editing the committed-nowhere config.toml.
+        """
         raw = self.handlers.get("pr_review")
         if raw is None:
-            return PrReviewHandlerEntry()
-        return PrReviewHandlerEntry.model_validate(raw.model_dump())
+            return _apply_scope_env(PrReviewHandlerEntry())
+        return _apply_scope_env(PrReviewHandlerEntry.model_validate(raw.model_dump()))
 
     def jira_assigned_trigger_entry(self) -> JiraAssignedTriggerEntry:
         """Typed view of `[triggers.jira_assigned]` (with defaults). Feature 002."""
@@ -522,6 +577,25 @@ class Config(BaseSettings):
     @property
     def pidfile_path(self) -> Path:
         return self.state_dir_path / "daeyeon-bot.pid"
+
+
+PR_REVIEW_SCOPE_ENV = "DAEYEON_BOT__HANDLERS__PR_REVIEW__SCOPE"
+_PR_REVIEW_SCOPES = ("self", "requested", "both")
+
+
+def _apply_scope_env(entry: PrReviewHandlerEntry) -> PrReviewHandlerEntry:
+    """Overlay `PR_REVIEW_SCOPE_ENV` onto a resolved pr_review entry.
+
+    An unset or empty variable is a no-op. A *set but bogus* value raises —
+    silently falling back to the config value would run the bot against a
+    different set of PRs than the operator just asked for.
+    """
+    override = os.environ.get(PR_REVIEW_SCOPE_ENV, "").strip()
+    if not override:
+        return entry
+    if override not in _PR_REVIEW_SCOPES:
+        raise ConfigError(f"{PR_REVIEW_SCOPE_ENV}={override!r} is not one of {_PR_REVIEW_SCOPES}")
+    return entry.model_copy(update={"scope": override})
 
 
 def resolve_config_path(explicit: str | None) -> Path | None:

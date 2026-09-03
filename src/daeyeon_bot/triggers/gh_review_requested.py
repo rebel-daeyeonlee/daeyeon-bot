@@ -1,7 +1,12 @@
-"""Polling trigger for `review-requested:<operator>` searches on GitHub.
+"""Polling trigger for the PR sets `pr_review` cares about on GitHub.
 
-The trigger sleeps `poll_interval_seconds` between observations, calls
-`gh.search_review_requested`, applies the §5 case table from
+Which sets those are is `[handlers.pr_review].scope`: `author:<operator>`
+("self", the default), `review-requested:<operator>` ("requested"), or both.
+The trigger name and its `gh_review_requested_state` table predate the scope
+knob and are kept for schema stability — read them as "the pr_review poller".
+
+The trigger sleeps `poll_interval_seconds` between observations, runs the
+search(es) its scope selects, applies the §5 case table from
 `data-model.md` to the union of "PRs returned now" and "PRs we have a
 state row for", and emits `gh.review_requested` events for cases (1, 2, 3)
 in the same SQLite transaction as the state UPSERT — so a crash between
@@ -27,7 +32,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import aiosqlite
 import structlog
@@ -74,7 +79,7 @@ PermanentFailureReporter = Callable[[str], Awaitable[bool]]
 
 @dataclass(slots=True)
 class GhReviewRequestedTrigger:
-    """Long-running poller for `review-requested:<operator>` PRs."""
+    """Long-running poller for the PRs selected by `scope`."""
 
     gh: Any
     storage_factory: StorageFactory
@@ -101,13 +106,13 @@ class GhReviewRequestedTrigger:
     # fnmatch gate is the only enforcement). Built in `app/registry.py`
     # by `build_search_extra_query`.
     search_extra_query: str = ""
-    # Mirror of `[handlers.pr_review].review_self`. When true, each poll also
-    # runs an `author:<operator>` search and unions those PRs into the observed
-    # set, so the operator's own PRs flow through the same state machine and
-    # `pr_review` handler (which submits them as COMMENT reviews). The handler
-    # re-checks `review_self` before posting, so this is a traffic optimization,
-    # not the security boundary.
-    review_self: bool = False
+    # Mirror of `[handlers.pr_review].scope` — which GitHub searches this poll
+    # runs. "self" runs only `author:<operator>`, "requested" only
+    # `review-requested:<operator>`, "both" unions them. Every hit lands in the
+    # same state machine and the same `pr_review` handler; the handler re-checks
+    # the live PR author against its own `scope` before posting, so this is a
+    # traffic optimization, not the security boundary.
+    scope: Literal["self", "requested", "both"] = "self"
 
     async def run(self, emit: EmitFn, ctx: TriggerContext) -> None:
         """Loop until cancelled. AuthError propagates and halts the daemon.
@@ -144,14 +149,18 @@ class GhReviewRequestedTrigger:
 
     async def poll_once(self) -> int:
         """One observe-and-emit pass. Returns the number of events emitted."""
-        items = await self.gh.search_review_requested(
-            self.github_username, extra_query=self.search_extra_query
-        )
-        if self.review_self:
-            # Self-authored PRs are a disjoint set (you can't be your own
-            # reviewer), so a flat append is enough — the `(repo, pr)` dict
-            # below collapses any incidental overlap.
-            items = items + await self.gh.search_authored(
+        # The two searches are disjoint (GitHub never lists you as a reviewer of
+        # your own PR), so a flat concat is enough — and the `(repo, pr)` dict
+        # below collapses any incidental overlap anyway.
+        # `list[Any]`, not `list[dict[...]]`: `gh` is an untyped protocol here and
+        # the per-item `isinstance` guard below is the real narrowing.
+        items: list[Any] = []
+        if self.scope in ("requested", "both"):
+            items += await self.gh.search_review_requested(
+                self.github_username, extra_query=self.search_extra_query
+            )
+        if self.scope in ("self", "both"):
+            items += await self.gh.search_authored(
                 self.github_username, extra_query=self.search_extra_query
             )
         # `updated_at` lets us short-circuit `pr_get` for steady-state PRs:
